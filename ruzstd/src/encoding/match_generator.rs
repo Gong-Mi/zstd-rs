@@ -328,7 +328,8 @@ impl MatchGenerator {
             // Mirrors C zstd's fast strategy where step grows on misses.
             self.miss_counter += 1;
             let step = 1 + (self.miss_counter >> 4).min(7); // 1, 1, ..., 2, 2, ..., 3, ...
-            self.suffix_idx += step;
+            let data_len = self.window.last().unwrap().data.len();
+            self.suffix_idx = (self.suffix_idx + step).min(data_len);
         }
     }
 
