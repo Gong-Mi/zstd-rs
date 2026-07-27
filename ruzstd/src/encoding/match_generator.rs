@@ -287,9 +287,16 @@ impl MatchGenerator {
             }
 
             if let Some((offset, match_len)) = candidate {
-                // For each index in the match we found we do not need to look for another match
-                // But we still want them registered in the suffix store
-                self.add_suffixes_till(self.suffix_idx + match_len);
+                // Fast mode: skip hash insertion for positions within the match.
+                // C zstd's fast strategy does the same — only searched positions
+                // get inserted. This trades a small ratio loss for large speed gain
+                // (avoids O(match_len) hash inserts per match).
+                // We still insert the current position's key so future lookups work.
+                let last_entry = self.window.last_mut().unwrap();
+                let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
+                if !last_entry.suffixes.contains_key(key) {
+                    last_entry.suffixes.insert(key, self.suffix_idx);
+                }
 
                 // All literals that were not included between this match and the last are now included here
                 let last_entry = self.window.last().unwrap();
@@ -312,7 +319,9 @@ impl MatchGenerator {
             if !last_entry.suffixes.contains_key(key) {
                 last_entry.suffixes.insert(key, self.suffix_idx);
             }
-            self.suffix_idx += 1;
+            // Step acceleration: on consecutive misses, skip ahead faster.
+            // Mirrors C zstd's fast strategy where step grows on misses.
+            self.suffix_idx += 1 + (self.suffix_idx >> 10).min(3);
         }
     }
 
