@@ -96,6 +96,10 @@ impl Matcher for MatchGeneratorDriver {
     fn skip_matching(&mut self) {
         self.match_generator.skip_matching();
     }
+    fn recycle_space(&mut self, mut space: Vec<u8>) {
+        space.resize(space.capacity(), 0);
+        self.vec_pool.push(space);
+    }
 }
 
 /// This stores the index of a suffix of a string by hashing the first few bytes of that suffix

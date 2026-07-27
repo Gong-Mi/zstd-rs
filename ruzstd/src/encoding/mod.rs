@@ -92,6 +92,10 @@ pub trait Matcher {
     fn skip_matching(&mut self);
     /// Process the data in the last commited space for future matching AND generate matches for the data
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
+    /// Recycle a buffer without adding it to the matching window.
+    /// Use this for blocks that are emitted raw (incompressible data)
+    /// where building suffix indexes would be wasted work.
+    fn recycle_space(&mut self, space: alloc::vec::Vec<u8>);
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);
     /// The size of the window the decoder will need to execute all sequences produced by this matcher
