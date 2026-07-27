@@ -101,7 +101,7 @@ impl DecodeBuffer {
                 // 2. explicitly reserved enough memory for the whole match_length
                 unsafe {
                     self.buffer
-                        .extend_from_within_unchecked_branchless(start_idx, match_length)
+                        .extend_from_within_unchecked(start_idx, match_length)
                 };
             }
 
@@ -133,7 +133,7 @@ impl DecodeBuffer {
             // 2. explicitly reserved enough memory for the whole match_length
             unsafe {
                 self.buffer
-                    .extend_from_within_unchecked_branchless(start_idx, chunksize)
+                    .extend_from_within_unchecked(start_idx, chunksize)
             };
             copied_counter_left -= chunksize;
             start_idx += chunksize;
