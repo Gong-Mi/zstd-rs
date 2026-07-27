@@ -182,8 +182,6 @@ pub(crate) struct MatchGenerator {
     suffix_idx: usize,
     /// Gets updated when a new sequence is returned to point right behind that sequence
     last_idx_in_sequence: usize,
-    /// Consecutive miss counter for step acceleration
-    miss_counter: usize,
 }
 
 impl MatchGenerator {
@@ -197,7 +195,6 @@ impl MatchGenerator {
             concat_window: Vec::new(),
             suffix_idx: 0,
             last_idx_in_sequence: 0,
-            miss_counter: 0,
         }
     }
 
@@ -207,7 +204,6 @@ impl MatchGenerator {
         self.concat_window.clear();
         self.suffix_idx = 0;
         self.last_idx_in_sequence = 0;
-        self.miss_counter = 0;
         self.window.drain(..).for_each(|entry| {
             reuse_space(entry.data, entry.suffixes);
         });
@@ -309,7 +305,6 @@ impl MatchGenerator {
                 // Update the indexes, all indexes upto and including the current index have been included in a sequence now
                 self.suffix_idx += match_len;
                 self.last_idx_in_sequence = self.suffix_idx;
-                self.miss_counter = 0; // Reset on match
                 handle_sequence(Sequence::Triple {
                     literals,
                     offset,
@@ -324,11 +319,11 @@ impl MatchGenerator {
             if !last_entry.suffixes.contains_key(key) {
                 last_entry.suffixes.insert(key, self.suffix_idx);
             }
-            // Step acceleration: on consecutive misses, skip ahead faster.
-            // Mirrors C zstd's fast strategy where step grows on misses.
-            self.miss_counter += 1;
-            let step = 1 + (self.miss_counter >> 4).min(7); // 1, 1, ..., 2, 2, ..., 3, ...
-            let data_len = self.window.last().unwrap().data.len();
+            // Step acceleration: skip ahead faster at later positions in the block.
+            // Positions near the start are more valuable as match targets, so we
+            // search them densely. Later positions are less likely to be referenced.
+            let data_len = last_entry.data.len();
+            let step = 1 + (self.suffix_idx * 4 / data_len.max(1)).min(3);
             self.suffix_idx = (self.suffix_idx + step).min(data_len);
         }
     }
