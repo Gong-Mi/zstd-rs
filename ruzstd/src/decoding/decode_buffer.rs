@@ -111,32 +111,31 @@ impl DecodeBuffer {
     }
 
     fn repeat_in_chunks(&mut self, offset: usize, match_length: usize, start_idx: usize) {
-        // We have at max offset bytes in one chunk, the last one can be smaller
-        let mut start_idx = start_idx;
-        let mut copied_counter_left = match_length;
-        // TODO this can  be optimized further I think.
-        // Each time we copy a chunk we have a repetiton of length 'offset', so we can copy offset * iteration many bytes from start_idx
-        while copied_counter_left > 0 {
-            let chunksize = usize::min(offset, copied_counter_left);
-
-            // SAFETY: Requirements checked:
-            // 1. start_idx + chunksize must be <= self.buffer.len()
-            //      We know that:
-            //      1. start_idx starts at buffer.len() - offset
-            //      2. chunksize <= offset (== offset for each iteration but the last, and match_length modulo offset in the last iteration)
-            //      3. the buffer grows by offset many bytes each iteration but the last
-            //      4. start_idx is increased by the same amount as the buffer grows each iteration
-            //
-            //      Thus follows: start_idx + chunksize == self.buffer.len() in each iteration but the last, where match_length modulo offset == chunksize < offset
-            //          Meaning: start_idx + chunksize <= self.buffer.len()
-            //
-            // 2. explicitly reserved enough memory for the whole match_length
-            unsafe {
-                self.buffer
-                    .extend_from_within_unchecked(start_idx, chunksize)
-            };
-            copied_counter_left -= chunksize;
-            start_idx += chunksize;
+        // The source region has period `offset` and grows as we copy: after
+        // copying k*offset bytes total, the periodic run from `start_idx` is
+        // (k+1)*offset bytes long. So instead of copying offset-sized chunks
+        // one by one, double the chunk size every step: 1x, 2x, 4x, ...
+        // Number of extend calls drops from match_length/offset to
+        // log2(match_length/offset).
+        //
+        // SAFETY (for each extend_from_within_unchecked call): let buf_len be
+        // the buffer length on entry to this function and step the chunk size
+        // of the current iteration. Before iteration j with cumulative copied
+        // c_j = step_0 + ... + step_{j-1} = step_j - offset (telescoping, since
+        // step_{i+1} = 2*step_i except the final partial chunk):
+        //   buffer.len() = buf_len + c_j
+        //   start_idx + step_j = buf_len - offset + step_j = buf_len + c_j
+        // so start_idx + step_j == buffer.len() <= buffer.len(), and the
+        // caller reserved `match_length` up front so capacity is sufficient.
+        let mut copied = 0usize;
+        let mut step = offset;
+        while copied < match_length {
+            if step > match_length - copied {
+                step = match_length - copied;
+            }
+            unsafe { self.buffer.extend_from_within_unchecked(start_idx, step) };
+            copied += step;
+            step *= 2;
         }
     }
 
