@@ -61,14 +61,48 @@ fn gen_medium(size: usize) -> Vec<u8> {
 /// 不是真数据，是"结构仿造"，用来替代"必须下载内核源码"这类重依赖语料。
 fn gen_src_like(size: usize) -> Vec<u8> {
     const KWS: [&[u8]; 22] = [
-        b"static ", b"int ", b"struct ", b"const ", b"unsigned long ", b"void ", b"return ",
-        b"if (", b") {\n", b"}\n", b"for (", b";\n", b" = ", b"->", b"/* ", b" */", b"\n\t",
-        b"EXPORT_SYMBOL(", b"__init", b"#define ", b"#include <linux/", b">\n",
+        b"static ",
+        b"int ",
+        b"struct ",
+        b"const ",
+        b"unsigned long ",
+        b"void ",
+        b"return ",
+        b"if (",
+        b") {\n",
+        b"}\n",
+        b"for (",
+        b";\n",
+        b" = ",
+        b"->",
+        b"/* ",
+        b" */",
+        b"\n\t",
+        b"EXPORT_SYMBOL(",
+        b"__init",
+        b"#define ",
+        b"#include <linux/",
+        b">\n",
     ];
     const IDS: [&[u8]; 18] = [
-        b"page", b"sk_buff", b"alloc", b"mutex_lock", b"vmalloc", b"inode", b"task_struct",
-        b"list_head", b"spinlock", b"kmalloc", b"rcu_read_lock", b"dma_addr_t", b"workqueue",
-        b"kmem_cache", b"jiffies", b"refcount", b"hlist_node", b"bio",
+        b"page",
+        b"sk_buff",
+        b"alloc",
+        b"mutex_lock",
+        b"vmalloc",
+        b"inode",
+        b"task_struct",
+        b"list_head",
+        b"spinlock",
+        b"kmalloc",
+        b"rcu_read_lock",
+        b"dma_addr_t",
+        b"workqueue",
+        b"kmem_cache",
+        b"jiffies",
+        b"refcount",
+        b"hlist_node",
+        b"bio",
     ];
     let mut rng = rand::rngs::SmallRng::seed_from_u64(0xC0FFEE);
     let mut buf = Vec::with_capacity(size + 4096);
@@ -105,8 +139,26 @@ fn gen_src_like(size: usize) -> Vec<u8> {
 /// （x86-64 常见 opcode/ModRM 前缀）+ 零填充 + 字符串表 + 指针数组。
 fn gen_bin_like(size: usize) -> Vec<u8> {
     const OPS: [u8; 20] = [
-        0x48, 0x8b, 0x89, 0xe8, 0x0f, 0x1f, 0x00, 0x48, 0x89, 0xc7, 0xeb, 0x74, 0x75, 0x31,
-        0xc0, 0xff, 0x25, 0xc3, 0x55, 0x5d,
+        0x48,
+        0x8b,
+        0x89,
+        0xe8,
+        0x0f,
+        0x1f,
+        0x00,
+        0x48,
+        0x89,
+        0xc7,
+        0xeb,
+        0x74,
+        0x75,
+        0x31,
+        0xc0,
+        0xff,
+        0x25,
+        0xc3,
+        0x55,
+        0x5d,
     ];
     let mut rng = rand::rngs::SmallRng::seed_from_u64(0xBADC0DE);
     let mut buf = Vec::with_capacity(size + 4096);
