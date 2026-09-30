@@ -136,12 +136,19 @@ impl BlockDecoder {
         vprintln!("Slice for literals: {}", raw_literals.len());
 
         workspace.literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
+        #[cfg(feature = "prof")]
+        let t_literals = crate::decoding::prof::tick();
         let bytes_used_in_literals_section = decode_literals(
             &section,
             &mut workspace.huf,
             raw_literals,
             &mut workspace.literals_buffer,
         )?;
+        #[cfg(feature = "prof")]
+        crate::decoding::prof::flush(
+            &crate::decoding::prof::LITERALS_TICKS,
+            crate::decoding::prof::tick().wrapping_sub(t_literals),
+        );
         assert!(
             section.regenerated_size == workspace.literals_buffer.len() as u32,
             "Wrong number of literals: {}, Should have been: {}",
@@ -172,6 +179,8 @@ impl BlockDecoder {
         vprintln!("Slice for sequences: {}", raw.len());
 
         if seq_section.num_sequences != 0 {
+            #[cfg(feature = "prof")]
+            let t_seq = crate::decoding::prof::tick();
             decode_and_execute_sequences(
                 &seq_section,
                 raw,
@@ -188,6 +197,11 @@ impl BlockDecoder {
                     DecompressBlockError::from(x)
                 }
             })?;
+            #[cfg(feature = "prof")]
+            crate::decoding::prof::flush(
+                &crate::decoding::prof::SEQ_LOOP_TICKS,
+                crate::decoding::prof::tick().wrapping_sub(t_seq),
+            );
         } else {
             if !raw.is_empty() {
                 return Err(DecompressBlockError::DecodeSequenceError(

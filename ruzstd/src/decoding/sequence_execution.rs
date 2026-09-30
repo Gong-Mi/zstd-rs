@@ -8,6 +8,8 @@ use crate::decoding::errors::DecodeBufferError;
 use crate::decoding::errors::FSEDecoderError;
 use crate::decoding::errors::{DecodeSequenceError, ExecuteSequencesError};
 use crate::fse::FSEDecoder;
+#[cfg(feature = "prof")]
+use crate::decoding::prof;
 
 /// Error type for the fused sequence decode+execute pass.
 ///
@@ -99,7 +101,16 @@ pub fn decode_and_execute_sequences(
     let old_buffer_size = buffer.len();
     let mut seq_sum = 0u32;
 
+    #[cfg(feature = "prof")]
+    let (mut fse_acc, mut lit_acc, mut match_acc, mut samples) = (0u64, 0u64, 0u64, 0u64);
+
     for seq_idx in 0..num_sequences {
+        // Only every 64th sequence is timed: timing every one would add
+        // 20-30ns/sequence to a ~20ns/sequence loop and swamp the split.
+        #[cfg(feature = "prof")]
+        let sampled = seq_idx & 63 == 0;
+        #[cfg(feature = "prof")]
+        let t_fse = if sampled { prof::tick() } else { 0 };
         let ll_code = if let Some(ll_rle) = ll_rle {
             ll_rle
         } else {
@@ -137,6 +148,13 @@ pub fn decode_and_execute_sequences(
         let seq_ml = ml_value + ml_add as u32;
 
         // ── inline execution ( mirrors execute_sequences ) ──
+        #[cfg(feature = "prof")]
+        let t_lit = if sampled {
+            fse_acc += prof::tick().wrapping_sub(t_fse);
+            prof::tick()
+        } else {
+            0
+        };
         if seq_ll > 0 {
             let high = literals_copy_counter + seq_ll as usize;
             if high > literals_buffer.len() {
@@ -152,12 +170,25 @@ pub fn decode_and_execute_sequences(
             buffer.push(literals);
         }
 
+        #[cfg(feature = "prof")]
+        let t_match = if sampled {
+            lit_acc += prof::tick().wrapping_sub(t_lit);
+            prof::tick()
+        } else {
+            0
+        };
         let actual_offset = do_offset_history(offset, seq_ll, &mut *offset_hist);
         if actual_offset == 0 {
             return Err(ExecuteSequencesError::ZeroOffset.into());
         }
         if seq_ml > 0 {
             buffer.repeat(actual_offset as usize, seq_ml as usize)?;
+        }
+
+        #[cfg(feature = "prof")]
+        if sampled {
+            match_acc += prof::tick().wrapping_sub(t_match);
+            samples += 1;
         }
 
         seq_sum += seq_ml;
@@ -191,6 +222,16 @@ pub fn decode_and_execute_sequences(
         let rest_literals = &literals_buffer[literals_copy_counter..];
         buffer.push(rest_literals);
         seq_sum += rest_literals.len() as u32;
+    }
+
+    #[cfg(feature = "prof")]
+    {
+        prof::flush(&prof::FSE_TICKS, fse_acc);
+        prof::flush(&prof::LIT_COPY_TICKS, lit_acc);
+        prof::flush(&prof::MATCH_COPY_TICKS, match_acc);
+        prof::count(&prof::SAMPLES, samples);
+        prof::count(&prof::SEQS, num_sequences as u64);
+        prof::count(&prof::BLOCKS, 1);
     }
 
     let diff = buffer.len() - old_buffer_size;
