@@ -64,7 +64,7 @@ jobs:
             --partition boot \
             --out corpus-cache/boot.img \
             --max-mb ${{ github.event.inputs.max_mb || '300' }} \
-            --log corpus-cache/range.log --verbose
+            --log corpus-cache/range.log
           echo "== Range 记账 =="; tail -5 corpus-cache/range.log; wc -l corpus-cache/range.log
 
       - name: Extract kernel image
