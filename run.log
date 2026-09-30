@@ -1,5 +1,0 @@
-WARNING: 语料退化，可能未走压缩/序列路径: random(ratio=1.00)
-reps=1 iters=3 size=8MB corpora=3
-  rep 1 text           C    11.993 ms (cpu   11.917)   ruzstd    33.260 ms (cpu   32.918)   wall ratio  2.77x  cpu ratio  2.76x
-  rep 1 random         C     5.736 ms (cpu    5.669)   ruzstd     6.373 ms (cpu    6.295)   wall ratio  1.11x  cpu ratio  1.11x
-  rep 1 binary-medium  C    11.844 ms (cpu   11.778)   ruzstd    52.520 ms (cpu   51.506)   wall ratio  4.43x  cpu ratio  4.37x
