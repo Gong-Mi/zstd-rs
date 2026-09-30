@@ -42,7 +42,9 @@ pub fn compress_fastest<M: Matcher>(
     }
     // For blocks larger than the sample, verify RLE on the full block
     if all_same && uncompressed_data.len() > sample_len {
-        all_same = uncompressed_data[sample_len..].iter().all(|&x| x == first_byte);
+        all_same = uncompressed_data[sample_len..]
+            .iter()
+            .all(|&x| x == first_byte);
     }
 
     if all_same {
