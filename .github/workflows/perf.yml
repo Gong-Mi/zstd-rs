@@ -26,6 +26,10 @@ on:
         description: '每语料大小 (MB)'
         default: '8'
         required: false
+      arm_crosscheck:
+        description: '在 arm64 Linux runner 上复核 (默认关闭, 很少用到)'
+        default: 'false'
+        required: false
   push:
     branches:
       - 'ci-perf*'
@@ -40,7 +44,9 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       contains(github.event.pull_request.labels.*.name, 'perf')
-    runs-on: ubuntu-latest
+    # 默认 x86_64（快、够用）；只有显式要求时在 arm64 Linux runner 上复核。
+    # arm64 runner 很少轮到，所以不做成默认路径。
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.arm_crosscheck == 'true') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     steps:
       - name: Resolve refs
         id: refs
