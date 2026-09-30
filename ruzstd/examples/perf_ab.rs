@@ -138,7 +138,8 @@ fn gen_src_like(size: usize) -> Vec<u8> {
 /// 仿真 ELF 二进制（pseudo-random，确定种子）：ELF 头 + 代码段字节分布
 /// （x86-64 常见 opcode/ModRM 前缀）+ 零填充 + 字符串表 + 指针数组。
 fn gen_bin_like(size: usize) -> Vec<u8> {
-    const OPS: &[u8] = b"\x48\x8b\x89\xe8\x0f\x1f\x00\x48\x89\xc7\xeb\x74\x75\x31\xc0\xff\x25\xc3\x55\x5d";
+    const OPS: &[u8] =
+        b"\x48\x8b\x89\xe8\x0f\x1f\x00\x48\x89\xc7\xeb\x74\x75\x31\xc0\xff\x25\xc3\x55\x5d";
     let mut rng = rand::rngs::SmallRng::seed_from_u64(0xBADC0DE);
     let mut buf = Vec::with_capacity(size + 4096);
     buf.extend_from_slice(b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00");

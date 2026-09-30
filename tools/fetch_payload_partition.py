@@ -284,53 +284,67 @@ def main():
         print("  没有 payload.bin（可能是 .tgz fastboot 包）", file=sys.stderr)
         return 2
 
-    with zf.open("payload.bin") as pf:
-        head = pf.read(4 + 8 + 8)
-        magic, _ver, msize = struct.unpack("<4sQQ", head)
-        assert magic == b"CrAU", f"payload magic = {magic!r}"
-        mf = pf.read(msize)
-        print(f"  manifest: {msize} B（只读了这一段，未整包下载）")
-        parts = parse_manifest(mf)
-        target = next((p for p in parts if p["name"] == a.partition), None)
-        if not target:
-            print(f"  没有分区 {a.partition}；可选: {sorted(p['name'] for p in parts)}", file=sys.stderr)
-            return 2
-        ops = target["ops"]
-        total = sum(o["data_length"] for o in ops)
-        print(f"  {a.partition}: {len(ops)} ops, 数据合计 {total/1048576:.1f} MB（将按 op Range 取）")
+    # 不走 ZipExtFile（它按 4KB 缓冲，取 100MB 分区要上万次 Range）：自算 payload.bin
+    # 的数据起点，然后按 op 的 [data_offset, data_length] 一次性大块 Range 读。
+    info = zf.getinfo("payload.bin")
+    rf.seek(info.header_offset)
+    lh = rf.read(30)
+    nlen = struct.unpack_from("<H", lh, 26)[0]
+    elen = struct.unpack_from("<H", lh, 28)[0]
+    data_start = info.header_offset + 30 + nlen + elen
+    print(f"  payload.bin: local header @{info.header_offset}, data @{data_start}, "
+          f"size={info.file_size/1048576:.1f} MB")
 
-        # 组装分区：按 dst extent 写
-        out_size = 0
-        for o in ops:
-            for e in o["dst"]:
-                out_size = max(out_size, e["start"] + e["num_blocks"])
-        out_size *= 4096
-        buf = bytearray(out_size)
-        if a.dry_run:
-            print("  --dry-run：停在这里（未下载任何 op 数据）")
-            print("  分区列表:", sorted(p["name"] for p in parts))
-            print("  boot ops 前 3:", json.dumps(ops[:3]))
-            return 0
-        for idx, o in enumerate(ops):
-            if o["data_length"] == 0:
-                continue
-            pf.seek(o["data_offset"])
-            raw = pf.read(o["data_length"])
-            t = o["type"]
-            if t == 8:      # REPLACE_XZ
-                data = lzma.decompress(raw)
-            elif t == 1:    # REPLACE_BZ
-                data = __import__("bz2").decompress(raw)
-            else:           # REPLACE / 其它按原样
-                data = raw
-            pos = 0
-            for e in o["dst"]:
-                start = e["start"] * 4096
-                length = e["num_blocks"] * 4096
-                buf[start:start + length] = data[pos:pos + length]
-                pos += length
-            if idx % 20 == 0:
-                print(f"    op {idx}/{len(ops)} type={t} len={o['data_length']}")
+    def read_at(off, ln):
+        rf.seek(data_start + off)
+        return rf.read(ln)
+
+    magic, _ver, msize = struct.unpack("<4sQQ", read_at(0, 20))
+    assert magic == b"CrAU", f"payload magic = {magic!r}"
+    mf = read_at(20, msize)
+    print(f"  manifest: {msize} B（读到 manifest 为止只用了很少几次 Range）")
+    parts = parse_manifest(mf)
+    target = next((p for p in parts if p["name"] == a.partition), None)
+    if not target:
+        print(f"  没有分区 {a.partition}；可选: {sorted(p['name'] for p in parts)}", file=sys.stderr)
+        return 2
+    ops = target["ops"]
+    total = sum(o["data_length"] for o in ops)
+    print(f"  {a.partition}: {len(ops)} ops, 数据合计 {total/1048576:.1f} MB（每 op 一次大块 Range）")
+
+    out_size = 0
+    for o in ops:
+        for e in o["dst"]:
+            out_size = max(out_size, e["start"] + e["num_blocks"])
+    out_size *= 4096
+    buf = bytearray(out_size)
+    if a.dry_run:
+        print("  --dry-run：停在这里（未下载任何 op 数据）")
+        print("  分区列表:", sorted(p["name"] for p in parts))
+        print("  boot ops 前 3:", json.dumps(ops[:3]))
+        return 0
+    import time as _t
+    t0 = _t.time()
+    for idx, o in enumerate(ops):
+        if o["data_length"] == 0:
+            continue
+        raw = read_at(o["data_offset"], o["data_length"])
+        t = o["type"]
+        if t == 8:      # REPLACE_XZ
+            data = lzma.decompress(raw)
+        elif t == 1:    # REPLACE_BZ
+            data = __import__("bz2").decompress(raw)
+        else:           # REPLACE / 其它按原样
+            data = raw
+        pos = 0
+        for e in o["dst"]:
+            s0 = e["start"] * 4096
+            length = e["num_blocks"] * 4096
+            buf[s0:s0 + length] = data[pos:pos + length]
+            pos += length
+        if idx % 5 == 0 or idx == len(ops) - 1:
+            print(f"    op {idx+1}/{len(ops)} type={t} len={o['data_length']} "
+                  f"累计传输 {rf.transferred/1048576:.1f} MB, {_t.time()-t0:.0f}s")
 
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     open(a.out, "wb").write(bytes(buf))
