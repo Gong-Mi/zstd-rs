@@ -8,3 +8,8 @@ fuzz_decodecorpus
 perf.data*
 ruzstd/fuzz/corpus
 .idea
+
+# 本地冒烟产物（测量 harness 的输出，别提交）
+base.jsonl
+head.jsonl
+run.log
