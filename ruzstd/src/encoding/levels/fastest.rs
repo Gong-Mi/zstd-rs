@@ -29,15 +29,9 @@ pub fn compress_fastest<M: Matcher>(
     let sample_len = uncompressed_data.len().min(1024);
     let first_byte = uncompressed_data[0];
     let mut all_same = true;
-    let mut seen = [false; 256];
-    let mut distinct: u16 = 0;
     for &b in &uncompressed_data[..sample_len] {
         if b != first_byte {
             all_same = false;
-        }
-        if !seen[b as usize] {
-            seen[b as usize] = true;
-            distinct += 1;
         }
     }
     // For blocks larger than the sample, verify RLE on the full block
