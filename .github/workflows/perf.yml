@@ -196,9 +196,11 @@ jobs:
             > ../profile.jsonl 2> ../profile.log || { cat ../profile.log; exit 1; }
           python3 - <<'PY'
           import json, os
+          # 本步的 working-directory 是 head/，产物写在仓库根
+          path = os.path.join(os.environ['GITHUB_WORKSPACE'], 'profile.jsonl')
           rows = ['| corpus | literals % | seq loop % | lit raw/huf MB | huf 4-stream/1-stream | seqs | in-loop FSE / litcopy / matchcopy % |',
                   '|---|---|---|---|---|---|---|']
-          for line in open('profile.jsonl'):
+          for line in open(path):
               line = line.strip()
               if not line.startswith('{'):
                   continue
