@@ -188,7 +188,7 @@ def parse_manifest(mf):
             ops = []
             for f2, w2, v2 in iter_fields(val):
                 if f2 == 1 and w2 == 2:
-                    name = v2.decode()
+                    name = bytes(v2).decode()
                 elif f2 == 8 and w2 == 2:
                     op = {"type": 0, "data_offset": 0, "data_length": 0, "dst": []}
                     for f3, w3, v3 in iter_fields(v2):
@@ -318,12 +318,16 @@ def main():
     # 一路读到 300MB 预算才被拦住（guard 起了作用，但根因是端序）。
     magic, _ver, msize = struct.unpack(">4sQQ", read_at(0, 20))
     assert magic == b"CrAU", f"payload magic = {magic!r}"
-    print(f"  manifest size = {msize/1024:.0f} KiB")
+    # v2 头是 24 字节：magic(4) + version(8) + manifest_size(8) + metadata_signature_size(4)，
+    # manifest 从第 24 字节开始——我上一版从 20 开始解析，错位 4 字节，protobuf 走查必然 desync。
+    hdr_len = 24 if _ver >= 2 else 20
+    meta_sig = struct.unpack(">I", read_at(20, 4))[0] if _ver >= 2 else 0
+    print(f"  manifest size = {msize/1024:.0f} KiB, metadata_signature = {meta_sig} B")
     # 分块读 manifest：一次要几十 MB 时某些 CDN 会长时间不返回，分块＋逐块进度能把
     # "卡在哪一块"看出来（上一轮就是整块读 manifest 卡了 20 分钟直到超时）
     CHUNK = 256 * 1024
     mf = bytearray()
-    off = 20
+    off = hdr_len
     while len(mf) < msize:
         n = min(CHUNK, msize - len(mf))
         mf += read_at(off, n)
