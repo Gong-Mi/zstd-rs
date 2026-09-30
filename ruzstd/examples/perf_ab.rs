@@ -375,9 +375,11 @@ fn report_profile(label: &str, comp: &[u8]) {
     let inloop =
         (get(&p::FSE_TICKS) + get(&p::LIT_COPY_TICKS) + get(&p::MATCH_COPY_TICKS)).max(1.0);
     println!(
-        "{{\"kind\":\"profile\",\"corpus\":\"{label}\",\"literals_pct\":{:.1},\"seq_loop_pct\":{:.1},\"lit_huf_mb\":{:.2},\"huf4_sections\":{},\"huf1_sections\":{},\"seqs\":{},\"samples\":{},\"inloop_fse_pct\":{:.1},\"inloop_litcopy_pct\":{:.1},\"inloop_matchcopy_pct\":{:.1}}}",
+        "{{\"kind\":\"profile\",\"corpus\":\"{label}\",\"literals_pct\":{:.1},\"seq_loop_pct\":{:.1},\"lit_raw_mb\":{:.2},\"lit_rle_mb\":{:.2},\"lit_huf_mb\":{:.2},\"huf4_sections\":{},\"huf1_sections\":{},\"seqs\":{},\"samples\":{},\"inloop_fse_pct\":{:.1},\"inloop_litcopy_pct\":{:.1},\"inloop_matchcopy_pct\":{:.1}}}",
         lit * 100.0 / phased,
         seq * 100.0 / phased,
+        get(&p::LIT_RAW_BYTES) / 1048576.0,
+        get(&p::LIT_RLE_BYTES) / 1048576.0,
         get(&p::LIT_HUF_BYTES) / 1048576.0,
         get(&p::HUF4_SECTIONS) as u64,
         get(&p::HUF1_SECTIONS) as u64,

@@ -275,7 +275,7 @@ jobs:
           echo "== profile.jsonl 行数: $(wc -l < "$GITHUB_WORKSPACE/profile.jsonl" 2>/dev/null || echo 0) ==" 
           python3 - <<'PY'
           import json, os
-          rows = ['| corpus | literals % | seq loop % | huf MB (4/1-stream) | seqs | in-loop FSE / litcopy / matchcopy % |',
+          rows = ['| corpus | literals % | seq loop % | raw/rle/huf MB | huf 段 4/1-stream | seqs | in-loop FSE / litcopy / matchcopy % |',
                   '|---|---|---|---|---|---|']
           path = os.path.join(os.environ['GITHUB_WORKSPACE'], 'profile.jsonl')
           try:
@@ -290,7 +290,8 @@ jobs:
               if o.get('kind') != 'profile':
                   continue
               rows.append(f"| {o['corpus']} | {o['literals_pct']} | {o['seq_loop_pct']} | "
-                          f"{o['lit_huf_mb']} ({o['huf4_sections']}/{o['huf1_sections']}) | {o['seqs']} | "
+                          f"{o.get('lit_raw_mb','?')}/{o.get('lit_rle_mb','?')}/{o['lit_huf_mb']} | "
+                          f"{o['huf4_sections']}/{o['huf1_sections']} | {o['seqs']} | "
                           f"{o['inloop_fse_pct']} / {o['inloop_litcopy_pct']} / {o['inloop_matchcopy_pct']} |")
           out = '\n'.join(rows)
           print(out)
