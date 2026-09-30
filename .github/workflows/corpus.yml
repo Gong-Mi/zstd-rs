@@ -75,6 +75,11 @@ jobs:
             || { echo "::warning::unpack failed, 用 boot.img 整份当语料"; cp corpus-cache/boot.img corpus-cache/kernel-real.bin; }
           ls -l corpus-cache
           sha256sum corpus-cache/kernel-real.bin | tee corpus-cache/SHA256
+          # 语料身份自证：前 16 字节 + file(1) 判定，避免"到底是不是压缩态"靠猜
+          echo "--- 语料身份 ---"
+          head -c 16 corpus-cache/kernel-real.bin | od -An -tx1
+          file corpus-cache/kernel-real.bin || true
+          head -c 16 corpus-cache/boot.img | od -An -tx1
 
       - name: Report
         run: |
