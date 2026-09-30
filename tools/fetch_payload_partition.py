@@ -309,9 +309,15 @@ def main():
     print(f"  payload.bin: local header @{info.header_offset}, data @{data_start}, "
           f"size={info.file_size/1048576:.1f} MB")
 
-    def read_at(off, ln):
-        rf.seek(data_start + off)
+    # op 的 data_offset 是相对"data blobs 段"起点的，而 blobs 段在
+    # [header][manifest][metadata_signature] 之后 —— 上一版直接从 payload 数据起点算，
+    # 少了 metadata_signature 那 267 字节，于是解压器拿到错位数据（LZMAError）。
+    def read_at(off, ln, base=None):
+        rf.seek((data_start if base is None else base) + off)
         return rf.read(ln)
+
+    blob_base = data_start + hdr_len + int(msize) + meta_sig
+    print(f"  data blobs 起点 = {blob_base}（header {hdr_len} + manifest {msize} + sig {meta_sig}）")
 
     # payload 头是**大端**（网络字节序）：magic "CrAU" + version u64 + manifest_size u64。
     # 我第一版写成 "<4sQQ"（小端），manifest_size 解析成 2.1e15 KiB，于是按 256KB 分块
@@ -360,7 +366,7 @@ def main():
     for idx, o in enumerate(ops):
         if o["data_length"] == 0:
             continue
-        raw = read_at(o["data_offset"], o["data_length"])
+        raw = read_at(o["data_offset"], o["data_length"], base=blob_base)
         t = o["type"]
         if t == 8:      # REPLACE_XZ
             data = lzma.decompress(raw)
@@ -374,6 +380,9 @@ def main():
             length = e["num_blocks"] * 4096
             buf[s0:s0 + length] = data[pos:pos + length]
             pos += length
+        if idx == 0:
+            print(f"    首个 op 校验: type={t} 压缩 {len(raw)} B → 解出 {len(data)} B, "
+                  f"期望 extent {sum(e['num_blocks'] for e in o['dst'])*4096} B")
         if idx % 5 == 0 or idx == len(ops) - 1:
             print(f"    op {idx+1}/{len(ops)} type={t} len={o['data_length']} "
                   f"累计传输 {rf.transferred/1048576:.1f} MB, {_t.time()-t0:.0f}s")
