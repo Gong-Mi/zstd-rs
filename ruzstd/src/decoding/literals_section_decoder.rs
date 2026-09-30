@@ -121,6 +121,21 @@ fn decompress_literals(
             // after the padding-skip and init_state,
             // bits_remaining == stream_len*8 - skipped_bits - max_bits
             let mut budget = (stream.len() * 8) as isize - skipped_bits as isize;
+            let max_bits = scratch.table.max_num_bits as isize;
+
+            // Fast path: four symbols per refill, decoded straight out of a
+            // register window. `budget >= 48 + max_bits` is
+            // `bits_remaining() >= 48`, the precondition that makes
+            // `decode_batch4` bit-exact with the serial rounds below.
+            while budget >= 48 + max_bits && written + 4 <= regen {
+                // SAFETY: `written + 4 <= regen` and `target` is reserved for
+                // `regen` bytes above; nothing else touches `target` while
+                // `base` is live.
+                let consumed = unsafe { decoder.decode_batch4(&mut br, base.add(written)) };
+                written += 4;
+                budget -= consumed as isize;
+            }
+
             while budget > 0 {
                 if written >= regen {
                     return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
@@ -163,10 +178,44 @@ fn decompress_literals(
             return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
         }
         decoder.init_state(&mut br);
-        while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
-            target.push(decoder.decode_symbol());
-            decoder.next_state(&mut br);
+
+        // Same shape as the four-stream path: raw-pointer writes into the
+        // pre-reserved `target`, a local bit budget instead of a per-symbol
+        // `bits_remaining()` recomputation, and a four-symbol batch fast path.
+        // `budget == bits_remaining() + max_bits` here as well.
+        let regen = section.regenerated_size as usize;
+        let base = target.as_mut_ptr();
+        let mut written = 0usize;
+        let max_bits = scratch.table.max_num_bits as isize;
+        let mut budget = (source.len() * 8) as isize - skipped_bits as isize;
+
+        while budget >= 48 + max_bits && written + 4 <= regen {
+            // SAFETY: `written + 4 <= regen` and `target` is reserved for `regen`
+            // bytes; nothing else touches `target` while `base` is live.
+            let consumed = unsafe { decoder.decode_batch4(&mut br, base.add(written)) };
+            written += 4;
+            budget -= consumed as isize;
         }
+
+        while budget > 0 {
+            if written >= regen {
+                return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
+                    decoded: written + 1,
+                    expected: regen,
+                });
+            }
+            // SAFETY: written < regen, and target was reserved for regen bytes;
+            // nothing else touches target while `base` is live.
+            unsafe { base.add(written).write(decoder.decode_symbol()) };
+            written += 1;
+            let nb = decoder.next_state(&mut br);
+            budget -= nb as isize;
+        }
+        // `budget <= 0` is where the previous `bits_remaining() > -max_bits` loop
+        // stopped as well; an underproduction is still caught by the length check
+        // after this function.
+        unsafe { target.set_len(written) };
+
         bytes_read += source.len() as u32;
     }
 
