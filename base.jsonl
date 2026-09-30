@@ -1,0 +1,4 @@
+{"kind":"meta","reps":1,"iters":3,"size_mb":8,"ratios":{"text":4.04,"random":1.00,"binary-medium":1.32},"degenerate":["random(ratio=1.00)"]}
+{"kind":"sample","rep":1,"corpus":"text","c_ms":11.9933,"ruzstd_ms":33.2603,"c_cpu_ms":11.9175,"ruzstd_cpu_ms":32.9183}
+{"kind":"sample","rep":1,"corpus":"random","c_ms":5.7358,"ruzstd_ms":6.3728,"c_cpu_ms":5.6692,"ruzstd_cpu_ms":6.2953}
+{"kind":"sample","rep":1,"corpus":"binary-medium","c_ms":11.8443,"ruzstd_ms":52.5203,"c_cpu_ms":11.7779,"ruzstd_cpu_ms":51.5060}
