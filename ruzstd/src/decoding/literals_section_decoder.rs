@@ -138,17 +138,50 @@ fn decompress_literals(
             && w3 + 4 <= seg_len[2]
             && w4 + 4 <= seg_len[3]
         {
+            // Two two-symbol lookups per stream instead of four one-symbol ones:
+            // at most 4 symbols and at most `2 * (max_num_bits + 1) <= 24` bits
+            // per stream and iteration, which the 48-bit part of the guard above
+            // covers. `decode_x2_pair` reports how many bits it consumed, and the
+            // next lookup reuses the same window shifted by exactly those bits.
+            //
             // SAFETY: every `w + 4 <= len` holds and the four segments are
             // disjoint ranges inside the `regen` bytes reserved above; nothing
             // else writes to `target` while `base` is live.
-            b1 -= unsafe { dec1.decode_batch4(&mut br1, base.add(seg[0] + w1)) } as isize;
-            w1 += 4;
-            b2 -= unsafe { dec2.decode_batch4(&mut br2, base.add(seg[1] + w2)) } as isize;
-            w2 += 4;
-            b3 -= unsafe { dec3.decode_batch4(&mut br3, base.add(seg[2] + w3)) } as isize;
-            w3 += 4;
-            b4 -= unsafe { dec4.decode_batch4(&mut br4, base.add(seg[3] + w4)) } as isize;
-            w4 += 4;
+            let win1 = br1.unread_window();
+            let (l1, n1) = unsafe { dec1.decode_x2_pair(win1, base.add(seg[0] + w1)) };
+            let (l2, n2) = unsafe {
+                dec1.decode_x2_pair(win1 << n1, base.add(seg[0] + w1 + l1 as usize))
+            };
+            w1 += (l1 + l2) as usize;
+            b1 -= (n1 + n2) as isize;
+            br1.consume(n1 + n2);
+
+            let win2 = br2.unread_window();
+            let (l3, n3) = unsafe { dec2.decode_x2_pair(win2, base.add(seg[1] + w2)) };
+            let (l4, n4) = unsafe {
+                dec2.decode_x2_pair(win2 << n3, base.add(seg[1] + w2 + l3 as usize))
+            };
+            w2 += (l3 + l4) as usize;
+            b2 -= (n3 + n4) as isize;
+            br2.consume(n3 + n4);
+
+            let win3 = br3.unread_window();
+            let (l5, n5) = unsafe { dec3.decode_x2_pair(win3, base.add(seg[2] + w3)) };
+            let (l6, n6) = unsafe {
+                dec3.decode_x2_pair(win3 << n5, base.add(seg[2] + w3 + l5 as usize))
+            };
+            w3 += (l5 + l6) as usize;
+            b3 -= (n5 + n6) as isize;
+            br3.consume(n5 + n6);
+
+            let win4 = br4.unread_window();
+            let (l7, n7) = unsafe { dec4.decode_x2_pair(win4, base.add(seg[3] + w4)) };
+            let (l8, n8) = unsafe {
+                dec4.decode_x2_pair(win4 << n7, base.add(seg[3] + w4 + l7 as usize))
+            };
+            w4 += (l7 + l8) as usize;
+            b4 -= (n7 + n8) as isize;
+            br4.consume(n7 + n8);
         }
 
         // Tails: a stream can run out of bits before the others, so each stream

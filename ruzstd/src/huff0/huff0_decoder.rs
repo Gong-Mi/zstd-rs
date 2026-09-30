@@ -93,11 +93,64 @@ impl<'t> HuffmanDecoder<'t> {
         br.consume(total);
         total
     }
+
+    /// Decode one or two symbols with a single table lookup.
+    ///
+    /// `window` must be the left-aligned unread region of the bit container
+    /// (`BitReaderReversed::unread_window`), i.e. the next bit of the stream is
+    /// its most significant bit. Every subsequent lookup of the same batch can
+    /// reuse the same window shifted left by the bits consumed so far.
+    ///
+    /// Returns `(symbols written, bits consumed)`. Both are exactly what the
+    /// one-symbol path would produce for the same window, because the table only
+    /// stores a second symbol when its code is fully determined by the window.
+    ///
+    /// `self.state` is kept in sync (`state` is by construction the next
+    /// `max_num_bits` bits of the stream), so a caller may switch to
+    /// `decode_batch4`/`next_state` afterwards, e.g. to finish a stream with the
+    /// serial path.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must be valid for two byte writes.
+    #[inline(always)]
+    pub unsafe fn decode_x2_pair(&mut self, window: u64, dst: *mut u8) -> (u8, u8) {
+        // The lookup key is the current `n`-bit look-ahead (`state`) followed by
+        // the next stream bit, which is the most significant bit of the unread
+        // window. `window` is the unread region (bits *after* the look-ahead), so
+        // a caller doing several lookups per refill passes it shifted left by the
+        // bits consumed so far.
+        let idx = ((self.state as usize) << 1) | (window >> 63) as usize;
+        // SAFETY: the table has `1 << dt_log` entries (dt_log <= 12) and `idx`
+        // is masked to `dt_log` bits by the shift above, so it is in bounds.
+        let e = unsafe { *self.table.decode_x2.get_unchecked(idx) };
+        // SAFETY: caller guarantees room for two writes.
+        unsafe {
+            dst.write(e.seq as u8);
+            if e.len == 2 {
+                dst.add(1).write((e.seq >> 8) as u8);
+            }
+        }
+        // Slide the look-ahead forward by the bits this lookup consumed: the new
+        // `state` is `(state << nb) | next nb stream bits`, masked to
+        // `max_num_bits` bits — the same update `next_state` performs per symbol.
+        let nb = e.nb as u32;
+        if nb != 0 {
+            self.state = ((self.state << nb) | (window >> (64 - nb)))
+                & (self.table.decode.len() as u64 - 1);
+        }
+        (e.len, e.nb)
+    }
 }
 
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 pub struct HuffmanTable {
     decode: Vec<Entry>,
+    /// Second-level table for two-symbol lookups ("X2"): indexed by
+    /// `max_num_bits + 1` bits instead of `max_num_bits`, so one lookup can
+    /// resolve two symbols when the second one's code fits in what is left of
+    /// the window. Halves the number of dependent table lookups per symbol.
+    decode_x2: Vec<EntryX2>,
     /// The weight of a symbol is the number of occurences in a table.
     /// This value is used in constructing a binary tree referred to as
     /// a Huffman tree. Once this tree is constructed, it can be used to build the
@@ -120,6 +173,7 @@ impl HuffmanTable {
     pub fn new() -> HuffmanTable {
         HuffmanTable {
             decode: Vec::new(),
+            decode_x2: Vec::new(),
 
             weights: Vec::with_capacity(256),
             max_num_bits: 0,
@@ -415,7 +469,78 @@ impl HuffmanTable {
             }
         }
 
+        self.build_two_symbol_table();
         Ok(())
+    }
+
+    /// Build the two-symbol lookup table from the one-symbol table.
+    ///
+    /// For every `max_num_bits + 1` bit window: the first symbol comes from the
+    /// one-symbol table indexed by the top `max_num_bits` bits, and a second
+    /// symbol is stored when its whole code fits into the bits that are left in
+    /// the window (`nb1 <= max_num_bits + 1 - nb0`). When fewer than
+    /// `max_num_bits` bits are left, the window does not cover the whole lookup
+    /// range of the one-symbol table, so the range is only usable when every
+    /// index in it maps to the same symbol and length — which a single
+    /// comparison of the two ends decides, because the table is filled in code
+    /// order and equal entries are therefore contiguous.
+    fn build_two_symbol_table(&mut self) {
+        let n = self.max_num_bits as usize;
+        let size = 1usize << n;
+        let x2_size = size << 1;
+        self.decode_x2.clear();
+        self.decode_x2.resize(
+            x2_size,
+            EntryX2 {
+                seq: 0,
+                nb: 0,
+                len: 1,
+            },
+        );
+
+        for idx in 0..x2_size {
+            let e0 = self.decode[idx >> 1];
+            let nb0 = e0.num_bits as usize;
+            if nb0 == 0 {
+                // Not reachable for a fully filled table; keep the one-symbol
+                // behaviour (emit the symbol, consume no bits) instead of
+                // underflowing on the arithmetic below.
+                self.decode_x2[idx] = EntryX2 {
+                    seq: u16::from(e0.symbol),
+                    nb: 0,
+                    len: 1,
+                };
+                continue;
+            }
+
+            let room = n + 1 - nb0;
+            let base = ((idx << nb0) & (x2_size - 1)) >> 1;
+            let unknown = nb0 - 1;
+            let second_known = if unknown == 0 {
+                self.decode[base].num_bits as usize <= room
+            } else {
+                let last = base + (1 << unknown) - 1;
+                last < size
+                    && self.decode[last].symbol == self.decode[base].symbol
+                    && self.decode[last].num_bits == self.decode[base].num_bits
+                    && self.decode[base].num_bits as usize <= room
+            };
+
+            self.decode_x2[idx] = if second_known {
+                let e1 = self.decode[base];
+                EntryX2 {
+                    seq: u16::from(e0.symbol) | (u16::from(e1.symbol) << 8),
+                    nb: e0.num_bits + e1.num_bits,
+                    len: 2,
+                }
+            } else {
+                EntryX2 {
+                    seq: u16::from(e0.symbol),
+                    nb: e0.num_bits,
+                    len: 1,
+                }
+            };
+        }
     }
 }
 
@@ -427,6 +552,20 @@ impl Default for HuffmanTable {
 
 /// A single entry in the table contains the decoded symbol/literal and the
 /// size of the prefix code.
+/// One entry of the two-symbol lookup table.
+///
+/// `seq` packs the symbols little byte first (first symbol in the low byte),
+/// `nb` is the number of bits the present symbols consume together and `len` is
+/// how many symbols are present (1 or 2). A second symbol is only stored when
+/// its code is fully contained in the lookup window, so consuming `nb` bits and
+/// emitting `len` symbols is bit-exact with `len` rounds of the one-symbol path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct EntryX2 {
+    pub seq: u16,
+    pub nb: u8,
+    pub len: u8,
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct Entry {
     /// The byte that the prefix code replaces during encoding.
@@ -440,4 +579,98 @@ pub struct Entry {
 fn highest_bit_set(x: u32) -> u32 {
     assert!(x > 0);
     u32::BITS - x.leading_zeros()
+}
+
+#[cfg(test)]
+mod x2_two_symbol_table {
+    //! The two-symbol lookup path must produce exactly the same symbols, and
+    //! consume exactly the same bits, as the serial one-symbol path.
+
+    use super::*;
+    use crate::bit_io::{BitReaderReversed, BitWriter};
+    use crate::huff0::huff0_encoder;
+    // no_std crate: the test harness has std, but `eprintln!` is not in scope.
+    use std::eprintln;
+
+    fn skip_padding(br: &mut BitReaderReversed<'_>) -> i32 {
+        let mut skipped = 0;
+        loop {
+            let v = br.get_bits(1);
+            skipped += 1;
+            if v == 1 || skipped > 8 {
+                break;
+            }
+        }
+        skipped
+    }
+
+    #[test]
+    fn x2_matches_x1() {
+        for seed in 0u32..32 {
+            let data: Vec<u8> = (0..300usize)
+                .map(|i| ((i as u32 * 7 + seed) % 5) as u8)
+                .collect();
+            let mut writer = BitWriter::new();
+            let enc_table = huff0_encoder::HuffmanTable::build_from_data(&data);
+            let mut enc = huff0_encoder::HuffmanEncoder::new(&enc_table, &mut writer);
+            enc.encode(&data, true);
+            let encoded = writer.dump();
+            let mut table = HuffmanTable::new();
+            let table_bytes = table.build_decoder(&encoded).unwrap();
+            let payload = &encoded[table_bytes as usize..];
+            let max_bits = table.max_num_bits as isize;
+
+            // serial
+            let mut d1 = HuffmanDecoder::new(&table);
+            let mut br1 = BitReaderReversed::new(payload);
+            let sk1 = skip_padding(&mut br1);
+            d1.init_state(&mut br1);
+            let mut out1 = Vec::new();
+            while br1.bits_remaining() > -max_bits {
+                out1.push(d1.decode_symbol());
+                d1.next_state(&mut br1);
+            }
+
+            // two-symbol lookups, serial tail
+            let mut d2 = HuffmanDecoder::new(&table);
+            let mut br2 = BitReaderReversed::new(payload);
+            let sk2 = skip_padding(&mut br2);
+            d2.init_state(&mut br2);
+            let mut out2 = Vec::new();
+            let mut budget = (payload.len() * 8) as isize - sk2 as isize;
+            let mut buf = [0u8; 8];
+            while budget >= 48 + max_bits && out2.len() + 4 <= data.len() {
+                let win = br2.unread_window();
+                let (l1, n1) = unsafe { d2.decode_x2_pair(win, buf.as_mut_ptr()) };
+                let (l2, n2) =
+                    unsafe { d2.decode_x2_pair(win << n1, buf.as_mut_ptr().add(l1 as usize)) };
+                out2.extend_from_slice(&buf[..(l1 + l2) as usize]);
+                br2.consume(n1 + n2);
+                budget -= (n1 + n2) as isize;
+            }
+            while budget > 0 && out2.len() < data.len() {
+                out2.push(d2.decode_symbol());
+                let nb = d2.next_state(&mut br2);
+                budget -= nb as isize;
+            }
+
+            assert_eq!(sk1, sk2, "seed {seed}: padding skip differs");
+            if out1 != out2 {
+                let i = out1
+                    .iter()
+                    .zip(out2.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or_else(|| out1.len().min(out2.len()));
+                panic!(
+                    "seed {seed}: divergence at {i}/{}, max_bits={}, before={:?} x1={:?} x2={:?}",
+                    out1.len(),
+                    max_bits,
+                    &out1[i.saturating_sub(4)..i],
+                    &out1[i..(i + 6).min(out1.len())],
+                    &out2[i..(i + 6).min(out2.len())]
+                );
+            }
+            assert_eq!(out1.len(), data.len());
+        }
+    }
 }
