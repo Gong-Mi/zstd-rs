@@ -13,7 +13,6 @@
 //! *相对*比较（同轮 ruzstd/C 比值、base vs head 差值），不可当作 aarch64 绝对值。
 
 use rand::{Rng, SeedableRng};
-use std::io::Read;
 use std::time::Instant;
 
 fn gen_text(size: usize) -> Vec<u8> {
@@ -75,16 +74,56 @@ fn ruzstd_decode(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// best-of over `iters`; returns seconds.
-fn best_of<F: FnMut()>(iters: u32, mut f: F) -> f64 {
+/// best-of over `iters`; returns (wall seconds, CPU seconds).
+///
+/// CPU time comes from `/proc/self/stat` (utime+stime, CLK_TCK=100 on Linux).
+/// It is a much more load-tolerant reference than wall time: it counts only the
+/// CPU this process actually burned, so a busy runner or a noisy neighbour
+/// inflates it far less than wall clock. Still a reference, not ground truth.
+fn best_of<F: FnMut()>(iters: u32, mut f: F) -> (f64, f64) {
     f(); // warmup
-    let mut best = f64::MAX;
+    let mut best_wall = f64::MAX;
+    let mut best_cpu = f64::MAX;
     for _ in 0..iters {
+        let cpu0 = cpu_seconds();
         let t = Instant::now();
         f();
-        best = best.min(t.elapsed().as_secs_f64());
+        let wall = t.elapsed().as_secs_f64();
+        let cpu = (cpu_seconds() - cpu0).max(0.0);
+        best_wall = best_wall.min(wall);
+        best_cpu = best_cpu.min(cpu);
     }
-    best
+    (best_wall, best_cpu)
+}
+
+/// Process CPU time (user+sys) in seconds, at nanosecond resolution.
+///
+/// Uses `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` — declared here directly
+/// instead of pulling in a `libc` dependency (the value is 2 on Linux for every
+/// architecture we care about). This is a much more load-tolerant reference than
+/// wall time: it counts only the CPU this process actually burned, so a busy
+/// runner slows it far less than wall clock. Still a reference, not ground truth.
+fn cpu_seconds() -> f64 {
+    const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+    extern "C" {
+        fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+    }
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, properly aligned `Timespec` for the duration of
+    // the call, which is what `clock_gettime` writes into.
+    let rc = unsafe { clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    if rc != 0 {
+        return 0.0;
+    }
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
 fn main() {
@@ -167,22 +206,27 @@ fn main() {
 
     for rep in 1..=reps {
         for (name, comp, _) in &encoded {
-            let c = best_of(iters, || {
+            let (c_wall, c_cpu) = best_of(iters, || {
                 let _ = zstd::decode_all(&comp[..]).unwrap();
             });
-            let rs = best_of(iters, || {
+            let (rs_wall, rs_cpu) = best_of(iters, || {
                 let _ = ruzstd_decode(comp);
             });
             eprintln!(
-                "  rep {rep} {name:<14} C {:>9.3} ms   ruzstd {:>9.3} ms   ruzstd/C {:>5.2}x",
-                c * 1000.0,
-                rs * 1000.0,
-                rs / c
+                "  rep {rep} {name:<14} C {:>9.3} ms (cpu {:>8.3})   ruzstd {:>9.3} ms (cpu {:>8.3})   wall ratio {:>5.2}x  cpu ratio {:>5.2}x",
+                c_wall * 1000.0,
+                c_cpu * 1000.0,
+                rs_wall * 1000.0,
+                rs_cpu * 1000.0,
+                rs_wall / c_wall,
+                rs_cpu / c_cpu.max(f64::MIN_POSITIVE)
             );
             println!(
-                "{{\"kind\":\"sample\",\"rep\":{rep},\"corpus\":\"{name}\",\"c_ms\":{:.4},\"ruzstd_ms\":{:.4}}}",
-                c * 1000.0,
-                rs * 1000.0
+                "{{\"kind\":\"sample\",\"rep\":{rep},\"corpus\":\"{name}\",\"c_ms\":{:.4},\"ruzstd_ms\":{:.4},\"c_cpu_ms\":{:.4},\"ruzstd_cpu_ms\":{:.4}}}",
+                c_wall * 1000.0,
+                rs_wall * 1000.0,
+                c_cpu * 1000.0,
+                rs_cpu * 1000.0
             );
         }
     }
