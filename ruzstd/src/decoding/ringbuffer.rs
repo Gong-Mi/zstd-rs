@@ -169,6 +169,29 @@ impl RingBuffer {
         debug_assert!(self.len() + len < self.cap);
         debug_assert!(self.free() >= len, "free: {} len: {}", self.free(), len);
 
+        // Fast path: the free region starting at `tail` is contiguous and takes
+        // the whole slice — the steady state while a block is written. Saves the
+        // two-cursor free-space computation and the second (wrapping) copy of
+        // the general path below.
+        let after_tail = if self.tail >= self.head {
+            self.cap - self.tail
+        } else {
+            self.head - self.tail
+        };
+        if len <= after_tail {
+            // SAFETY: `tail < cap` (invariant 3) and `len <= cap - tail`, so the
+            // destination range is in bounds and lies in the free region after
+            // the tail; `data` is a valid slice of `len` bytes.
+            unsafe {
+                self.buf
+                    .as_ptr()
+                    .add(self.tail)
+                    .copy_from_nonoverlapping(ptr, len)
+            };
+            self.tail = (self.tail + len) % self.cap;
+            return;
+        }
+
         let ((f1_ptr, f1_len), (f2_ptr, f2_len)) = self.free_slice_parts();
         debug_assert!(f1_len + f2_len >= len, "{} + {} < {}", f1_len, f2_len, len);
 
@@ -294,6 +317,31 @@ impl RingBuffer {
     pub unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
         debug_assert!(start + len <= self.len());
         debug_assert!(self.free() >= len);
+
+        // Fast path: read section and write section are both contiguous (no wrap
+        // between head and tail), which is where a block's sequences usually
+        // land. One copy with the overshooting copier instead of the four-case
+        // source/destination walk below.
+        if self.head < self.tail && len <= self.cap - self.tail {
+            let src = (
+                // SAFETY: `head < tail <= cap` and `head + start + len <= tail`,
+                // so this points at initialized data.
+                unsafe { self.buf.as_ptr().add(self.head + start) }.cast_const(),
+                // Src length: everything up to the logical end of the buffer.
+                self.tail - self.head - start,
+            );
+            let dst = (
+                // SAFETY: `tail < cap` (invariant 3).
+                unsafe { self.buf.as_ptr().add(self.tail) },
+                // Dst length: the free run after the tail.
+                self.cap - self.tail,
+            );
+            // SAFETY: `src` points at initialized data, `dst` at free memory;
+            // `copy_bytes_overshooting` never writes past `dst.1` bytes.
+            unsafe { copy_bytes_overshooting(src, dst, len) };
+            self.tail = (self.tail + len) % self.cap;
+            return;
+        }
 
         if self.head < self.tail {
             // Continuous source section and possibly non continuous write section:
