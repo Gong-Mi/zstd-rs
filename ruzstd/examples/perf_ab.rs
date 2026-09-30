@@ -69,7 +69,10 @@ fn gen_repo_sources(dir: &str, size: usize) -> Vec<u8> {
                 if p.is_dir() {
                     walk(&p, out);
                 } else if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
-                    if matches!(ext, "rs" | "c" | "h" | "md" | "toml" | "json" | "yml" | "yaml") {
+                    if matches!(
+                        ext,
+                        "rs" | "c" | "h" | "md" | "toml" | "json" | "yml" | "yaml"
+                    ) {
                         out.push(p);
                     }
                 }
@@ -192,7 +195,10 @@ fn main() {
             "--iters" => iters = args.next().and_then(|v| v.parse().ok()).unwrap_or(iters),
             "--size-mb" => size_mb = args.next().and_then(|v| v.parse().ok()).unwrap_or(size_mb),
             "--encode-mb" => {
-                encode_mb = args.next().and_then(|v| v.parse().ok()).unwrap_or(encode_mb)
+                encode_mb = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(encode_mb)
             }
             "--repo-dir" => repo_dir = args.next().unwrap_or(repo_dir),
             "--profile" => profile = true,
@@ -300,18 +306,10 @@ fn main() {
             let _ = zstd::encode_all(src, 1).unwrap();
         });
         let mut rs_out = Vec::new();
-        ruzstd::encoding::compress(
-            src,
-            &mut rs_out,
-            ruzstd::encoding::CompressionLevel::Fastest,
-        );
+        ruzstd::encoding::compress(src, &mut rs_out, ruzstd::encoding::CompressionLevel::Fastest);
         let (rs_wall, rs_cpu) = best_of(1, || {
             let mut out = Vec::new();
-            ruzstd::encoding::compress(
-                src,
-                &mut out,
-                ruzstd::encoding::CompressionLevel::Fastest,
-            );
+            ruzstd::encoding::compress(src, &mut out, ruzstd::encoding::CompressionLevel::Fastest);
         });
         let ratio_c = src.len() as f64 / c_comp.len().max(1) as f64;
         let ratio_rs = src.len() as f64 / rs_out.len().max(1) as f64;

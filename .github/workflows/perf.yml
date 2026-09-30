@@ -117,9 +117,13 @@ jobs:
           cp base/target/release/examples/perf_ab bins/base
           cp head/target/release/examples/perf_ab bins/head
           if [ "${{ steps.refs.outputs.config_leg }}" = "true" ]; then
-            (cd head && RUSTFLAGS="-C lto=fat -C codegen-units=1 -C target-cpu=native" \
-               CARGO_TARGET_DIR=target-tuned cargo build --release --example perf_ab) \
+            # lto/cgu 走 cargo 的 profile env 覆盖（RUSTFLAGS 里的 -C lto 会被 cargo 拒），
+            # target-cpu 走 RUSTFLAGS
+            (cd head && CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+               RUSTFLAGS="-C target-cpu=native" CARGO_TARGET_DIR=target-tuned \
+               cargo build --release --example perf_ab) \
               || echo "::warning::tuned build failed, config leg skipped"
+            ls -l head/target-tuned/release/examples/perf_ab || true
             cp head/target-tuned/release/examples/perf_ab bins/head_tuned 2>/dev/null || true
           fi
           ls -l bins
