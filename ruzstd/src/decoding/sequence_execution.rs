@@ -95,6 +95,13 @@ pub fn decode_and_execute_sequences(
 
     let num_sequences = section.num_sequences as usize;
 
+    // Per-sequence `bits_remaining()` recomputation (3-4 ops + field loads) is
+    // replaced by a local budget that is decremented by exactly the bits each
+    // sequence consumes: the triples read for offset/match-length/literal-length
+    // plus the bits consumed by the three state updates. The negative check is
+    // then done once after the loop — for valid input identical, for corrupt
+    // input the same error is reported at the end of the block instead of mid-way.
+    let mut bits_budget = br.bits_remaining();
     let mut literals_copy_counter = 0usize;
     let old_buffer_size = buffer.len();
     let mut seq_sum = 0u32;
@@ -164,20 +171,27 @@ pub fn decode_and_execute_sequences(
         seq_sum += seq_ll;
 
         if seq_idx + 1 < num_sequences {
+            // 扣减必须在 update_state 之前读 state.num_bits——更新之后就变成下一个
+            // 状态的位数了（上一版就是错在这里，测试直接抓到）
             if ll_rle.is_none() {
+                bits_budget -= ll_dec.state.num_bits as isize;
                 ll_dec.update_state(&mut br);
             }
             if ml_rle.is_none() {
+                bits_budget -= ml_dec.state.num_bits as isize;
                 ml_dec.update_state(&mut br);
             }
             if of_rle.is_none() {
+                bits_budget -= of_dec.state.num_bits as isize;
                 of_dec.update_state(&mut br);
             }
         }
 
-        if br.bits_remaining() < 0 {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
-        }
+        bits_budget -= (of_code as isize) + (ml_num_bits as isize) + (ll_num_bits as isize);
+    }
+
+    if bits_budget < 0 {
+        return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
     }
 
     if br.bits_remaining() > 0 {

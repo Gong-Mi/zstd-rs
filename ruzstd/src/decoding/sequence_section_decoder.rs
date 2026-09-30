@@ -50,6 +50,7 @@ const LL_LOOKUP: [(u32, u8); 36] = [
     (65536, 16),
 ];
 #[inline(always)]
+#[inline]
 pub fn lookup_ll_code(code: u8) -> (u32, u8) {
     LL_LOOKUP[code as usize]
 }
@@ -114,6 +115,7 @@ const ML_LOOKUP: [(u32, u8); 53] = [
     (65539, 16),
 ];
 #[inline(always)]
+#[inline]
 pub fn lookup_ml_code(code: u8) -> (u32, u8) {
     ML_LOOKUP[code as usize]
 }
