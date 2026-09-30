@@ -91,6 +91,14 @@ fn decompress_literals(
         let stream3 = &source[jump2..jump3];
         let stream4 = &source[jump3..];
 
+        // EXP4 probe: raw-pointer writes into pre-reserved target + local bit
+        // budget instead of per-symbol bits_remaining() recomputation.
+        // Same decode order; corrupt data that would overproduce literals now
+        // errors at the guard instead of the final length check.
+        let regen = section.regenerated_size as usize;
+        let mut written: usize = 0;
+        let base = target.as_mut_ptr();
+
         for stream in &[stream1, stream2, stream3, stream4] {
             let mut decoder = HuffmanDecoder::new(&scratch.table);
             let mut br = BitReaderReversed::new(stream);
@@ -109,9 +117,23 @@ fn decompress_literals(
             }
             decoder.init_state(&mut br);
 
-            while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
-                target.push(decoder.decode_symbol());
-                decoder.next_state(&mut br);
+            // budget == br.bits_remaining() + max_bits, tracked incrementally:
+            // after the padding-skip and init_state,
+            // bits_remaining == stream_len*8 - skipped_bits - max_bits
+            let mut budget = (stream.len() * 8) as isize - skipped_bits as isize;
+            while budget > 0 {
+                if written >= regen {
+                    return Err(DecompressLiteralsError::DecodedLiteralCountMismatch {
+                        decoded: written + 1,
+                        expected: regen,
+                    });
+                }
+                // SAFETY: written < regen, and target was reserved for regen bytes
+                // above; nothing else touches target while `base` is live.
+                unsafe { base.add(written).write(decoder.decode_symbol()) };
+                written += 1;
+                let nb = decoder.next_state(&mut br);
+                budget -= nb as isize;
             }
             if br.bits_remaining() != -(scratch.table.max_num_bits as isize) {
                 return Err(DecompressLiteralsError::BitstreamReadMismatch {
@@ -120,6 +142,7 @@ fn decompress_literals(
                 });
             }
         }
+        unsafe { target.set_len(written) };
 
         bytes_read += source.len() as u32;
     } else {
