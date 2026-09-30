@@ -7,9 +7,9 @@ use crate::decoding::decode_buffer::DecodeBuffer;
 use crate::decoding::errors::DecodeBufferError;
 use crate::decoding::errors::FSEDecoderError;
 use crate::decoding::errors::{DecodeSequenceError, ExecuteSequencesError};
-use crate::fse::FSEDecoder;
 #[cfg(feature = "prof")]
 use crate::decoding::prof;
+use crate::fse::FSEDecoder;
 
 /// Error type for the fused sequence decode+execute pass.
 ///

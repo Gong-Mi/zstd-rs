@@ -244,7 +244,9 @@ fn main() {
     }
     #[cfg(not(feature = "prof"))]
     if profile {
-        eprintln!("--profile needs the `prof` feature: cargo run --features prof --example gap_vs_c");
+        eprintln!(
+            "--profile needs the `prof` feature: cargo run --features prof --example gap_vs_c"
+        );
     }
 
     if failures > 0 {
@@ -279,7 +281,8 @@ fn report_profile(label: &str, comp: &[u8], orig_len: u32) {
     let seq = get(&p::SEQ_LOOP_TICKS);
     let phased = (lit + seq).max(1.0);
     let samples = get(&p::SAMPLES).max(1.0);
-    let inloop = (get(&p::FSE_TICKS) + get(&p::LIT_COPY_TICKS) + get(&p::MATCH_COPY_TICKS)).max(1.0);
+    let inloop =
+        (get(&p::FSE_TICKS) + get(&p::LIT_COPY_TICKS) + get(&p::MATCH_COPY_TICKS)).max(1.0);
 
     println!(
         "{{\"kind\":\"profile\",\"corpus\":\"{label}\",\"literals_pct\":{:.1},\"seq_loop_pct\":{:.1},\"lit_raw_mb\":{:.2},\"lit_rle_mb\":{:.2},\"lit_huf_mb\":{:.2},\"huf4_sections\":{},\"huf1_sections\":{},\"lit_blocks_raw\":{},\"lit_blocks_rle\":{},\"lit_blocks_huf\":{},\"seqs\":{},\"samples\":{},\"inloop_fse_pct\":{:.1},\"inloop_litcopy_pct\":{:.1},\"inloop_matchcopy_pct\":{:.1}}}",
