@@ -109,6 +109,15 @@ fn decompress_literals(
             }
             decoder.init_state(&mut br);
 
+            // Fast path: decode 4 symbols per refill while enough real bits
+            // remain. The >= 48 guard guarantees all bits consumed by a batch
+            // are real stream bits, making this bit-exact with the serial loop.
+            while br.bits_remaining() >= 48 {
+                let mut out = [0u8; 4];
+                decoder.decode_batch4(&mut br, &mut out);
+                target.extend_from_slice(&out);
+            }
+
             while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
                 target.push(decoder.decode_symbol());
                 decoder.next_state(&mut br);
@@ -140,6 +149,14 @@ fn decompress_literals(
             return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
         }
         decoder.init_state(&mut br);
+
+        // Fast path: 4 symbols per refill, same guard reasoning as the 4-stream path.
+        while br.bits_remaining() >= 48 {
+            let mut out = [0u8; 4];
+            decoder.decode_batch4(&mut br, &mut out);
+            target.extend_from_slice(&out);
+        }
+
         while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
             target.push(decoder.decode_symbol());
             decoder.next_state(&mut br);

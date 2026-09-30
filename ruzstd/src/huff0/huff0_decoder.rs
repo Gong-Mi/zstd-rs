@@ -51,6 +51,42 @@ impl<'t> HuffmanDecoder<'t> {
         self.state |= new_bits;
         num_bits
     }
+
+    /// Decode 4 symbols in one go, writing them into `out` and returning the
+    /// total number of bits consumed from the bit reader.
+    ///
+    /// Requires the caller to have established that at least 44 real bits are
+    /// still unread in `br` (e.g. `br.bits_remaining() >= 48`), so that every
+    /// bit consumed here is a real stream bit. Under that precondition this is
+    /// bit-exact with four serial `decode_symbol`/`next_state` rounds and the
+    /// termination checks of the surrounding loop are unaffected.
+    #[inline(always)]
+    pub fn decode_batch4(&mut self, br: &mut BitReaderReversed<'_>, out: &mut [u8; 4]) -> u8 {
+        let table = &self.table.decode;
+        let mask = table.len() as u64 - 1;
+        let mut window = br.unread_window();
+        let mut state = self.state;
+        let mut total = 0u8;
+
+        for slot in out.iter_mut() {
+            // SAFETY: `state` is always masked to `table.len() - 1` below and
+            // initialized to `max_num_bits` bits in `init_state`, which is the
+            // table index space.
+            let entry = unsafe { *table.get_unchecked(state as usize) };
+            *slot = entry.symbol;
+            let num_bits = entry.num_bits;
+            if num_bits != 0 {
+                state = (state << num_bits) | (window >> (64 - num_bits as u32));
+                state &= mask;
+                window <<= num_bits;
+                total += num_bits;
+            }
+        }
+
+        self.state = state;
+        br.consume(total);
+        total
+    }
 }
 
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
