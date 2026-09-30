@@ -118,11 +118,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: corpus-cache
-          key: real-corpus-v1-${{ steps.refs.outputs.corpus_bucket }}
+          key: real-corpus-v2-${{ steps.refs.outputs.corpus_bucket }}
 
       - name: Warn if real corpus cache missing
         if: steps.refs.outputs.real_corpus == 'true' && steps.corpus_cache.outputs.cache-hit != 'true'
-        run: echo "::warning::real corpus 缓存未命中（key=real-corpus-v1-${{ steps.refs.outputs.corpus_bucket }}）——先跑 corpus prepare 工作流"
+        run: echo "::warning::real corpus 缓存未命中（key=real-corpus-v2-${{ steps.refs.outputs.corpus_bucket }}）——先跑 corpus prepare 工作流"
 
       - name: Share harness into base
         run: |
