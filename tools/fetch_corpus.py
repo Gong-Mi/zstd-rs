@@ -48,10 +48,26 @@ def resolve_api(device, os_ver, android):
     if out.returncode != 0:
         raise RuntimeError(f"query_xiaomi_rom failed: {out.stderr[:300]}")
     data = json.loads(out.stdout)
+
+    def find_urls(obj, acc):
+        """递归收集任何 http(s) 字符串，避免依赖 API 的字段结构。"""
+        if isinstance(obj, str):
+            if obj.startswith("http://") or obj.startswith("https://"):
+                acc.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                find_urls(v, acc)
+        elif isinstance(obj, list):
+            for v in obj:
+                find_urls(v, acc)
+        return acc
+
     for rom in data.get("roms", []):
-        for url in rom.get("urls", []):
-            if url:
-                return url, rom.get("filename", "rom.zip"), rom.get("size"), rom.get("md5")
+        urls = find_urls(rom, [])
+        if urls:
+            # 优先整包（ota_full），其次任何可达 URL
+            urls.sort(key=lambda u: (0 if "ota_full" in u else 1, len(u)))
+            return urls[0], rom.get("filename", "rom.zip"), rom.get("size"), rom.get("md5")
     raise RuntimeError(f"no downloadable rom in api response for {device} {os_ver} {android}")
 
 

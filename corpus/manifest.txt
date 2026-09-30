@@ -19,3 +19,11 @@
 #
 # 例（prague 的 boot.img 直链；等确认 URL/哈希后取消注释）：
 # kernel-real | url | prague | OS4.0.0.7 | 16.0 | https://example.invalid/boot.img | - | kernel
+
+# 已由 miotaV3 实测确认（任何设备都行，这里取 violin）：
+#   filename = violin-ota_full-OS2.0.203.0.VOTCNXM-user-15.0-701c5549f6.zip
+#   md5      = 701c5549f6d3e60cef9172ec6187b80a
+# mode=api 让 CI 每次现查地址；extract=kernel 走 boot.img → 内核。
+# 注意：整包是 GB 级，CI 侧应走 payload Range 只取 boot 分区（下一步工具），
+# 在那之前这条会因体量被跳过（fetch_corpus 的大小护栏）。
+kernel-real | api | violin | OS2.0.203.0.VOTCNXM | 15.0 | - | - | kernel
