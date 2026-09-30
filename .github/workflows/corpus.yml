@@ -1,0 +1,95 @@
+--- 
+name: corpus prepare
+
+# 真实语料的"先拉、解压、进缓存"工作流（与 perf A/B 解耦）：
+#   Range 拉 OTA 里的 payload.bin 头 → 按分区 op 表只取 boot 分区 → 解 XZ → 拼 boot.img
+#   → 解出内核镜像 → 落到 corpus-cache/ → 存进 GitHub Actions cache（3 天轮转 key）
+# 之后 perf A/B 的 real_corpus=true 腿直接 restore 这个缓存来跑测试，不再重复下载。
+#
+# 3 天轮转：key 里带 epoch天/3 的桶号，桶一变缓存就 miss，于是重新拉一次语料。
+# 手动触发：workflow_dispatch；也可以在 push 到 corpus-* 分支时验证。
+on:
+  workflow_dispatch:
+    inputs:
+      max_mb:
+        description: '本次 Range 传输总量上限（MB）'
+        default: '300'
+        required: false
+  push:
+    branches:
+      - 'corpus-*'
+  schedule:
+    # 每 3 天一次（cron 不支持"每 3 天"，用两个日期错开近似；配合桶号轮转足够）
+    - cron: '0 4 */3 * *'
+
+jobs:
+  prepare:
+    name: fetch + extract boot kernel -> cache
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute cache key (3 天轮转桶)
+        id: key
+        run: |
+          echo "bucket=$(( $(date +%s) / 86400 / 3 ))" >> "$GITHUB_OUTPUT"
+          echo "key=real-corpus-v1-$(( $(date +%s) / 86400 / 3 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cache (命中就直接结束，不下载)
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: corpus-cache
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Install python deps
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          python3 -m pip install --quiet lz4 || echo "::warning::lz4 unavailable"
+
+      - name: Fetch boot partition (HTTP Range, 不整包下载)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p corpus-cache
+          # 只取 boot 分区：Range 读 zip 中央目录 + payload manifest，再按 op 取数据
+          python3 tools/fetch_payload_partition.py \
+            --manifest corpus/manifest.txt \
+            --name kernel-real \
+            --partition boot \
+            --out corpus-cache/boot.img \
+            --max-mb ${{ github.event.inputs.max_mb || '300' }} \
+            --log corpus-cache/range.log
+          echo "== Range 记账 =="; tail -5 corpus-cache/range.log; wc -l corpus-cache/range.log
+
+      - name: Extract kernel image
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          python3 tools/unpack_kernel.py --in corpus-cache/boot.img --out corpus-cache/kernel-real.bin \
+            || { echo "::warning::unpack failed, 用 boot.img 整份当语料"; cp corpus-cache/boot.img corpus-cache/kernel-real.bin; }
+          ls -l corpus-cache
+          sha256sum corpus-cache/kernel-real.bin | tee corpus-cache/SHA256
+
+      - name: Report
+        run: |
+          {
+            echo "## corpus prepare"
+            echo
+            echo "- cache key: \`${{ steps.key.outputs.key }}\`"
+            echo "- cache hit: ${{ steps.cache.outputs.cache-hit }}"
+            ls -l corpus-cache 2>/dev/null || echo "(corpus-cache 为空)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact (便于核对/回填哈希)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-cache
+          path: |
+            corpus-cache/boot.img
+            corpus-cache/kernel-real.bin
+            corpus-cache/SHA256
+            corpus-cache/range.log
+          if-no-files-found: warn

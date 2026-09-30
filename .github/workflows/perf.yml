@@ -110,22 +110,19 @@ jobs:
           workspaces: head
 
       # harness 自包含：拷进两侧，保证对照侧跑的是同一份测量代码
-      - name: Cache real corpus (3 天轮转 key)
+      # 真实语料由 corpus prepare 工作流先拉好并进缓存（3 天轮转 key 与之一致）；
+      # 这里只 restore、不下载：缓存 miss 就跳过这条腿并提示去跑 corpus prepare。
+      - name: Restore real corpus cache (3 天轮转 key)
         id: corpus_cache
         if: steps.refs.outputs.real_corpus == 'true'
         uses: actions/cache@v4
         with:
           path: corpus-cache
-          key: real-corpus-${{ hashFiles('head/corpus/manifest.txt') }}-${{ steps.refs.outputs.corpus_bucket }}
+          key: real-corpus-v1-${{ steps.refs.outputs.corpus_bucket }}
 
-      - name: Fetch real corpus (cache miss 时下载)
+      - name: Warn if real corpus cache missing
         if: steps.refs.outputs.real_corpus == 'true' && steps.corpus_cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p corpus-cache
-          # lz4 解压内核镜像用；装不上就退回压缩态当语料（不致命）
-          python3 -m pip install --quiet lz4 || echo "::warning::lz4 unavailable, kernel may stay compressed"
-          python3 head/tools/fetch_corpus.py --manifest head/corpus/manifest.txt --out corpus-cache
-          ls -l corpus-cache
+        run: echo "::warning::real corpus 缓存未命中（key=real-corpus-v1-${{ steps.refs.outputs.corpus_bucket }}）——先跑 corpus prepare 工作流"
 
       - name: Share harness into base
         run: |

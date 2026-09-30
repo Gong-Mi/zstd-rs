@@ -29,7 +29,11 @@ UA = {"User-Agent": "curl/8"}
 
 
 class HttpRangeFile(io.RawIOBase):
-    """只读文件对象：seek/read 都翻译成 HTTP Range 请求。"""
+    """只读文件对象：seek/read 都翻译成 HTTP Range 请求。
+
+    复用同一条 HTTPS 连接（keep-alive），否则每次小 Range 都要重做 TLS 往返，
+    在慢链路上 4KB 一次会慢到分钟级。
+    """
 
     def __init__(self, url, verbose=True, max_bytes=32 << 20, log=None):
         self.url = url
@@ -41,12 +45,43 @@ class HttpRangeFile(io.RawIOBase):
         self.max_bytes = max_bytes
         self.transferred = 0
         self.log = log
+        from urllib.parse import urlsplit
+        u = urlsplit(url)
+        self._host = u.hostname
+        self._path = u.path + (("?" + u.query) if u.query else "")
+        self._conn = None
+
+    def _connection(self):
+        import http.client
+        if self._conn is None:
+            self._conn = http.client.HTTPSConnection(self._host, timeout=60)
+        return self._conn
+
+    def _get(self, extra_headers=None):
+        import http.client
+        headers = {"User-Agent": "curl/8", "Connection": "keep-alive"}
+        if extra_headers:
+            headers.update(extra_headers)
+        for attempt in range(3):
+            try:
+                conn = self._connection()
+                conn.request("GET", self._path, headers=headers)
+                resp = conn.getresponse()
+                return resp
+            except Exception:
+                # 连接断了就重建再试
+                self._conn = None
+        raise RuntimeError("range request failed after retries")
 
     def _size(self):
         if self._len is None:
-            req = urllib.request.Request(self.url, method="HEAD", headers=UA)
-            with urllib.request.urlopen(req, timeout=60) as r:
-                self._len = int(r.headers["Content-Length"])
+            resp = self._get({"Range": "bytes=0-0"})
+            crange = resp.getheader("Content-Range") or ""
+            resp.read()
+            if "/" in crange:
+                self._len = int(crange.rsplit("/", 1)[1])
+            else:
+                self._len = int(resp.getheader("Content-Length") or 0)
             if self.verbose:
                 print(f"  [range] remote size = {self._len/1048576:.1f} MB", file=sys.stderr)
         return self._len
@@ -85,9 +120,8 @@ class HttpRangeFile(io.RawIOBase):
             )
         n = min(n, size - self.pos)
         end = self.pos + n - 1
-        req = urllib.request.Request(self.url, headers={**UA, "Range": f"bytes={self.pos}-{end}"})
-        with urllib.request.urlopen(req, timeout=120) as r:
-            data = r.read()
+        resp = self._get({"Range": f"bytes={self.pos}-{end}"})
+        data = resp.read()
         self._reads += 1
         self.transferred += len(data)
         line = f"[range] #{self._reads} {self.pos}..{end} ({len(data)} B, 累计 {self.transferred/1048576:.2f} MB)"
@@ -209,6 +243,8 @@ def main():
     ap.add_argument("--os")
     ap.add_argument("--android")
     ap.add_argument("--url")
+    ap.add_argument("--manifest", default=None, help="从 corpus/manifest.txt 里按 --name 取条目")
+    ap.add_argument("--name", default=None, help="清单里的语料名（如 kernel-real）")
     ap.add_argument("--partition", default="boot")
     ap.add_argument("--out", required=True)
     ap.add_argument("--quiet", action="store_true")
@@ -216,6 +252,19 @@ def main():
     ap.add_argument("--max-mb", type=int, default=32, help="本次允许的 Range 传输总量上限（MB）")
     ap.add_argument("--log", default=None, help="Range 记账写到此文件（默认 stderr 摘要）")
     a = ap.parse_args()
+
+    if a.manifest and not a.url:
+        for line in open(a.manifest):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            f = [x.strip() for x in line.split("|")]
+            if len(f) >= 8 and (a.name is None or f[0] == a.name):
+                a.url, a.device, a.os, a.android = (f[5] if f[1] == "url" else None), f[2], f[3], f[4]
+                print(f"manifest entry: {f[0]} mode={f[1]} device={f[2]} os={f[3]} android={f[4]}")
+                break
+        else:
+            raise SystemExit(f"manifest 里没有 {a.name} 的可用条目")
 
     url = a.url
     if not url:
