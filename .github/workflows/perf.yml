@@ -1,0 +1,179 @@
+--- 
+name: perf A/B
+
+# 性能结论只在 CI 出（同 runner、同窗口、可重复）；
+# 本地设备负载不稳，只做构建验证与测试/断言。
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'base ref/SHA (对照侧)'
+        default: 'master'
+        required: false
+      head_ref:
+        description: 'head ref/SHA (被测侧, 空=当前 ref)'
+        default: ''
+        required: false
+      reps:
+        description: '重复轮数'
+        default: '5'
+        required: false
+      iters:
+        description: '每轮 best-of'
+        default: '7'
+        required: false
+      size_mb:
+        description: '每语料大小 (MB)'
+        default: '8'
+        required: false
+      arm_crosscheck:
+        description: '在 arm64 Linux runner 上复核 (默认关闭, 很少用到)'
+        default: 'false'
+        required: false
+  push:
+    branches:
+      - 'ci-perf*'
+      - 'perf/*'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  ab:
+    name: bench A/B (base vs head)
+    # 普通 PR 不跑；加 `perf` label 或走 push/workflow_dispatch
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'perf')
+    # 默认 x86_64（快、够用）；只有显式要求时在 arm64 Linux runner 上复核。
+    # arm64 runner 很少轮到，所以不做成默认路径。
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.arm_crosscheck == 'true') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+      - name: Resolve refs
+        id: refs
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            base="${{ github.event.inputs.base_ref }}"; [ -z "$base" ] && base="master"
+            head="${{ github.event.inputs.head_ref }}"
+            [ -z "$head" ] && head="${{ github.sha }}"
+            echo "base=$base" >> "$GITHUB_OUTPUT"
+            echo "head=$head" >> "$GITHUB_OUTPUT"
+          fi
+          echo "reps=${{ github.event.inputs.reps || '5' }}" >> "$GITHUB_OUTPUT"
+          echo "iters=${{ github.event.inputs.iters || '7' }}" >> "$GITHUB_OUTPUT"
+          echo "size_mb=${{ github.event.inputs.size_mb || '8' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout base (对照侧)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.refs.outputs.base }}
+          path: base
+          fetch-depth: 1
+
+      - name: Checkout head (被测侧)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.refs.outputs.head }}
+          path: head
+          fetch-depth: 1
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo (base)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: base
+      - name: Cache cargo (head)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: head
+
+      # harness 是自包含的 example：拷进两侧，保证对照侧也有同一份测量代码
+      - name: Share harness into base
+        run: |
+          mkdir -p base/ruzstd/examples
+          cp head/ruzstd/examples/gap_vs_c.rs base/ruzstd/examples/gap_vs_c.rs
+
+      - name: Bench base
+        working-directory: base
+        run: |
+          cargo run --release --example gap_vs_c -- \
+            --reps ${{ steps.refs.outputs.reps }} --iters ${{ steps.refs.outputs.iters }} \
+            --size-mb ${{ steps.refs.outputs.size_mb }} \
+            > ../base.jsonl 2> ../base.log || { cat ../base.log; exit 1; }
+          tail -20 ../base.log
+
+      - name: Bench head
+        working-directory: head
+        run: |
+          cargo run --release --example gap_vs_c -- \
+            --reps ${{ steps.refs.outputs.reps }} --iters ${{ steps.refs.outputs.iters }} \
+            --size-mb ${{ steps.refs.outputs.size_mb }} \
+            > ../head.jsonl 2> ../head.log || { cat ../head.log; exit 1; }
+          tail -20 ../head.log
+
+      - name: Compare
+        run: |
+          python3 - <<'PY'
+          import json, collections, os
+
+          def load(path):
+              best = collections.defaultdict(lambda: float('inf'))
+              for line in open(path):
+                  line = line.strip()
+                  if not line.startswith('{'):
+                      continue
+                  o = json.loads(line)
+                  if o.get('kind') != 'sample':
+                      continue
+                  best[o['corpus']] = min(best[o['corpus']], o['ruzstd_ms'])
+                  best[o['corpus'] + '::c'] = min(best[o['corpus'] + '::c'], o['c_ms'])
+              return best
+
+          base, head = load('base.jsonl'), load('head.jsonl')
+          rows = []
+          lines = []
+          lines.append('| corpus | base ruzstd | head ruzstd | Δ head/base | base C | head C | base gap | head gap |')
+          lines.append('|---|---|---|---|---|---|---|---|')
+          for corpus in sorted({k for k in base if not k.endswith('::c')}):
+              b, h = base[corpus], head.get(corpus)
+              bc, hc = base[corpus + '::c'], head.get(corpus + '::c')
+              if h is None or hc is None:
+                  continue
+              bd, hd = 100 * (h - b) / b, None
+              lines.append(
+                  f'| {corpus} | {b:.3f} ms | {h:.3f} ms | {bd:+.2f}% | {bc:.3f} ms | {hc:.3f} ms | '
+                  f'{b/bc:.2f}x | {h/hc:.2f}x |')
+              rows.append((corpus, bd))
+          # 噪声底 = 同窗口 C 参照自身漂移
+          lines.append('')
+          lines.append('| corpus | base C | head C | C 漂移(噪声底) |')
+          lines.append('|---|---|---|---|')
+          for corpus in sorted({k for k in base if not k.endswith('::c')}):
+              bc, hc = base.get(corpus + '::c'), head.get(corpus + '::c')
+              if bc and hc:
+                  lines.append(f'| {corpus} | {bc:.3f} ms | {hc:.3f} ms | {100*(hc-bc)/bc:+.2f}% |')
+          out = '\n'.join(lines)
+          print(out)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('## perf A/B (base vs head)\n\n')
+              f.write(f"base=`{os.environ.get('BASE_LABEL','')}` head=`{os.environ.get('HEAD_LABEL','')}`\n\n")
+              f.write(out + '\n')
+          PY
+        env:
+          BASE_LABEL: ${{ steps.refs.outputs.base }}
+          HEAD_LABEL: ${{ steps.refs.outputs.head }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-ab-logs
+          path: |
+            base.jsonl
+            head.jsonl
+            base.log
+            head.log
