@@ -147,6 +147,8 @@ jobs:
           if [ -x bins/head_tuned ]; then
             echo "--- config leg: head_tuned ---" >> run.log
             ./bins/head_tuned --reps 2 --iters "$ITERS" --size-mb "$SIZE_MB" --repo-dir head >> head_tuned.jsonl 2>> run.log
+            echo "--- head_tuned.jsonl 前两行 ---" >> run.log
+            head -2 head_tuned.jsonl >> run.log || true
           else
             : > head_tuned.jsonl
           fi
@@ -239,12 +241,14 @@ jobs:
               out.append('')
               out.append('| corpus | leg | head wall | tuned wall | Δ(tuned-head) |')
               out.append('|---|---|---|---|---|')
-              for key in sorted({k.rsplit('|', 1)[0] for k in head}):
+              keys = {k.rsplit('|', 1)[0] for k in set(head) | set(tuned)}
+              for key in sorted(keys):
                   corpus, leg = key.split('|')
                   hw, tw = head.get(key + '|wall'), tuned.get(key + '|wall')
-                  if tw is None:
-                      continue
-                  out.append(f'| {corpus} | {leg} | {hw:.3f} ms | {tw:.3f} ms | {100*(tw-hw)/hw:+.2f}% |')
+                  hs = f'{hw:.3f} ms' if hw else '-'
+                  ts = f'{tw:.3f} ms' if tw else '-'
+                  d = f'{100*(tw-hw)/hw:+.2f}%' if (hw and tw) else '-'
+                  out.append(f'| {corpus} | {leg} | {hs} | {ts} | {d} |')
           text = '\n'.join(out)
           print(text)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
@@ -263,9 +267,12 @@ jobs:
         continue-on-error: true
         working-directory: head
         run: |
-          cargo run --release --quiet --features prof --example perf_ab -- \
+          cargo run -p ruzstd --release --quiet --features prof --example perf_ab -- \
             --profile --reps 0 --iters 1 --size-mb ${{ steps.refs.outputs.size_mb }} \
             > "$GITHUB_WORKSPACE/profile.jsonl" 2> "$GITHUB_WORKSPACE/profile.log" || true
+          echo "== profile.log 尾部（诊断用）=="
+          tail -5 "$GITHUB_WORKSPACE/profile.log" || true
+          echo "== profile.jsonl 行数: $(wc -l < "$GITHUB_WORKSPACE/profile.jsonl" 2>/dev/null || echo 0) ==" 
           python3 - <<'PY'
           import json, os
           rows = ['| corpus | literals % | seq loop % | huf MB (4/1-stream) | seqs | in-loop FSE / litcopy / matchcopy % |',
