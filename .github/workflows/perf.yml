@@ -40,8 +40,8 @@ on:
         default: 'true'
         required: false
       real_corpus:
-        description: '跑真实语料腿（按 corpus/manifest.txt 下载，缓存 3 天）'
-        default: 'false'
+        description: '跑真实语料腿（用 corpus prepare 放进缓存的语料；miss 则跳过）'
+        default: 'true'
         required: false
       arm_crosscheck:
         description: '在 arm64 Linux runner 上复核 (默认关闭, 很少用到)'
@@ -79,7 +79,7 @@ jobs:
           echo "iters=${{ github.event.inputs.iters || '9' }}" >> "$GITHUB_OUTPUT"
           echo "size_mb=${{ github.event.inputs.size_mb || '16' }}" >> "$GITHUB_OUTPUT"
           echo "config_leg=${{ github.event.inputs.config_leg || 'true' }}" >> "$GITHUB_OUTPUT"
-          echo "real_corpus=${{ github.event.inputs.real_corpus || 'false' }}" >> "$GITHUB_OUTPUT"
+          echo "real_corpus=${{ github.event.inputs.real_corpus || 'true' }}" >> "$GITHUB_OUTPUT"
           # 缓存 key 的 3 天轮转桶：epoch 天 / 3，跨桶即重拉语料
           echo "corpus_bucket=$(( $(date +%s) / 86400 / 3 ))" >> "$GITHUB_OUTPUT"
 
