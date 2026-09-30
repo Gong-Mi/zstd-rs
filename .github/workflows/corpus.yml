@@ -26,6 +26,8 @@ jobs:
   prepare:
     name: fetch + extract boot kernel -> cache
     runs-on: ubuntu-latest
+    # 卡住不许拖几小时：超时即失败（上一版就是这么白烧了两轮 50min+）
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,20 +58,20 @@ jobs:
           set -euo pipefail
           mkdir -p corpus-cache
           # 只取 boot 分区：Range 读 zip 中央目录 + payload manifest，再按 op 取数据
-          python3 tools/fetch_payload_partition.py \
+          python3 -u tools/fetch_payload_partition.py \
             --manifest corpus/manifest.txt \
             --name kernel-real \
             --partition boot \
             --out corpus-cache/boot.img \
             --max-mb ${{ github.event.inputs.max_mb || '300' }} \
-            --log corpus-cache/range.log
+            --log corpus-cache/range.log --verbose
           echo "== Range 记账 =="; tail -5 corpus-cache/range.log; wc -l corpus-cache/range.log
 
       - name: Extract kernel image
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          python3 tools/unpack_kernel.py --in corpus-cache/boot.img --out corpus-cache/kernel-real.bin \
+          python3 -u tools/unpack_kernel.py --in corpus-cache/boot.img --out corpus-cache/kernel-real.bin \
             || { echo "::warning::unpack failed, 用 boot.img 整份当语料"; cp corpus-cache/boot.img corpus-cache/kernel-real.bin; }
           ls -l corpus-cache
           sha256sum corpus-cache/kernel-real.bin | tee corpus-cache/SHA256
