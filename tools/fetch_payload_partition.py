@@ -236,7 +236,21 @@ def resolve_url(device, os_ver, android):
     for rom in data.get("roms", []):
         urls = find(rom, [])
         if urls:
-            urls.sort(key=lambda u: (0 if "ota_full" in u else 1, len(u)))
+            def rank(u):
+                full = 0 if "ota_full" in u else 1
+                # 镜像偏好：aliyun OSS > superota > ultimateota > 其它（cdnorg 常最慢）
+                if "oss" in u or "aliyun" in u:
+                    mir = 0
+                elif "superota" in u:
+                    mir = 1
+                elif "ultimateota" in u:
+                    mir = 2
+                else:
+                    mir = 3
+                return (full, mir, len(u))
+
+            urls.sort(key=rank)
+            print(f"  {len(urls)} 个镜像候选，选: {urls[0][:100]}")
             return urls[0], rom.get("filename")
     raise SystemExit("no downloadable rom resolved")
 
@@ -301,8 +315,19 @@ def main():
 
     magic, _ver, msize = struct.unpack("<4sQQ", read_at(0, 20))
     assert magic == b"CrAU", f"payload magic = {magic!r}"
-    mf = read_at(20, msize)
-    print(f"  manifest: {msize} B（读到 manifest 为止只用了很少几次 Range）")
+    print(f"  manifest size = {msize/1024:.0f} KiB")
+    # 分块读 manifest：一次要几十 MB 时某些 CDN 会长时间不返回，分块＋逐块进度能把
+    # "卡在哪一块"看出来（上一轮就是整块读 manifest 卡了 20 分钟直到超时）
+    CHUNK = 256 * 1024
+    mf = bytearray()
+    off = 20
+    while len(mf) < msize:
+        n = min(CHUNK, msize - len(mf))
+        mf += read_at(off, n)
+        off += n
+        print(f"    manifest {len(mf)/1024:.0f}/{msize/1024:.0f} KiB, "
+              f"Range 累计 {rf.transferred/1048576:.2f} MB")
+    mf = bytes(mf)
     parts = parse_manifest(mf)
     target = next((p for p in parts if p["name"] == a.partition), None)
     if not target:
