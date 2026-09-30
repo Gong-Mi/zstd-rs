@@ -313,11 +313,7 @@ fn main() {
         );
         let (rs_wall, rs_cpu) = best_of(1, || {
             let mut out = Vec::new();
-            ruzstd::encoding::compress(
-                src,
-                &mut out,
-                ruzstd::encoding::CompressionLevel::Fastest,
-            );
+            ruzstd::encoding::compress(src, &mut out, ruzstd::encoding::CompressionLevel::Fastest);
         });
         let ratio_c = src.len() as f64 / c_comp.len().max(1) as f64;
         let ratio_rs = src.len() as f64 / rs_out.len().max(1) as f64;
