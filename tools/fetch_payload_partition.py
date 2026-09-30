@@ -316,8 +316,6 @@ def main():
         rf.seek((data_start if base is None else base) + off)
         return rf.read(ln)
 
-    blob_base = data_start + hdr_len + int(msize) + meta_sig
-    print(f"  data blobs 起点 = {blob_base}（header {hdr_len} + manifest {msize} + sig {meta_sig}）")
 
     # payload 头是**大端**（网络字节序）：magic "CrAU" + version u64 + manifest_size u64。
     # 我第一版写成 "<4sQQ"（小端），manifest_size 解析成 2.1e15 KiB，于是按 256KB 分块
@@ -329,6 +327,9 @@ def main():
     hdr_len = 24 if _ver >= 2 else 20
     meta_sig = struct.unpack(">I", read_at(20, 4))[0] if _ver >= 2 else 0
     print(f"  manifest size = {msize/1024:.0f} KiB, metadata_signature = {meta_sig} B")
+    # op 的 data_offset 相对 data blobs 段起点，blobs 段在 header+manifest+sig 之后
+    blob_base = data_start + hdr_len + int(msize) + meta_sig
+    print(f"  data blobs 起点 = {blob_base}（header {hdr_len} + manifest {msize} + sig {meta_sig}）")
     # 分块读 manifest：一次要几十 MB 时某些 CDN 会长时间不返回，分块＋逐块进度能把
     # "卡在哪一块"看出来（上一轮就是整块读 manifest 卡了 20 分钟直到超时）
     CHUNK = 256 * 1024
