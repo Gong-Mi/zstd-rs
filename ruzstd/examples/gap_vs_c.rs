@@ -59,9 +59,19 @@ fn gen_medium(size: usize) -> Vec<u8> {
 }
 
 fn ruzstd_decode(data: &[u8]) -> Vec<u8> {
+    use ruzstd::io::Read as _;
     let mut dec = ruzstd::decoding::StreamingDecoder::new(data).unwrap();
     let mut out = Vec::new();
-    dec.read_to_end(&mut out).unwrap();
+    let mut buf = [0u8; 64 * 1024];
+    // 用 `read` 循环而不是 std 的 `read_to_end`：feature 矩阵里 ruzstd 可能不带
+    // `std`，那时没有 std 的 blanket 实现（read_to_end 不存在）。
+    loop {
+        let n = dec.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
     out
 }
 
@@ -132,7 +142,10 @@ fn main() {
         );
     }
 
-    eprintln!("reps={reps} iters={iters} size={size_mb}MB corpora={}", encoded.len());
+    eprintln!(
+        "reps={reps} iters={iters} size={size_mb}MB corpora={}",
+        encoded.len()
+    );
     let ratios: Vec<String> = encoded
         .iter()
         .map(|(name, comp, orig_len)| {
