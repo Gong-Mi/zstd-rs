@@ -46,7 +46,9 @@ jobs:
       - name: Install python deps
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          python3 -m pip install --quiet lz4 || echo "::warning::lz4 unavailable"
+          # lz4：解内核镜像；pycryptodome：query_xiaomi_rom.py 的 AES-CBC 需要
+          python3 -m pip install --quiet lz4 pycryptodome \
+            || echo "::warning::pip install failed (lz4/pycryptodome)"
 
       - name: Fetch boot partition (HTTP Range, 不整包下载)
         if: steps.cache.outputs.cache-hit != 'true'
