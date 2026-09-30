@@ -1,0 +1,21 @@
+# 真实语料清单（git 里只放这个列表，不放二进制）
+#
+# 每行一条，字段用 | 分隔；以 # 开头的行为注释。
+#
+#   name | mode | device | os | android | file_url | sha256 | extract
+#
+#   name      : 语料在 harness 里的名字（如 kernel-real）
+#   mode      : api  = 用 tools/query_xiaomi_rom.py 按 device/os/android 现查下载地址
+#               url  = 直接用 file_url（已确证的直链，最省事）
+#   file_url  : mode=url 时必填；mode=api 时留 "-"
+#   sha256    : 期望哈希，空或 "-" = 只记录不校验（CI 会在日志里打印实际值以便回填）
+#   extract   : kernel = 从下载物里解出内核镜像（boot.img → kernel）
+#               raw    = 整份当语料
+#
+# 缓存：workflow 用 actions/cache，key 带 3 天轮转桶（epoch/86400/3），
+# 过期自动重新拉一次语料；命中缓存时跳过下载与解包。
+#
+# 填入真值前请保持注释状态（解析器会跳过空行与注释行）。
+#
+# 例（prague 的 boot.img 直链；等确认 URL/哈希后取消注释）：
+# kernel-real | url | prague | OS4.0.0.7 | 16.0 | https://example.invalid/boot.img | - | kernel

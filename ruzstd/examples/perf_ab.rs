@@ -300,6 +300,7 @@ fn main() {
     let (mut reps, mut iters, mut size_mb, mut encode_mb) = (5u32, 7u32, 8usize, 4usize);
     let mut repo_dir = String::from(".");
     let mut profile = false;
+    let mut corpus_files: Vec<(String, String)> = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--reps" => reps = args.next().and_then(|v| v.parse().ok()).unwrap_or(reps),
@@ -312,20 +313,51 @@ fn main() {
                     .unwrap_or(encode_mb)
             }
             "--repo-dir" => repo_dir = args.next().unwrap_or(repo_dir),
+            // --corpus-file PATH[:NAME]：把外部取来的真实语料（内核镜像等）加进语料表
+            "--corpus-file" => {
+                if let Some(spec) = args.next() {
+                    let (path, name) = match spec.rsplit_once(':') {
+                        Some((p, n)) if !n.contains('/') => (p.to_string(), n.to_string()),
+                        _ => {
+                            let n = std::path::Path::new(&spec)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("external")
+                                .to_string();
+                            (spec.clone(), n)
+                        }
+                    };
+                    corpus_files.push((path, name));
+                }
+            }
             "--profile" => profile = true,
             other => eprintln!("ignoring unknown arg {other}"),
         }
     }
     let size = size_mb * 1024 * 1024;
 
-    let corpora: Vec<(&str, Vec<u8>)> = vec![
-        ("text", gen_text(size)),
-        ("random", gen_random(size)),
-        ("binary-medium", gen_medium(size)),
-        ("src-like", gen_src_like(size)),
-        ("bin-like", gen_bin_like(size)),
-        ("repo-sources", gen_repo_sources(&repo_dir, size)),
+    let mut corpora: Vec<(String, Vec<u8>)> = vec![
+        ("text".into(), gen_text(size)),
+        ("random".into(), gen_random(size)),
+        ("binary-medium".into(), gen_medium(size)),
+        ("src-like".into(), gen_src_like(size)),
+        ("bin-like".into(), gen_bin_like(size)),
+        ("repo-sources".into(), gen_repo_sources(&repo_dir, size)),
     ];
+    for (path, name) in &corpus_files {
+        match std::fs::read(path) {
+            Ok(mut data) => {
+                data.truncate(size);
+                eprintln!("external corpus {name}: {} bytes from {path}", data.len());
+                corpora.push((name.clone(), data));
+            }
+            Err(e) => eprintln!("WARNING: cannot read external corpus {path}: {e}"),
+        }
+    }
+    let corpora: Vec<(&str, Vec<u8>)> = corpora
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.clone()))
+        .collect();
     let encoded: Vec<(&str, Vec<u8>, u32)> = corpora
         .iter()
         .map(|(name, data)| {

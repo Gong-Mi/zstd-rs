@@ -39,6 +39,10 @@ on:
         description: '额外跑一条编译配置腿'
         default: 'true'
         required: false
+      real_corpus:
+        description: '跑真实语料腿（按 corpus/manifest.txt 下载，缓存 3 天）'
+        default: 'false'
+        required: false
       arm_crosscheck:
         description: '在 arm64 Linux runner 上复核 (默认关闭, 很少用到)'
         default: 'false'
@@ -75,6 +79,9 @@ jobs:
           echo "iters=${{ github.event.inputs.iters || '9' }}" >> "$GITHUB_OUTPUT"
           echo "size_mb=${{ github.event.inputs.size_mb || '16' }}" >> "$GITHUB_OUTPUT"
           echo "config_leg=${{ github.event.inputs.config_leg || 'true' }}" >> "$GITHUB_OUTPUT"
+          echo "real_corpus=${{ github.event.inputs.real_corpus || 'false' }}" >> "$GITHUB_OUTPUT"
+          # 缓存 key 的 3 天轮转桶：epoch 天 / 3，跨桶即重拉语料
+          echo "corpus_bucket=$(( $(date +%s) / 86400 / 3 ))" >> "$GITHUB_OUTPUT"
 
       - name: Checkout base (对照侧)
         uses: actions/checkout@v4
@@ -103,6 +110,23 @@ jobs:
           workspaces: head
 
       # harness 自包含：拷进两侧，保证对照侧跑的是同一份测量代码
+      - name: Cache real corpus (3 天轮转 key)
+        id: corpus_cache
+        if: steps.refs.outputs.real_corpus == 'true'
+        uses: actions/cache@v4
+        with:
+          path: corpus-cache
+          key: real-corpus-${{ hashFiles('head/corpus/manifest.txt') }}-${{ steps.refs.outputs.corpus_bucket }}
+
+      - name: Fetch real corpus (cache miss 时下载)
+        if: steps.refs.outputs.real_corpus == 'true' && steps.corpus_cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p corpus-cache
+          # lz4 解压内核镜像用；装不上就退回压缩态当语料（不致命）
+          python3 -m pip install --quiet lz4 || echo "::warning::lz4 unavailable, kernel may stay compressed"
+          python3 head/tools/fetch_corpus.py --manifest head/corpus/manifest.txt --out corpus-cache
+          ls -l corpus-cache
+
       - name: Share harness into base
         run: |
           mkdir -p base/ruzstd/examples
@@ -136,13 +160,21 @@ jobs:
         run: |
           set -euo pipefail
           : > base.jsonl; : > base2.jsonl; : > head.jsonl; : > run.log
+          EXTRA=""
+          if [ -d corpus-cache ]; then
+            for f in corpus-cache/*.bin; do
+              [ -f "$f" ] || continue
+              EXTRA="$EXTRA --corpus-file $f"
+            done
+          fi
+          echo "external corpora:${EXTRA:-（无）}" >> run.log
           for i in $(seq 1 "$REPS"); do
             echo "--- round $i: base ---" >> run.log
-            ./bins/base --reps 1 --iters "$ITERS" --size-mb "$SIZE_MB" --repo-dir head >> base.jsonl 2>> run.log
+            ./bins/base --reps 1 --iters "$ITERS" --size-mb "$SIZE_MB" --repo-dir head $EXTRA >> base.jsonl 2>> run.log
             echo "--- round $i: head ---" >> run.log
-            ./bins/head --reps 1 --iters "$ITERS" --size-mb "$SIZE_MB" --repo-dir head >> head.jsonl 2>> run.log
+            ./bins/head --reps 1 --iters "$ITERS" --size-mb "$SIZE_MB" --repo-dir head $EXTRA >> head.jsonl 2>> run.log
             echo "--- round $i: base2 ---" >> run.log
-            ./bins/base --reps 1 --iters "$ITERS" --size-mb "$SIZE_MB" --repo-dir head >> base2.jsonl 2>> run.log
+            ./bins/base --reps 1 --iters "$ITERS" --size-mb "$SIZE_MB" --repo-dir head $EXTRA >> base2.jsonl 2>> run.log
           done
           if [ -x bins/head_tuned ]; then
             echo "--- config leg: head_tuned ---" >> run.log
