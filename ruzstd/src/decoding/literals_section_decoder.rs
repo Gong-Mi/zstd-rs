@@ -106,7 +106,7 @@ fn decompress_literals(
         // (`budget == bits_remaining() + max_bits`), and four symbols per refill.
         let regen = section.regenerated_size as usize;
         let base = target.as_mut_ptr();
-        let segment_size = (regen + 3) / 4;
+        let segment_size = regen.div_ceil(4);
         // For valid input the first three streams fill `segment_size` bytes
         // exactly and the fourth one the remainder; the `min`s only keep a
         // malformed header from desynchronising the slices below.
