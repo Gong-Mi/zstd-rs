@@ -114,10 +114,14 @@ class HttpRangeFile(io.RawIOBase):
         if self.pos >= size:
             return b""
         if n is None or n < 0:
-            # 绝不允许"读到底"：7.6GB 远端上那就是整包下载
-            raise RuntimeError(
-                f"unbounded read refused (pos={self.pos}, remote={size}); 用显式长度读"
-            )
+            # 无长度读：只放行"剩余很小"的尾读（zipfile 读 EOCD 就会这样），
+            # 剩余很大时一律拒绝——否则 7.6GB 远端上那就是整包下载。
+            remaining = size - self.pos
+            if remaining > (1 << 20):
+                raise RuntimeError(
+                    f"unbounded read refused (pos={self.pos}, remaining={remaining}); 用显式长度读"
+                )
+            n = remaining
         n = min(n, size - self.pos)
         end = self.pos + n - 1
         resp = self._get({"Range": f"bytes={self.pos}-{end}"})
