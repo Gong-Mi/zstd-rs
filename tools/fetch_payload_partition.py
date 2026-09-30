@@ -313,7 +313,10 @@ def main():
         rf.seek(data_start + off)
         return rf.read(ln)
 
-    magic, _ver, msize = struct.unpack("<4sQQ", read_at(0, 20))
+    # payload 头是**大端**（网络字节序）：magic "CrAU" + version u64 + manifest_size u64。
+    # 我第一版写成 "<4sQQ"（小端），manifest_size 解析成 2.1e15 KiB，于是按 256KB 分块
+    # 一路读到 300MB 预算才被拦住（guard 起了作用，但根因是端序）。
+    magic, _ver, msize = struct.unpack(">4sQQ", read_at(0, 20))
     assert magic == b"CrAU", f"payload magic = {magic!r}"
     print(f"  manifest size = {msize/1024:.0f} KiB")
     # 分块读 manifest：一次要几十 MB 时某些 CDN 会长时间不返回，分块＋逐块进度能把
