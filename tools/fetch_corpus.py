@@ -95,6 +95,8 @@ def main():
     ap.add_argument("--manifest", default="corpus/manifest.txt")
     ap.add_argument("--out", default="corpus-cache")
     ap.add_argument("--only", default=None)
+    ap.add_argument("--max-mb", type=int, default=512, help="单文件下载上限（MB）；超限跳过")
+    ap.add_argument("--allow-large", action="store_true", help="显式允许超限下载")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -117,6 +119,19 @@ def main():
             print(f"  api resolved: {fname} size={size} md5={md5}")
         elif url in ("-", ""):
             print(f"  SKIP: mode=url 但没给 file_url", file=sys.stderr)
+            continue
+        # 大小护栏：整包 OTA 是 GB 级，CI 里必须先确认体量（payload Range 只取 boot 分区
+        # 的工具到位之前，不在这里悄悄下 GB）
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=60) as r:
+                clen = int(r.headers.get("Content-Length") or 0)
+        except Exception as ex:
+            print(f"  WARN: HEAD failed ({ex}); 无法确认大小，按超限处理（用 --allow-large 强制）", file=sys.stderr)
+            clen = (args.max_mb + 1) * 1024 * 1024
+        if clen > args.max_mb * 1024 * 1024 and not args.allow_large:
+            print(f"  SKIP: {clen/1048576:.1f} MB > 上限 {args.max_mb} MB（整包 OTA 需先做 payload Range 抽取）",
+                  file=sys.stderr)
             continue
         tmp = dst + ".part"
         download(url, tmp, e["sha256"])
