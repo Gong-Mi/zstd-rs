@@ -305,7 +305,9 @@ impl MatchGenerator {
                 let max_back = match_data.len().min(curr_data.len());
                 let mut back = 0;
                 while back < max_back {
-                    if match_data[match_data.len() - 1 - back] == curr_data[curr_data.len() - 1 - back] {
+                    if match_data[match_data.len() - 1 - back]
+                        == curr_data[curr_data.len() - 1 - back]
+                    {
                         back += 1;
                     } else {
                         break;
