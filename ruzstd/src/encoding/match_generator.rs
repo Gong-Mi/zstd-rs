@@ -218,7 +218,20 @@ impl MatchGenerator {
     /// * If no more matches can be found but there are bytes still left handle_sequence is called with the Literals variant
     /// * If no more matches can be found and no more bytes are left this returns false
     fn next_sequence(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) -> bool {
+        #[cfg(feature = "encstats")]
+        let mut pos_ctr: u64 = 0;
         loop {
+            // 每 64 个位置采样一次：把"每个位置"的成本拆成
+            //   phase7 = 窗口扫描 + 哈希 get + 逐字节比较（整段）
+            //   phase8 = 其中的 common_prefix_len 比较
+            // phase7-phase8 ≈ 窗口迭代与哈希 get 的代价。每位置打点会被插桩自身淹没，
+            // 所以只在采样点取时钟。
+            #[cfg(feature = "encstats")]
+            let (sample, t_probe) = {
+                pos_ctr = pos_ctr.wrapping_add(1);
+                let s = pos_ctr % 64 == 0;
+                (s, if s { crate::encstats::tick() } else { 0 })
+            };
             let last_entry = self.window.last().unwrap();
             let data_slice = &last_entry.data;
 
@@ -248,8 +261,12 @@ impl MatchGenerator {
 
             // This is the key we are looking to find a match for
             let key = &data_slice[..MIN_MATCH_LEN];
+            #[cfg(feature = "encstats")]
+            let _ = &key;
 
             // Look in each window entry
+            #[cfg(feature = "encstats")]
+            let mut cmp_ticks: u64 = 0;
             let mut candidate = None;
             for (match_entry_idx, match_entry) in self.window.iter().enumerate() {
                 let is_last = match_entry_idx == self.window.len() - 1;
@@ -261,7 +278,13 @@ impl MatchGenerator {
                     };
 
                     // Check how long the common prefix actually is
+                    #[cfg(feature = "encstats")]
+                    let t_cmp = if sample { crate::encstats::tick() } else { 0 };
                     let match_len = Self::common_prefix_len(match_slice, data_slice);
+                    #[cfg(feature = "encstats")]
+                    if sample {
+                        cmp_ticks += crate::encstats::tick() - t_cmp;
+                    }
 
                     // Collisions in the suffix store might make this check fail
                     if match_len >= MIN_MATCH_LEN {
@@ -277,7 +300,12 @@ impl MatchGenerator {
                             debug_assert_eq!(check_slice, &match_slice[..match_len]);
                         }
 
-                        if let Some((old_offset, old_match_len)) = candidate {
+                        #[cfg(feature = "encstats")]
+                if sample {
+                    crate::encstats::add_phase(7, crate::encstats::tick() - t_probe);
+                    crate::encstats::add_phase(8, cmp_ticks);
+                }
+                if let Some((old_offset, old_match_len)) = candidate {
                             if match_len > old_match_len
                                 || (match_len == old_match_len && offset < old_offset)
                             {

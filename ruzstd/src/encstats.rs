@@ -17,7 +17,7 @@ pub const CMP_BYTES_MATCHED: usize = 7;
 pub const N: usize = 8;
 
 /// 块级相位计时累加器（tick 数，架构间不可比；只看同进程内占比）。
-pub const PHASES: usize = 8;
+pub const PHASES: usize = 10;
 pub static P: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
 
 /// 廉价时间戳：aarch64 读 cntvct_el0，x86_64 读 rdtsc，其他架构返回 0。
