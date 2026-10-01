@@ -771,3 +771,14 @@ fn matches() {
 
     assert_eq!(reconstructed, original_data);
 }
+
+#[test]
+fn chain_reaches_old_positions() {
+    let mut store = SuffixStore::with_capacity(64);
+    for pos in 0..5usize {
+        store.insert(&[0u8; 8][..MIN_MATCH_LEN], pos);
+    }
+    let mut buf = [0usize; 8];
+    let n = store.get_chain(&[0u8; 8][..MIN_MATCH_LEN], 8, &mut buf);
+    assert_eq!(&buf[..n], &[4, 3, 2, 1, 0], "链走查应能回到最老位置");
+}
