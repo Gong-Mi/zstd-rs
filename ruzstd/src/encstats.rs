@@ -18,7 +18,9 @@ pub const CMP_BYTES_MATCHED: usize = 7;
 pub const SECOND_HITS: usize = 8;
 /// 诊断：slot[1] 非空的探测次数（若为 0 说明 insert 从未把旧值挪到第二槽）
 pub const SECOND_POPULATED: usize = 9;
-pub const N: usize = 10;
+/// 诊断：insert 时 slot[0] 已非空（即真正发生了"旧值→[1]"移位）的次数
+pub const SHIFTED: usize = 10;
+pub const N: usize = 11;
 
 /// 块级相位计时累加器（tick 数，架构间不可比；只看同进程内占比）。
 pub const PHASES: usize = 10;

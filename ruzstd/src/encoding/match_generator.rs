@@ -159,6 +159,10 @@ impl SuffixStore {
     fn insert(&mut self, suffix: &[u8], idx: usize) {
         let key = self.key(suffix);
         let slot = &mut self.slots[key];
+        #[cfg(feature = "encstats")]
+        if slot[0].is_some() {
+            crate::encstats::bump(crate::encstats::SHIFTED, 1);
+        }
         // 保留最近两个位置：多一个候选能拿到更长匹配，从而减少"要逐位置走访"的位置数
         // （匹配器占编码时间 48.5~76.2%，其中每位置簿记 66~69%），ratio 与时间同向受益。
         slot[1] = slot[0];
