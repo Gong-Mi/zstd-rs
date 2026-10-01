@@ -284,20 +284,33 @@ impl MatchGenerator {
                             debug_assert_eq!(check_slice, &match_slice[..match_len]);
                         }
 
-                        if let Some((old_offset, old_match_len)) = candidate {
+                        if let Some((_, _, old_offset, old_match_len)) = candidate {
                             if match_len > old_match_len
                                 || (match_len == old_match_len && offset < old_offset)
                             {
-                                candidate = Some((offset, match_len));
+                                candidate = Some((match_entry_idx, match_index, offset, match_len));
                             }
                         } else {
-                            candidate = Some((offset, match_len));
+                            candidate = Some((match_entry_idx, match_index, offset, match_len));
                         }
                     }
                 }
             }
 
-            if let Some((offset, match_len)) = candidate {
+            if let Some((match_entry_idx, match_index, offset, mut match_len)) = candidate {
+                // Catch-up: 沿历史匹配与当前位置同时向前倒退，尽可能把前驱字面量合并进 match (对齐 C zstd_fast.c)
+                let last_entry = self.window.last().unwrap();
+                let mut back = 0;
+                while self.suffix_idx > self.last_idx_in_sequence + back && match_index > back {
+                    let prev_match_byte = self.window[match_entry_idx].data[match_index - 1 - back];
+                    let prev_curr_byte = last_entry.data[self.suffix_idx - 1 - back];
+                    if prev_match_byte == prev_curr_byte {
+                        back += 1;
+                    } else {
+                        break;
+                    }
+                }
+
                 // Fast mode: skip hash insertion for positions within the match.
                 // C zstd's fast strategy does the same — only searched positions
                 // get inserted. This trades a small ratio loss for large speed gain
@@ -309,13 +322,15 @@ impl MatchGenerator {
                     last_entry.suffixes.insert(key, self.suffix_idx);
                 }
 
-                // All literals that were not included between this match and the last are now included here
+                // 扣除倒退吸纳的字面量
                 let last_entry = self.window.last().unwrap();
-                let literals = &last_entry.data[self.last_idx_in_sequence..self.suffix_idx];
+                let match_start = self.suffix_idx - back;
+                let literals = &last_entry.data[self.last_idx_in_sequence..match_start];
 
                 // Update the indexes, all indexes upto and including the current index have been included in a sequence now
                 self.miss_count = 0;
                 self.suffix_idx += match_len;
+                match_len += back;
                 self.last_idx_in_sequence = self.suffix_idx;
                 handle_sequence(Sequence::Triple {
                     literals,
