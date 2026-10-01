@@ -147,9 +147,11 @@ impl Drop for SampleGuard {
 
 impl SuffixStore {
     fn with_capacity(capacity: usize) -> Self {
+        // 实验：把有效位宽钳到 14（16K 槽）。表仍按原容量分配，只改索引位宽，
+        // 目的是让桶碰撞/同 key 复访真正发生，使双槽的第二个候选有内容可选。
         Self {
             slots: alloc::vec![[None, None]; capacity],
-            len_log: capacity.ilog2(),
+            len_log: capacity.ilog2().min(14),
         }
     }
 
@@ -179,7 +181,12 @@ impl SuffixStore {
     #[inline(always)]
     fn get_second(&self, suffix: &[u8]) -> Option<usize> {
         let key = self.key(suffix);
-        self.slots[key][1].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
+        let v = self.slots[key][1];
+        #[cfg(feature = "encstats")]
+        if v.is_some() {
+            crate::encstats::bump(crate::encstats::SECOND_POPULATED, 1);
+        }
+        v.map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
     }
 
     #[inline(always)]

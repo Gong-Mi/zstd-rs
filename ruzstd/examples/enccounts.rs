@@ -53,7 +53,7 @@ fn main() {
                 100.0 * ph7 as f64 / tot_phases.max(1) as f64
             );
         }
-        eprintln!("  {:<20} 第二槽命中 {}", name0, c[8]);
+        eprintln!("  {:<20} 第二槽为非空 {} | 命中 {}", name0, c[9], c[8]);
         let tot = c[3] + c[4];
         let reuse_pct = if tot > 0 { 100.0 * c[4] as f64 / tot as f64 } else { 0.0 };
         let _ = per_byte;

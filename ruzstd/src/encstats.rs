@@ -16,7 +16,9 @@ pub const CMP_BYTES_MIN: usize = 6;
 pub const CMP_BYTES_MATCHED: usize = 7;
 /// 次新槽（第二个候选）真正参与比较的次数；若恒为 0 说明第二槽从未命中。
 pub const SECOND_HITS: usize = 8;
-pub const N: usize = 9;
+/// 诊断：slot[1] 非空的探测次数（若为 0 说明 insert 从未把旧值挪到第二槽）
+pub const SECOND_POPULATED: usize = 9;
+pub const N: usize = 10;
 
 /// 块级相位计时累加器（tick 数，架构间不可比；只看同进程内占比）。
 pub const PHASES: usize = 10;
