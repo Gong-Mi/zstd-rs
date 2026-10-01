@@ -48,11 +48,8 @@ impl<'t> FSEDecoder<'t> {
         of: &mut FSEDecoder<'_>,
         bits: &mut BitReaderReversed<'_>,
     ) {
-        let (add_ll, add_ml, add_of) = bits.get_bits_triple(
-            ll.state.num_bits,
-            ml.state.num_bits,
-            of.state.num_bits,
-        );
+        let (add_ll, add_ml, add_of) =
+            bits.get_bits_triple(ll.state.num_bits, ml.state.num_bits, of.state.num_bits);
         ll.state = ll.table.decode[(ll.state.base_line + add_ll as u32) as usize];
         ml.state = ml.table.decode[(ml.state.base_line + add_ml as u32) as usize];
         of.state = of.table.decode[(of.state.base_line + add_of as u32) as usize];
