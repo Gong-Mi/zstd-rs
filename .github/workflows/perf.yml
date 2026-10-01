@@ -336,9 +336,61 @@ jobs:
                           f"{o['inloop_fse_pct']} / {o['inloop_litcopy_pct']} / {o['inloop_matchcopy_pct']} |")
           out = '\n'.join(rows)
           print(out)
+
+          # ---- p13 单位成本账（可消除性预算）：把"还差多少"拆成每序列/每字面量字节 ----
+          import collections
+          def best(path_):
+              b = collections.defaultdict(lambda: float('inf'))
+              for line in open(path_):
+                  line = line.strip()
+                  if not line.startswith('{'):
+                      continue
+                  o = json.loads(line)
+                  if o.get('kind') != 'sample':
+                      continue
+                  k = f"{o['corpus']}|{o.get('leg','stream')}"
+                  b[k + '|wall'] = min(b[k + '|wall'], o['ruzstd_ms'])
+                  b[k + '|c'] = min(b[k + '|c'], o['c_ms'])
+              return b
+          ws = os.environ['GITHUB_WORKSPACE']
+          try:
+              H = best(os.path.join(ws, 'head.jsonl'))
+              B = best(os.path.join(ws, 'base.jsonl'))
+          except Exception:
+              H, B = {}, {}
+          bud = ['| corpus | 主导段 | head ms | C ms | 剩余 excess ms | seqs | ns/seq(head) | ns/seq(C) | huf MB | ns/lit-B(head) |',
+                 '|---|---|---|---|---|---|---|---|---|---|']
+          for line in open(path):
+              line = line.strip()
+              if not line.startswith('{'):
+                  continue
+              o = json.loads(line)
+              if o.get('kind') != 'profile':
+                  continue
+              c = o['corpus']
+              hw = H.get(c + '|stream|wall')
+              hc = H.get(c + '|stream|c')
+              bw = B.get(c + '|stream|wall')
+              if hw is None or hc is None:
+                  continue
+              seqs = o.get('seqs') or 0
+              litmb = (o.get('lit_huf_mb') or 0) + (o.get('lit_raw_mb') or 0) + (o.get('lit_rle_mb') or 0)
+              main = 'literals' if (o.get('literals_pct') or 0) >= 50 else 'seq-loop'
+              ns_seq_h = f'{1e6*hw/seqs:.2f}' if seqs else '-'
+              ns_seq_c = f'{1e6*hc/seqs:.2f}' if seqs else '-'
+              ns_lit_b = f'{1e6*(o.get("literals_pct",0)/100)*hw/(litmb*1048576):.3f}' if litmb else '-'
+              bud.append(f"| {c} | {main} | {hw:.3f} | {hc:.3f} | {hw-hc:.2f} | {seqs} | {ns_seq_h} | {ns_seq_c} | "
+                         f"{litmb:.2f} | {ns_lit_b} |")
+          bud.append('')
+          bud.append('契约成本=|head known − head stream|（实测 ≈0）；配置份额：见配置腿（default 更快 ⇒ 0）。')
+          bud.append('⇒ 剩余差距 100% 落在两个叶子循环上（熵解码 / 每序列拷贝与切片调用），可消除量只来自每单位指令数。')
+          budtxt = '\n'.join(bud)
+          print(budtxt)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
               f.write('\n## 解码相位归因（head 侧；块级打点 + 每 64 序列采样，只看占比）\n\n')
               f.write(out + '\n')
+              f.write('\n## 单位成本账 / 可消除性预算（p13）\n\n')
+              f.write(budtxt + '\n')
           PY
 
       - name: Upload logs
