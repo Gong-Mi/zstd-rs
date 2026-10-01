@@ -166,6 +166,13 @@ impl SuffixStore {
     #[inline(always)]
     fn insert(&mut self, suffix: &[u8], idx: usize) {
         let key = self.key(suffix);
+        // 链：新位置指向同一 key 的上一个位置（+1 编码，0 表示链尾）。
+        // 候选切片止于当前位置 ⇒ 只有"足够远"的位置才给得出合法匹配，链把更老的位置留住。
+        let prev = self.slots[key][0];
+        if idx >= self.links.len() {
+            self.links.resize(idx + 1, 0);
+        }
+        self.links[idx] = prev.map_or(0, |p| p.get() as u32);
         let slot = &mut self.slots[key];
         #[cfg(feature = "encstats")]
         if slot[0].is_some() {
@@ -627,7 +634,7 @@ fn matches() {
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 12,
+                offset: 6,
                 match_len: 6,
             },
             &mut reconstructed,
@@ -638,7 +645,7 @@ fn matches() {
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 28,
+                offset: 23,
                 match_len: 5,
             },
             &mut reconstructed,
