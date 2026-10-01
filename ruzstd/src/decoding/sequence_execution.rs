@@ -164,17 +164,20 @@ pub fn decode_and_execute_sequences(
         seq_sum += seq_ll;
 
         if seq_idx + 1 < num_sequences {
-            if ll_rle.is_none() {
-                ll_dec.update_state(&mut br);
-            }
-            if ml_rle.is_none() {
-                ml_dec.update_state(&mut br);
-            }
-            if of_rle.is_none() {
-                of_dec.update_state(&mut br);
+            if ll_rle.is_none() && ml_rle.is_none() && of_rle.is_none() {
+                FSEDecoder::update_state_triple(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
+            } else {
+                if ll_rle.is_none() {
+                    ll_dec.update_state(&mut br);
+                }
+                if ml_rle.is_none() {
+                    ml_dec.update_state(&mut br);
+                }
+                if of_rle.is_none() {
+                    of_dec.update_state(&mut br);
+                }
             }
         }
-
         if br.bits_remaining() < 0 {
             return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
         }

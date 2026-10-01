@@ -40,6 +40,24 @@ impl<'t> FSEDecoder<'t> {
     }
 
     /// Advance the internal state to decode the next symbol in the bitstream.
+    /// Simultaneously update three FSE decoder states using a single triple-bit extraction.
+    #[inline(always)]
+    pub fn update_state_triple(
+        ll: &mut FSEDecoder<'_>,
+        ml: &mut FSEDecoder<'_>,
+        of: &mut FSEDecoder<'_>,
+        bits: &mut BitReaderReversed<'_>,
+    ) {
+        let (add_ll, add_ml, add_of) = bits.get_bits_triple(
+            ll.state.num_bits,
+            ml.state.num_bits,
+            of.state.num_bits,
+        );
+        ll.state = ll.table.decode[(ll.state.base_line + add_ll as u32) as usize];
+        ml.state = ml.table.decode[(ml.state.base_line + add_ml as u32) as usize];
+        of.state = of.table.decode[(of.state.base_line + add_of as u32) as usize];
+    }
+
     pub fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
