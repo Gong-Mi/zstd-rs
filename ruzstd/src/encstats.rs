@@ -10,6 +10,43 @@ pub const FSE_BUILDS: usize = 3;
 pub const FSE_REUSED: usize = 4;
 pub const N: usize = 5;
 
+/// 块级相位计时累加器（tick 数，架构间不可比；只看同进程内占比）。
+pub const PHASES: usize = 8;
+pub static P: [AtomicU64; PHASES] = [const { AtomicU64::new(0) }; PHASES];
+
+/// 廉价时间戳：aarch64 读 cntvct_el0，x86_64 读 rdtsc，其他架构返回 0。
+#[inline(always)]
+pub fn tick() -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let v: u64;
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) v);
+        v
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_rdtsc()
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        0
+    }
+}
+
+#[inline(always)]
+pub fn add_phase(i: usize, delta: u64) {
+    P[i].fetch_add(delta, Ordering::Relaxed);
+}
+
+/// 读走并清零相位计时。
+pub fn take_phases() -> [u64; PHASES] {
+    let mut out = [0u64; PHASES];
+    for i in 0..PHASES {
+        out[i] = P[i].swap(0, Ordering::Relaxed);
+    }
+    out
+}
+
 pub static C: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
 #[inline(always)]

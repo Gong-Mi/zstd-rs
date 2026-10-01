@@ -12,11 +12,23 @@ fn main() {
     for path in files {
         let data = fs::read(&path).expect("read");
         let _ = ruzstd::encstats::take();
+        let _ = ruzstd::encstats::take_phases();
+        let wall0 = std::time::Instant::now();
         let comp = ruzstd::encoding::compress_to_vec(&data[..], ruzstd::encoding::CompressionLevel::Fastest);
+        let wall_ms = wall0.elapsed().as_secs_f64() * 1000.0;
         let c = ruzstd::encstats::take();
+        let ph = ruzstd::encstats::take_phases();
+        let tot: u64 = ph.iter().sum();
+        let pct = |i: usize| if tot > 0 { 100.0 * ph[i] as f64 / tot as f64 } else { 0.0 };
+        let name0 = path.rsplit('/').next().unwrap_or(&path).to_string();
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
         let ratio = data.len() as f64 / comp.len() as f64;
         let per_byte = (c[0] + c[1]) as f64 / data.len() as f64;
+        eprintln!(
+            "  {:<20} wall {:>7.1} ms | 匹配 {:>5.1}% 字面量 {:>5.1}% 表构建 {:>5.1}% 表写入 {:>5.1}% 序列编码 {:>5.1}% 其余 {:>5.1}%（相位和 {:>7.1} ms）",
+            name0, wall_ms, pct(0), pct(1), pct(2), pct(3), pct(4), pct(5),
+            tot as f64 / 1e6
+        );
         let tot = c[3] + c[4];
         let reuse_pct = if tot > 0 { 100.0 * c[4] as f64 / tot as f64 } else { 0.0 };
         let _ = per_byte;

@@ -12,6 +12,8 @@ use crate::{
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut literals_vec = Vec::new();
     let mut sequences = Vec::new();
+    #[cfg(feature = "encstats")]
+    let t0 = crate::encstats::tick();
     state.matcher.start_matching(|seq| {
         match seq {
             Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
@@ -29,6 +31,8 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             }
         }
     });
+    #[cfg(feature = "encstats")]
+    let t1 = crate::encstats::tick();
 
     // literals section
 
@@ -43,8 +47,13 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         raw_literals(&literals_vec, &mut writer);
     }
 
+    #[cfg(feature = "encstats")]
+    let t2 = crate::encstats::tick();
+
     // sequences section
 
+    #[cfg(feature = "encstats")]
+    let (mut t3, mut t4, mut t5): (Option<u64>, Option<u64>, Option<u64>) = (None, None, None);
     if sequences.is_empty() {
         writer.write_bits(0u8, 8);
     } else {
@@ -87,12 +96,20 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             of_present,
         );
 
+        #[cfg(feature = "encstats")]
+        {
+            t3 = Some(crate::encstats::tick());
+        }
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
 
         encode_table(&ll_mode, &mut writer);
         encode_table(&of_mode, &mut writer);
         encode_table(&ml_mode, &mut writer);
 
+        #[cfg(feature = "encstats")]
+        {
+            t4 = Some(crate::encstats::tick());
+        }
         encode_sequences(
             &sequences,
             &mut writer,
@@ -100,6 +117,14 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             ml_mode.as_ref(),
             of_mode.as_ref(),
         );
+        #[cfg(feature = "encstats")]
+        let t5_local = crate::encstats::tick();
+        #[cfg(feature = "encstats")]
+        crate::encstats::add_phase(4, t5_local - t4.unwrap_or(t3.unwrap_or(t2)));
+        #[cfg(feature = "encstats")]
+        {
+            t5 = Some(t5_local);
+        }
 
         if let FseTableMode::Encoded(table) = ll_mode {
             state.fse_tables.ll_previous = Some(table)
@@ -110,6 +135,18 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         if let FseTableMode::Encoded(table) = of_mode {
             state.fse_tables.of_previous = Some(table)
         }
+    }
+    #[cfg(feature = "encstats")]
+    {
+        let end = crate::encstats::tick();
+        crate::encstats::add_phase(0, t1 - t0); // 匹配
+        crate::encstats::add_phase(1, t2 - t1); // 字面量编码
+        if let (Some(t3), Some(t4)) = (t3, t4) {
+            crate::encstats::add_phase(2, t3 - t2); // 表构建（choose_table ×3）
+            crate::encstats::add_phase(3, t4 - t3); // 表写入 + seqnum
+        }
+        // phase 4 已在 encode_sequences 处累积
+        crate::encstats::add_phase(5, end - t5.unwrap_or(t4.unwrap_or(t3.unwrap_or(t2)))); // 其余（flush/拼块）
     }
     writer.flush();
 }
