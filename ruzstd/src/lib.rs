@@ -65,3 +65,7 @@ pub mod io_nostd;
 pub use io_nostd as io;
 
 mod tests;
+
+/// 编码侧工作项计数出口（仅 `encstats` 特性；本地计数用，不参与性能判定）。
+#[cfg(feature = "encstats")]
+pub mod encstats;

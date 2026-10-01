@@ -122,6 +122,8 @@ impl SuffixStore {
 
     #[inline(always)]
     fn insert(&mut self, suffix: &[u8], idx: usize) {
+        #[cfg(feature = "encstats")]
+        crate::encstats::bump(crate::encstats::INSERTS, 1);
         let key = self.key(suffix);
         self.slots[key] = Some(NonZeroUsize::new(idx + 1).unwrap());
     }
@@ -134,8 +136,15 @@ impl SuffixStore {
 
     #[inline(always)]
     fn get(&self, suffix: &[u8]) -> Option<usize> {
+        #[cfg(feature = "encstats")]
+        crate::encstats::bump(crate::encstats::PROBES, 1);
         let key = self.key(suffix);
-        self.slots[key].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
+        let hit = self.slots[key].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1);
+        #[cfg(feature = "encstats")]
+        if hit.is_some() {
+            crate::encstats::bump(crate::encstats::HITS, 1);
+        }
+        hit
     }
 
     #[inline(always)]
