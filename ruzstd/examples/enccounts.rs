@@ -12,7 +12,10 @@ fn main() {
     for path in files {
         let data = fs::read(&path).expect("read");
         let _ = ruzstd::encstats::take();
-        let comp = ruzstd::encoding::compress_to_vec(&data[..], ruzstd::encoding::CompressionLevel::Fastest);
+        let comp = ruzstd::encoding::compress_to_vec(
+            &data[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
         let c = ruzstd::encstats::take();
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
         let ratio = data.len() as f64 / comp.len() as f64;

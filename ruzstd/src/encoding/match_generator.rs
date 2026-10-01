@@ -189,6 +189,7 @@ pub(crate) struct MatchGenerator {
     concat_window: Vec<u8>,
     /// Index in the last slice that we already processed
     suffix_idx: usize,
+    miss_count: usize,
     /// Gets updated when a new sequence is returned to point right behind that sequence
     last_idx_in_sequence: usize,
 }
@@ -203,6 +204,7 @@ impl MatchGenerator {
             #[cfg(debug_assertions)]
             concat_window: Vec::new(),
             suffix_idx: 0,
+            miss_count: 0,
             last_idx_in_sequence: 0,
         }
     }
@@ -312,6 +314,7 @@ impl MatchGenerator {
                 let literals = &last_entry.data[self.last_idx_in_sequence..self.suffix_idx];
 
                 // Update the indexes, all indexes upto and including the current index have been included in a sequence now
+                self.miss_count = 0;
                 self.suffix_idx += match_len;
                 self.last_idx_in_sequence = self.suffix_idx;
                 handle_sequence(Sequence::Triple {
@@ -331,8 +334,14 @@ impl MatchGenerator {
             // Step acceleration: skip ahead faster at later positions in the block.
             // Positions near the start are more valuable as match targets, so we
             // search them densely. Later positions are less likely to be referenced.
+            self.miss_count += 1;
             let data_len = last_entry.data.len();
-            let step = 1 + (self.suffix_idx * 4 / data_len.max(1)).min(3);
+            let pos_step = (self.suffix_idx * 4 / data_len.max(1)).min(3);
+            let step = if self.miss_count >= 256 {
+                1 + (pos_step + (self.miss_count >> 8)).min(16)
+            } else {
+                1 + pos_step
+            };
             self.suffix_idx = (self.suffix_idx + step).min(data_len);
         }
     }

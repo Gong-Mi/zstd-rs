@@ -43,3 +43,7 @@ rustc-dep-of-std = ["dep:core", "dep:alloc"]
 [[bench]]
 name = "decode_all"
 harness = false
+
+[[example]]
+name = "enccounts"
+required-features = ["encstats"]
