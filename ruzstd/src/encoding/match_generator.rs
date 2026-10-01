@@ -184,12 +184,14 @@ impl SuffixStore {
         slot[0] = Some(NonZeroUsize::new(idx + 1).unwrap());
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     fn contains_key(&self, suffix: &[u8]) -> bool {
         let key = self.key(suffix);
         self.slots[key][0].is_some()
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     fn get(&self, suffix: &[u8]) -> Option<usize> {
         let key = self.key(suffix);
@@ -317,7 +319,7 @@ impl MatchGenerator {
             #[cfg(feature = "encstats")]
             let mut sample_guard = {
                 pos_ctr = pos_ctr.wrapping_add(1);
-                let s = pos_ctr % 64 == 0;
+                let s = pos_ctr.is_multiple_of(64);
                 SampleGuard {
                     sample: s,
                     t0: if s { crate::encstats::tick() } else { 0 },
