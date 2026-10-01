@@ -110,63 +110,6 @@ impl DecodeBuffer {
         }
     }
 
-    /// Fused `push(literals)` followed by `repeat(offset, match_length)`.
-    ///
-    /// Semantically identical to calling the two in order (literals land in the
-    /// buffer first, the match then reaches back `offset` bytes from the new
-    /// length), but both parts share a single `reserve` and one call boundary.
-    /// The sequence loop calls this once per sequence with ~2 byte literals and
-    /// ~14 byte matches, so the per-call fixed cost is what is being removed.
-    pub fn push_and_repeat(
-        &mut self,
-        literals: &[u8],
-        offset: usize,
-        match_length: usize,
-    ) -> Result<(), DecodeBufferError> {
-        if literals.is_empty() && match_length == 0 {
-            return Ok(());
-        }
-        // One reserve for both parts; the ring grows to window + amount, so
-        // reserving the sum up front is a superset of the two reserves it
-        // replaces and stays monotone.
-        self.buffer.reserve(literals.len() + match_length);
-
-        if !literals.is_empty() {
-            self.buffer.extend_unreserved(literals);
-            self.total_output_counter += literals.len() as u64;
-        }
-
-        if match_length == 0 {
-            return Ok(());
-        }
-
-        if offset > self.buffer.len() {
-            // Cold path (dictionary / cross-frame): keep the original routine,
-            // which publishes its own reserve needs.
-            return self.repeat_from_dict(offset, match_length);
-        }
-
-        let buf_len = self.buffer.len();
-        let start_idx = buf_len - offset;
-        let end_idx = start_idx + match_length;
-
-        if end_idx > buf_len {
-            // We need to copy in chunks.
-            self.repeat_in_chunks(offset, match_length, start_idx);
-        } else {
-            // can just copy parts of the existing buffer
-            // SAFETY: as in `repeat`: start_idx + match_length <= buf_len and
-            // `match_length` bytes were reserved above.
-            unsafe {
-                self.buffer
-                    .extend_from_within_unchecked(start_idx, match_length)
-            };
-        }
-
-        self.total_output_counter += match_length as u64;
-        Ok(())
-    }
-
     fn repeat_in_chunks(&mut self, offset: usize, match_length: usize, start_idx: usize) {
         // The source region has period `offset` and grows as we copy: after
         // copying k*offset bytes total, the periodic run from `start_idx` is

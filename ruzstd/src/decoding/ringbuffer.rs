@@ -192,36 +192,6 @@ impl RingBuffer {
         self.tail = (self.tail + len) % self.cap;
     }
 
-    /// Same as [`Self::extend`] but the caller has already reserved enough
-    /// space for `data.len()` bytes (used by the fused push+repeat path, where
-    /// one `reserve` for both parts replaces two).
-    pub fn extend_unreserved(&mut self, data: &[u8]) {
-        let len = data.len();
-        let ptr = data.as_ptr();
-        if len == 0 {
-            return;
-        }
-        debug_assert!(self.free() >= len, "free: {} len: {}", self.free(), len);
-
-        let ((f1_ptr, f1_len), (f2_ptr, f2_len)) = self.free_slice_parts();
-        debug_assert!(f1_len + f2_len >= len, "{} + {} < {}", f1_len, f2_len, len);
-        let in_f1 = usize::min(len, f1_len);
-        let in_f2 = len - in_f1;
-        unsafe {
-            // SAFETY: `in_f1 + in_f2 == len`, so this writes `len` bytes total
-            // upholding invariant 2. Caller guaranteed capacity and the
-            // free-slice parts above report the writable regions.
-            if in_f1 > 0 {
-                f1_ptr.copy_from_nonoverlapping(ptr, in_f1);
-            }
-            if in_f2 > 0 {
-                f2_ptr.copy_from_nonoverlapping(ptr.add(in_f1), in_f2);
-            }
-        }
-        // SAFETY: Upholds invariant 3 by wrapping `tail` around.
-        self.tail = (self.tail + len) % self.cap;
-    }
-
     /// Advance head past `amount` elements, effectively removing
     /// them from the buffer.
     pub fn drop_first_n(&mut self, amount: usize) {
