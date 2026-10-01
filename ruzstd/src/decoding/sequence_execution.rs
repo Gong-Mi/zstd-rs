@@ -141,7 +141,11 @@ pub fn decode_and_execute_sequences(
         let seq_ml = ml_value + ml_add as u32;
 
         // ── inline execution ( mirrors execute_sequences ) ──
-        if seq_ll > 0 {
+        // literals 的边界检查与切片先做（不触碰 buffer），随后一次调用完成
+        // "push literals + repeat match"：两部分次序与各自单独调用时完全一致，
+        // 只是共用一次 reserve、少一次跨模块调用（实测每序列 ~6 次调用、
+        // 每次固定开销 5-7.7ns，是序列循环 9.35ns/seq 超额的主要来源）。
+        let literals: &[u8] = if seq_ll > 0 {
             let high = literals_copy_counter + seq_ll as usize;
             if high > literals_buffer.len() {
                 return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
@@ -152,27 +156,24 @@ pub fn decode_and_execute_sequences(
             }
             let literals = &literals_buffer[literals_copy_counter..high];
             literals_copy_counter = high;
-
-            #[cfg(feature = "seqstats")]
-            {
-                crate::seqstats::bump(crate::seqstats::LIT_CALLS, 1);
-                crate::seqstats::bump(crate::seqstats::LIT_BYTES, seq_ll as u64);
-            }
-            buffer.push(literals);
-        }
+            literals
+        } else {
+            &[]
+        };
 
         let actual_offset = do_offset_history(offset, seq_ll, &mut *offset_hist);
         if actual_offset == 0 {
             return Err(ExecuteSequencesError::ZeroOffset.into());
         }
-        if seq_ml > 0 {
-            #[cfg(feature = "seqstats")]
-            {
-                crate::seqstats::bump(crate::seqstats::MATCH_CALLS, 1);
-                crate::seqstats::bump(crate::seqstats::MATCH_BYTES, seq_ml as u64);
-            }
-            buffer.repeat(actual_offset as usize, seq_ml as usize)?;
+
+        #[cfg(feature = "seqstats")]
+        {
+            crate::seqstats::bump(crate::seqstats::LIT_CALLS, 1);
+            crate::seqstats::bump(crate::seqstats::LIT_BYTES, seq_ll as u64);
+            crate::seqstats::bump(crate::seqstats::MATCH_CALLS, 1);
+            crate::seqstats::bump(crate::seqstats::MATCH_BYTES, seq_ml as u64);
         }
+        buffer.push_and_repeat(literals, actual_offset as usize, seq_ml as usize)?;
 
         seq_sum += seq_ml;
         seq_sum += seq_ll;
