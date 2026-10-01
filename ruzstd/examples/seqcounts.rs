@@ -1,4 +1,6 @@
 //! 每序列工作项计数（确定性计数，不是计时；性能判定仍只在 CI）。
+#![cfg(feature = "seqstats")]
+
 use std::env;
 use std::fs;
 
@@ -23,7 +25,14 @@ fn main() {
         } else {
             "-".into()
         };
-        println!("{:<20} {:>9} {:>10} {:>11} {:>12} {:>9}",
-                 name, c[8], c[9], c[10], format!("{} B", c[8] / 2), ratio);
+        println!(
+            "{:<20} {:>9} {:>10} {:>11} {:>12} {:>9}",
+            name,
+            c[8],
+            c[9],
+            c[10],
+            format!("{} B", c[8] / 2),
+            ratio
+        );
     }
 }
