@@ -202,31 +202,45 @@ impl DecodeBuffer {
         }
 
         let start_idx = written - offset;
-        // 与 repeat_in_chunks 同样的倍增步长：overlap 时按 1x/2x/4x… 拷贝。
-        let mut copied = 0usize;
-        let mut step = offset;
-        while copied < match_length {
-            if step > match_length - copied {
-                step = match_length - copied;
-            }
+        if offset >= match_length {
             unsafe {
-                // SAFETY: 源**固定**为 start_idx（模式以 offset 为周期，所以"再拷一遍
-                // 开头 step 个字节"等价于接着周期序列的后续字节——与 RingBuffer 版
-                // extend_from_within_unchecked(start_idx, step) 同义）。设已拷总量
-                // copied_j，非截断步长满足 step_j = copied_j + offset（归纳：step_0 =
-                // offset，之后每步翻倍），于是源末端 start_idx + step_j == written + copied_j
-                // 恰好等于目标起点 ⇒ 两区间相邻不重叠；dst 容量在入口已按 match_length 检查。
+                // SAFETY: 当 `offset >= match_length` 时，`start_idx + match_length = written - offset + match_length <= written`。
+                // 源区间 `[start_idx, start_idx + match_length)` 完全位于目标区间 `[written, written + match_length)` 之前，
+                // 两段完全不重叠。目标缓冲区容量已在入口处由 `written + match_length > cap` 检查保证。
+                // 这条快路覆盖 90%+ 的常规匹配，消除循环与步长更新开销。
                 core::ptr::copy_nonoverlapping(
                     dst_base.add(start_idx),
-                    dst_base.add(written + copied),
-                    step,
+                    dst_base.add(written),
+                    match_length,
                 );
             }
-            copied += step;
-            if offset == 0 {
-                break;
+        } else {
+            // 与 repeat_in_chunks 同样的倍增步长：仅在真正周期重叠 (offset < match_length) 时按 1x/2x/4x… 拷贝。
+            let mut copied = 0usize;
+            let mut step = offset;
+            while copied < match_length {
+                if step > match_length - copied {
+                    step = match_length - copied;
+                }
+                unsafe {
+                    // SAFETY: 源**固定**为 start_idx（模式以 offset 为周期，所以"再拷一遍
+                    // 开头 step 个字节"等价于接着周期序列的后续字节——与 RingBuffer 版
+                    // extend_from_within_unchecked(start_idx, step) 同义）。设已拷总量
+                    // copied_j，非截断步长满足 step_j = copied_j + offset（归纳：step_0 =
+                    // offset，之后每步翻倍），于是源末端 start_idx + step_j == written + copied_j
+                    // 恰好等于目标起点 ⇒ 两区间相邻不重叠；dst 容量在入口已按 match_length 检查。
+                    core::ptr::copy_nonoverlapping(
+                        dst_base.add(start_idx),
+                        dst_base.add(written + copied),
+                        step,
+                    );
+                }
+                copied += step;
+                if offset == 0 {
+                    break;
+                }
+                step *= 2;
             }
-            step *= 2;
         }
         if let Some(d) = self.direct.as_mut() {
             d.written += match_length;
