@@ -563,14 +563,11 @@ impl FrameDecoder {
             //
             // SAFETY: `output` 的生命周期覆盖下面的整个内层循环，期间不解绑、不把
             // 解码器移出本线程（DecodeBuffer 的 Send 契约见 decode_buffer.rs）。
-            unsafe {
-                self.state
-                    .as_mut()
-                    .unwrap()
-                    .decoder_scratch
-                    .buffer
-                    .set_direct_output(output);
-            }
+            // ── 对照组（control）：**故意不绑定**直写目标 ──
+            // 目的：把"类型级分派带来的代码形状扰动"与"直写本身的功能收益"分开量。
+            // 本分支的 known 腿应当与 base 无差异；若 stream 腿仍出现 +4~+17% 的退化，
+            // 那就说明上一轮的 stream 退化是代码布局/双实例化产物，而不是直写功能引起。
+            // 注：下面的 direct_progress 恒返回 None，走原 read(output) 路径。
             let frame_result = loop {
                 let remaining = output
                     .len()
