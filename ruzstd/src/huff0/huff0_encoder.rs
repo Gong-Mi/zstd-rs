@@ -181,7 +181,7 @@ impl HuffmanTable {
                 total_bits += count * (table.codes[sym].1 as usize);
             }
         }
-        let min_payload_bytes = (total_bits + 7) / 8;
+        let min_payload_bytes = total_bits.div_ceil(8);
         // 如果裸字面量位载荷加上基本头开销已超过原文，绝无可能比 raw_literals 紧凑，直接放弃编码 4 流
         if min_payload_bytes + 16 >= data.len() {
             return None;
