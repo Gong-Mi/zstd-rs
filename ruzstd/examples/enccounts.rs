@@ -19,6 +19,8 @@ fn main() {
         let c = ruzstd::encstats::take();
         let ph = ruzstd::encstats::take_phases();
         let tot: u64 = ph.iter().sum();
+        let tot_phases = ph.iter().sum::<u64>() + ph[6];
+        let ph6 = ph[6];
         let pct = |i: usize| if tot > 0 { 100.0 * ph[i] as f64 / tot as f64 } else { 0.0 };
         let name0 = path.rsplit('/').next().unwrap_or(&path).to_string();
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
@@ -28,6 +30,15 @@ fn main() {
             "  {:<20} wall {:>7.1} ms | 匹配 {:>5.1}% 字面量 {:>5.1}% 表构建 {:>5.1}% 表写入 {:>5.1}% 序列编码 {:>5.1}% 其余 {:>5.1}%（相位和 {:>7.1} ms）",
             name0, wall_ms, pct(0), pct(1), pct(2), pct(3), pct(4), pct(5),
             tot as f64 / 1e6
+        );
+        eprintln!(
+            "  {:<20} cmp_calls {:>12} 触及字节 {:>12} 匹配字节 {:>12} 触及/匹配 {:>6.2} | 后缀构建 {:>5.1}%",
+            name0,
+            c[5],
+            c[6],
+            c[7],
+            if c[7] > 0 { c[6] as f64 / c[7] as f64 } else { 0.0 },
+            if tot_phases > 0 { 100.0 * ph6 as f64 / tot_phases as f64 } else { 0.0 }
         );
         let tot = c[3] + c[4];
         let reuse_pct = if tot > 0 { 100.0 * c[4] as f64 / tot as f64 } else { 0.0 };

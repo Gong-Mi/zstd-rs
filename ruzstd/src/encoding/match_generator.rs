@@ -80,6 +80,8 @@ impl Matcher for MatchGeneratorDriver {
         let suffixes = suffix_store_idx
             .map(|idx| suffix_pool.remove(idx))
             .unwrap_or_else(|| SuffixStore::with_capacity(requested_suffix_store_size));
+        #[cfg(feature = "encstats")]
+        let t_add0 = crate::encstats::tick();
         self.match_generator
             .add_data(space, suffixes, |mut data, mut suffixes| {
                 data.resize(data.capacity(), 0);
@@ -88,6 +90,8 @@ impl Matcher for MatchGeneratorDriver {
                 suffixes.slots.resize(suffixes.slots.capacity(), None);
                 suffix_pool.push(suffixes);
             });
+        #[cfg(feature = "encstats")]
+        crate::encstats::add_phase(6, crate::encstats::tick() - t_add0); // 后缀构建（块外）
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -331,7 +335,14 @@ impl MatchGenerator {
     /// Find the common prefix length between two byte slices
     #[inline(always)]
     fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
-        Self::mismatch_chunks::<8>(a, b)
+        let len = Self::mismatch_chunks::<8>(a, b);
+        #[cfg(feature = "encstats")]
+        {
+            crate::encstats::bump(crate::encstats::CMP_CALLS, 1);
+            crate::encstats::bump(crate::encstats::CMP_BYTES_MIN, a.len().min(b.len()) as u64);
+            crate::encstats::bump(crate::encstats::CMP_BYTES_MATCHED, len as u64);
+        }
+        len
     }
 
     /// Find the common prefix length between two byte slices with a configurable chunk length

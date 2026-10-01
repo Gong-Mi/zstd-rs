@@ -8,7 +8,13 @@ pub const PROBES: usize = 1;
 pub const HITS: usize = 2;
 pub const FSE_BUILDS: usize = 3;
 pub const FSE_REUSED: usize = 4;
-pub const N: usize = 5;
+/// common_prefix_len 的调用次数
+pub const CMP_CALLS: usize = 5;
+/// 比较时触及的字节上限（min(两边长度) 之和）
+pub const CMP_BYTES_MIN: usize = 6;
+/// 实际匹配上的字节数之和
+pub const CMP_BYTES_MATCHED: usize = 7;
+pub const N: usize = 8;
 
 /// 块级相位计时累加器（tick 数，架构间不可比；只看同进程内占比）。
 pub const PHASES: usize = 8;
