@@ -330,6 +330,20 @@ impl MatchGenerator {
                 let t_get = if sample { crate::encstats::tick() } else { 0 };
                 let hit = match_entry.suffixes.get(key);
                 #[cfg(feature = "encstats")]
+                {
+                    if is_last {
+                        crate::encstats::bump(crate::encstats::PROBE_LAST, 1);
+                        if hit.is_some() {
+                            crate::encstats::bump(crate::encstats::HIT_LAST, 1);
+                        }
+                    } else {
+                        crate::encstats::bump(crate::encstats::PROBE_OLD, 1);
+                        if hit.is_some() {
+                            crate::encstats::bump(crate::encstats::HIT_OLD, 1);
+                        }
+                    }
+                }
+                #[cfg(feature = "encstats")]
                 if sample {
                     sample_guard.get += crate::encstats::tick() - t_get;
                 }

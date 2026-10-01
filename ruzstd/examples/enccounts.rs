@@ -53,7 +53,10 @@ fn main() {
                 100.0 * ph7 as f64 / tot_phases.max(1) as f64
             );
         }
-        eprintln!("  {:<20} 第二槽为非空 {} | 命中 {} | insert 时[0]非空(移位) {}", name0, c[9], c[8], c[10]);
+        eprintln!(
+            "  {:<20} 探测 当前块 {} / 更早块 {} | 命中 当前块 {} / 更早块 {} | 移位 {} | 第二槽非空 {}",
+            name0, c[13], c[14], c[11], c[12], c[10], c[9]
+        );
         let tot = c[3] + c[4];
         let reuse_pct = if tot > 0 { 100.0 * c[4] as f64 / tot as f64 } else { 0.0 };
         let _ = per_byte;

@@ -20,7 +20,14 @@ pub const SECOND_HITS: usize = 8;
 pub const SECOND_POPULATED: usize = 9;
 /// 诊断：insert 时 slot[0] 已非空（即真正发生了"旧值→[1]"移位）的次数
 pub const SHIFTED: usize = 10;
-pub const N: usize = 11;
+/// 命中来源：当前块（最后一个窗口条目）
+pub const HIT_LAST: usize = 11;
+/// 命中来源：更早的窗口条目（前几个块）
+pub const HIT_OLD: usize = 12;
+/// 探测次数：当前块 / 更早块
+pub const PROBE_LAST: usize = 13;
+pub const PROBE_OLD: usize = 14;
+pub const N: usize = 15;
 
 /// 块级相位计时累加器（tick 数，架构间不可比；只看同进程内占比）。
 pub const PHASES: usize = 10;
