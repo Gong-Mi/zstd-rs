@@ -22,9 +22,13 @@ impl Read for DecodeBuffer {
         let amount = max_amount.min(target.len());
 
         let mut written = 0;
+        #[cfg(feature = "seqstats")]
+        crate::seqstats::bump(crate::seqstats::DRAIN_CALLS, 1);
         self.drain_to(amount, |buf| {
             target[written..][..buf.len()].copy_from_slice(buf);
             written += buf.len();
+            #[cfg(feature = "seqstats")]
+            crate::seqstats::bump(crate::seqstats::DRAINED, buf.len() as u64);
             (buf.len(), Ok(()))
         })?;
         Ok(amount)
@@ -72,6 +76,8 @@ impl DecodeBuffer {
     }
 
     pub fn push(&mut self, data: &[u8]) {
+        #[cfg(feature = "seqstats")]
+        crate::seqstats::bump(crate::seqstats::PRODUCED, data.len() as u64);
         self.buffer.extend(data);
         self.total_output_counter += data.len() as u64;
     }
@@ -105,6 +111,8 @@ impl DecodeBuffer {
                 };
             }
 
+            #[cfg(feature = "seqstats")]
+            crate::seqstats::bump(crate::seqstats::PRODUCED, match_length as u64);
             self.total_output_counter += match_length as u64;
             Ok(())
         }
@@ -252,6 +260,7 @@ impl DecodeBuffer {
     /// Semantics of write_bytes:
     /// Should dump as many of the provided bytes as possible to whatever sink until no bytes are left or an error is encountered
     /// Return how many bytes have actually been dumped to the sink.
+    #[allow(clippy::too_many_arguments)]
     fn drain_to(
         &mut self,
         amount: usize,

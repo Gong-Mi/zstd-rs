@@ -13,7 +13,10 @@ pub const LIT_CALLS: usize = 4;
 pub const LIT_BYTES: usize = 5;
 pub const MATCH_CALLS: usize = 6;
 pub const MATCH_BYTES: usize = 7;
-pub const N: usize = 8;
+pub const PRODUCED: usize = 8;
+pub const DRAINED: usize = 9;
+pub const DRAIN_CALLS: usize = 10;
+pub const N: usize = 11;
 
 pub static C: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
