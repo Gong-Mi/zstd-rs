@@ -225,13 +225,17 @@ jobs:
               tuned, _ = load('head_tuned.jsonl')
           except Exception:
               tuned = {}
-          enc = []
-          try:
-              for line in open('head.jsonl'):
-                  if '"encode"' in line:
-                      enc.append(json.loads(line))
-          except Exception:
-              pass
+          # 编码腿必须两侧都读：之前只读 head.jsonl ⇒ 编码侧根本没有 base 对照，
+          # 判定缺口就出在这里（"两段一样的数字"= 同一侧打印两次）。
+          enc_base, enc_head = [], []
+          for path_, sink in (('base.jsonl', enc_base), ('head.jsonl', enc_head)):
+              try:
+                  for line in open(path_):
+                      if '"encode"' in line:
+                          sink.append(json.loads(line))
+              except Exception:
+                  pass
+          enc = enc_head
 
           out = []
           out.append(f"runner 指纹: `{meta.get('runner','?')}`   rounds={os.environ.get('REPS')} iters={os.environ.get('ITERS')} size={os.environ.get('SIZE_MB')}MB")
@@ -267,15 +271,28 @@ jobs:
               out.append(f'| {corpus} | {leg} | {bw:.3f} ms | {b2w:.3f} ms | {d:+.2f}% | {dc:+.2f}% |')
           out.append('')
           out.append(f'同代码路径平均 |Δ| ≈ **{floor/max(n,1):.2f}%**（判定阈值的下限）')
-          if enc:
+          if enc_base or enc_head:
               out.append('')
-              out.append('**编码腿（head 侧，时间 + ratio 双指标）**')
+              out.append('**编码腿（base vs head，时间 + ratio 双指标）**')
               out.append('')
-              out.append('| corpus | bytes | C ms | ruzstd ms | 时间倍率 | C ratio | ruzstd ratio |')
-              out.append('|---|---|---|---|---|---|---|')
-              for o in enc:
-                  out.append(f"| {o['corpus']} | {o['bytes']} | {o['c_ms']:.3f} | {o['ruzstd_ms']:.3f} | "
-                             f"{o['ruzstd_ms']/o['c_ms']:.2f}x | {o['c_ratio']:.2f} | {o['ruzstd_ratio']:.2f} |")
+              out.append('| corpus | bytes | base ruzstd ms | head ruzstd ms | Δ时间 | base ratio | head ratio | Δratio | C ms |')
+              out.append('|---|---|---|---|---|---|---|---|---|')
+              _hb = {o['corpus']: o for o in enc_base}
+              _hh = {o['corpus']: o for o in enc_head}
+              for _c in sorted(set(_hb) | set(_hh)):
+                  _b, _h = _hb.get(_c), _hh.get(_c)
+                  _bt = f"{_b['ruzstd_ms']:.3f}" if _b else '-'
+                  _ht = f"{_h['ruzstd_ms']:.3f}" if _h else '-'
+                  _dt = f"{100*(_h['ruzstd_ms']-_b['ruzstd_ms'])/_b['ruzstd_ms']:+.2f}%" if _b and _h else '-'
+                  _br = f"{_b['ruzstd_ratio']:.3f}" if _b else '-'
+                  _hr = f"{_h['ruzstd_ratio']:.3f}" if _h else '-'
+                  _dr = f"{100*(_h['ruzstd_ratio']-_b['ruzstd_ratio'])/_b['ruzstd_ratio']:+.2f}%" if _b and _h else '-'
+                  _cm = f"{(_h or _b)['c_ms']:.3f}"
+                  _n = (_h or _b)['bytes']
+                  out.append(f'| {_c} | {_n} | {_bt} | {_ht} | {_dt} | {_br} | {_hr} | {_dr} | {_cm} |')
+
+          # CI 失败时也能读到 clippy/fmt 的输出（日志接口多次返回空 ⇒ 写进 summary）
+          out.append('')
           if tuned:
               out.append('')
               out.append('**编译配置腿（head 默认 vs lto=fat+cgu=1+target-cpu=native）**')
