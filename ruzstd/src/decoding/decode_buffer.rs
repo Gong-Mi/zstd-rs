@@ -144,14 +144,20 @@ impl DecodeBuffer {
     }
 
     /// 直写模式下的周期拷贝（等价于 ringbuffer 的 repeat 路径，但写进 dst）。
-    fn direct_repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
-        let (dst_base, written, cap, overflow) = {
-            let d = self.direct.as_ref().expect("direct mode");
-            (d.ptr, d.written, d.cap, d.overflow)
+    fn direct_repeat(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
+        let (dst_base, written, cap, overflow) = match self.direct.as_ref() {
+            Some(d) => (d.ptr, d.written, d.cap, d.overflow),
+            None => return Ok(()),
         };
         let _ = overflow;
         if written + match_length > cap {
-            self.direct.as_mut().expect("direct mode").overflow = true;
+            if let Some(d) = self.direct.as_mut() {
+                d.overflow = true;
+            }
             return Ok(());
         }
         if offset > written {
@@ -177,7 +183,9 @@ impl DecodeBuffer {
             let new_written = {
                 // 字段级拆分借用：dict_content（只读）与 direct（可变）互不相干。
                 let dict_slice = &self.dict_content[low..low + take];
-                let d = self.direct.as_mut().expect("direct mode");
+                let Some(d) = self.direct.as_mut() else {
+                    return Ok(());
+                };
                 if d.written + take > d.cap {
                     d.overflow = true;
                     return Ok(());
@@ -224,10 +232,8 @@ impl DecodeBuffer {
             }
             step *= 2;
         }
-        {
-            let d = self.direct.as_mut().expect("direct mode");
+        if let Some(d) = self.direct.as_mut() {
             d.written += match_length;
-            let _ = &d;
         }
         self.total_output_counter += match_length as u64;
         Ok(())
@@ -258,12 +264,14 @@ impl DecodeBuffer {
     ) -> Result<(), crate::io::Error> {
         if self.direct.is_some() {
             // 直写：raw 块直接读进调用方缓冲。
-            let (ptr, cap, written) = {
-                let d = self.direct.as_ref().expect("direct mode");
-                (d.ptr, d.cap, d.written)
+            let (ptr, cap, written) = match self.direct.as_ref() {
+                Some(d) => (d.ptr, d.cap, d.written),
+                None => return Ok(()),
             };
             if written + fill_length > cap {
-                self.direct.as_mut().expect("direct mode").overflow = true;
+                if let Some(d) = self.direct.as_mut() {
+                    d.overflow = true;
+                }
                 return Ok(());
             }
             let target = unsafe {
@@ -271,7 +279,9 @@ impl DecodeBuffer {
                 core::slice::from_raw_parts_mut(ptr.add(written), fill_length)
             };
             read.read_exact(target)?;
-            self.direct.as_mut().expect("direct mode").written += fill_length;
+            if let Some(d) = self.direct.as_mut() {
+                d.written += fill_length;
+            }
             self.total_output_counter += fill_length as u64;
             return Ok(());
         }
