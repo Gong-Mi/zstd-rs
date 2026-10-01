@@ -14,14 +14,23 @@ fn main() {
         let _ = ruzstd::encstats::take();
         let _ = ruzstd::encstats::take_phases();
         let wall0 = std::time::Instant::now();
-        let comp = ruzstd::encoding::compress_to_vec(&data[..], ruzstd::encoding::CompressionLevel::Fastest);
+        let comp = ruzstd::encoding::compress_to_vec(
+            &data[..],
+            ruzstd::encoding::CompressionLevel::Fastest,
+        );
         let wall_ms = wall0.elapsed().as_secs_f64() * 1000.0;
         let c = ruzstd::encstats::take();
         let ph = ruzstd::encstats::take_phases();
         let tot: u64 = ph.iter().sum();
         let tot_phases = ph.iter().sum::<u64>() + ph[6];
         let ph6 = ph[6];
-        let pct = |i: usize| if tot > 0 { 100.0 * ph[i] as f64 / tot as f64 } else { 0.0 };
+        let pct = |i: usize| {
+            if tot > 0 {
+                100.0 * ph[i] as f64 / tot as f64
+            } else {
+                0.0
+            }
+        };
         let name0 = path.rsplit('/').next().unwrap_or(&path).to_string();
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
         let ratio = data.len() as f64 / comp.len() as f64;
@@ -58,7 +67,11 @@ fn main() {
             name0, c[13], c[14], c[11], c[12], c[10], c[9]
         );
         let tot = c[3] + c[4];
-        let reuse_pct = if tot > 0 { 100.0 * c[4] as f64 / tot as f64 } else { 0.0 };
+        let reuse_pct = if tot > 0 {
+            100.0 * c[4] as f64 / tot as f64
+        } else {
+            0.0
+        };
         let _ = per_byte;
         println!(
             "{:<20} {:>9.2} {:>8.3} {:>8} {:>9} {:>8.1}%",

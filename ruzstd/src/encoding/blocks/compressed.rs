@@ -146,7 +146,8 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             crate::encstats::add_phase(3, t4 - t3); // 表写入 + seqnum
         }
         // phase 4 已在 encode_sequences 处累积
-        crate::encstats::add_phase(5, end - t5.unwrap_or(t4.unwrap_or(t3.unwrap_or(t2)))); // 其余（flush/拼块）
+        crate::encstats::add_phase(5, end - t5.unwrap_or(t4.unwrap_or(t3.unwrap_or(t2))));
+        // 其余（flush/拼块）
     }
     writer.flush();
 }

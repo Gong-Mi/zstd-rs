@@ -44,7 +44,9 @@ impl Matcher for MatchGeneratorDriver {
             data.resize(data.capacity(), 0);
             vec_pool.push(data);
             suffixes.slots.clear();
-            suffixes.slots.resize(suffixes.slots.capacity(), [None, None]);
+            suffixes
+                .slots
+                .resize(suffixes.slots.capacity(), [None, None]);
             suffix_pool.push(suffixes);
         });
     }
@@ -87,7 +89,9 @@ impl Matcher for MatchGeneratorDriver {
                 data.resize(data.capacity(), 0);
                 vec_pool.push(data);
                 suffixes.slots.clear();
-                suffixes.slots.resize(suffixes.slots.capacity(), [None, None]);
+                suffixes
+                    .slots
+                    .resize(suffixes.slots.capacity(), [None, None]);
                 suffix_pool.push(suffixes);
             });
         #[cfg(feature = "encstats")]
@@ -124,7 +128,6 @@ struct SuffixStore {
     links: Vec<u32>,
     len_log: u32,
 }
-
 
 /// 每 64 位置采样用的守卫：Drop 时把本位置的时钟差 flush 到相位累加器，
 /// 因此循环里的任何 return（字面量返回 / 结束）都不会丢失样本。
@@ -213,7 +216,10 @@ impl SuffixStore {
             cur = link as usize - 1;
         }
         #[cfg(feature = "encstats")]
-        crate::encstats::bump(crate::encstats::SECOND_POPULATED, (n.saturating_sub(1)) as u64);
+        crate::encstats::bump(
+            crate::encstats::SECOND_POPULATED,
+            (n.saturating_sub(1)) as u64,
+        );
         n
     }
 
@@ -356,7 +362,9 @@ impl MatchGenerator {
                 // 候选切片止于当前位置 ⇒ 太近的位置一律 < MIN_MATCH_LEN，链保留更老的位置。
                 const CHAIN_DEPTH: usize = 8;
                 let mut chain_buf = [0usize; CHAIN_DEPTH];
-                let chain_len = match_entry.suffixes.get_chain(key, CHAIN_DEPTH, &mut chain_buf);
+                let chain_len = match_entry
+                    .suffixes
+                    .get_chain(key, CHAIN_DEPTH, &mut chain_buf);
                 #[cfg(feature = "encstats")]
                 {
                     if is_last {
@@ -422,7 +430,7 @@ impl MatchGenerator {
                 // We still insert the current position's key so future lookups work.
                 let last_entry = self.window.last_mut().unwrap();
                 let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-                                    last_entry.suffixes.insert(key, self.suffix_idx);
+                last_entry.suffixes.insert(key, self.suffix_idx);
 
                 // All literals that were not included between this match and the last are now included here
                 let last_entry = self.window.last().unwrap();
@@ -442,7 +450,7 @@ impl MatchGenerator {
 
             let last_entry = self.window.last_mut().unwrap();
             let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-                            last_entry.suffixes.insert(key, self.suffix_idx);
+            last_entry.suffixes.insert(key, self.suffix_idx);
             // Step acceleration: skip ahead faster at later positions in the block.
             // Positions near the start are more valuable as match targets, so we
             // search them densely. Later positions are less likely to be referenced.
