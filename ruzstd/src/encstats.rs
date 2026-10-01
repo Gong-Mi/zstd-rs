@@ -14,7 +14,9 @@ pub const CMP_CALLS: usize = 5;
 pub const CMP_BYTES_MIN: usize = 6;
 /// 实际匹配上的字节数之和
 pub const CMP_BYTES_MATCHED: usize = 7;
-pub const N: usize = 8;
+/// 次新槽（第二个候选）真正参与比较的次数；若恒为 0 说明第二槽从未命中。
+pub const SECOND_HITS: usize = 8;
+pub const N: usize = 9;
 
 /// 块级相位计时累加器（tick 数，架构间不可比；只看同进程内占比）。
 pub const PHASES: usize = 10;

@@ -44,7 +44,7 @@ impl Matcher for MatchGeneratorDriver {
             data.resize(data.capacity(), 0);
             vec_pool.push(data);
             suffixes.slots.clear();
-            suffixes.slots.resize(suffixes.slots.capacity(), None);
+            suffixes.slots.resize(suffixes.slots.capacity(), [None, None]);
             suffix_pool.push(suffixes);
         });
     }
@@ -87,7 +87,7 @@ impl Matcher for MatchGeneratorDriver {
                 data.resize(data.capacity(), 0);
                 vec_pool.push(data);
                 suffixes.slots.clear();
-                suffixes.slots.resize(suffixes.slots.capacity(), None);
+                suffixes.slots.resize(suffixes.slots.capacity(), [None, None]);
                 suffix_pool.push(suffixes);
             });
         #[cfg(feature = "encstats")]
@@ -112,7 +112,12 @@ struct SuffixStore {
     // We use NonZeroUsize to enable niche optimization here.
     // On store we do +1 and on get -1
     // This is ok since usize::MAX is never a valid offset
-    slots: Vec<Option<NonZeroUsize>>,
+    //
+    // 每个 key 保留**最近两个**位置（[0] 最新、[1] 次新）：匹配时两个都试、取更长者。
+    // 动机来自实测：匹配器占编码时间 48.5~76.2%，其中每位置簿记占 66~69%，
+    // 而"被逐位置访问的位置数"取决于匹配覆盖了多少字节——多一个候选能拿到更长匹配，
+    // 反过来减少要逐位置走的位置数，ratio 与时间同向受益（不是此消彼长）。
+    slots: Vec<[Option<NonZeroUsize>; 2]>,
     len_log: u32,
 }
 
@@ -143,7 +148,7 @@ impl Drop for SampleGuard {
 impl SuffixStore {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            slots: alloc::vec![None; capacity],
+            slots: alloc::vec![[None, None]; capacity],
             len_log: capacity.ilog2(),
         }
     }
@@ -151,19 +156,30 @@ impl SuffixStore {
     #[inline(always)]
     fn insert(&mut self, suffix: &[u8], idx: usize) {
         let key = self.key(suffix);
-        self.slots[key] = Some(NonZeroUsize::new(idx + 1).unwrap());
+        let slot = &mut self.slots[key];
+        // 保留最近两个位置：多一个候选能拿到更长匹配，从而减少"要逐位置走访"的位置数
+        // （匹配器占编码时间 48.5~76.2%，其中每位置簿记 66~69%），ratio 与时间同向受益。
+        slot[1] = slot[0];
+        slot[0] = Some(NonZeroUsize::new(idx + 1).unwrap());
     }
 
     #[inline(always)]
     fn contains_key(&self, suffix: &[u8]) -> bool {
         let key = self.key(suffix);
-        self.slots[key].is_some()
+        self.slots[key][0].is_some()
     }
 
     #[inline(always)]
     fn get(&self, suffix: &[u8]) -> Option<usize> {
         let key = self.key(suffix);
-        self.slots[key].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
+        self.slots[key][0].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
+    }
+
+    /// 同一 key 的次新位置（第二个候选）。
+    #[inline(always)]
+    fn get_second(&self, suffix: &[u8]) -> Option<usize> {
+        let key = self.key(suffix);
+        self.slots[key][1].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
     }
 
     #[inline(always)]
@@ -306,7 +322,13 @@ impl MatchGenerator {
                 if sample {
                     sample_guard.get += crate::encstats::tick() - t_get;
                 }
-                if let Some(match_index) = hit {
+                let second = match_entry.suffixes.get_second(key);
+                #[cfg(feature = "encstats")]
+                if second.is_some() {
+                    crate::encstats::bump(crate::encstats::SECOND_HITS, 1);
+                }
+                let hits = [hit, second];
+                for &match_index in hits.iter().flatten() {
                     let match_slice = if is_last {
                         &match_entry.data[match_index..self.suffix_idx]
                     } else {
