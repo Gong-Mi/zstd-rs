@@ -126,6 +126,8 @@ pub fn decode_and_execute_sequences(
             .into());
         }
 
+        #[cfg(feature = "seqstats")]
+        crate::seqstats::bump(crate::seqstats::TRIPLE, 1);
         let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
         let offset = obits as u32 + (1u32 << of_code);
 
@@ -133,6 +135,8 @@ pub fn decode_and_execute_sequences(
             return Err(DecodeSequenceError::ZeroOffset.into());
         }
 
+        #[cfg(feature = "seqstats")]
+        crate::seqstats::bump(crate::seqstats::SEQ, 1);
         let seq_ll = ll_value + ll_add as u32;
         let seq_ml = ml_value + ml_add as u32;
 
@@ -149,6 +153,11 @@ pub fn decode_and_execute_sequences(
             let literals = &literals_buffer[literals_copy_counter..high];
             literals_copy_counter = high;
 
+            #[cfg(feature = "seqstats")]
+            {
+                crate::seqstats::bump(crate::seqstats::LIT_CALLS, 1);
+                crate::seqstats::bump(crate::seqstats::LIT_BYTES, seq_ll as u64);
+            }
             buffer.push(literals);
         }
 
@@ -157,6 +166,11 @@ pub fn decode_and_execute_sequences(
             return Err(ExecuteSequencesError::ZeroOffset.into());
         }
         if seq_ml > 0 {
+            #[cfg(feature = "seqstats")]
+            {
+                crate::seqstats::bump(crate::seqstats::MATCH_CALLS, 1);
+                crate::seqstats::bump(crate::seqstats::MATCH_BYTES, seq_ml as u64);
+            }
             buffer.repeat(actual_offset as usize, seq_ml as usize)?;
         }
 
@@ -165,16 +179,24 @@ pub fn decode_and_execute_sequences(
 
         if seq_idx + 1 < num_sequences {
             if ll_rle.is_none() {
+                #[cfg(feature = "seqstats")]
+                crate::seqstats::bump(crate::seqstats::UPD, 1);
                 ll_dec.update_state(&mut br);
             }
             if ml_rle.is_none() {
+                #[cfg(feature = "seqstats")]
+                crate::seqstats::bump(crate::seqstats::UPD, 1);
                 ml_dec.update_state(&mut br);
             }
             if of_rle.is_none() {
+                #[cfg(feature = "seqstats")]
+                crate::seqstats::bump(crate::seqstats::UPD, 1);
                 of_dec.update_state(&mut br);
             }
         }
 
+        #[cfg(feature = "seqstats")]
+        crate::seqstats::bump(crate::seqstats::BITSREM, 1);
         if br.bits_remaining() < 0 {
             return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
         }

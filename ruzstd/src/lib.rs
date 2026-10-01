@@ -65,3 +65,7 @@ pub mod io_nostd;
 pub use io_nostd as io;
 
 mod tests;
+
+/// 每序列工作项计数出口（仅 `seqstats` 特性；本地计数用，不参与性能判定）。
+#[cfg(feature = "seqstats")]
+pub mod seqstats;
