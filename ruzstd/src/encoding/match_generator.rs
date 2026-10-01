@@ -198,7 +198,6 @@ impl SuffixStore {
         self.slots[key][0].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
     }
 
-
     /// 沿链收集至多 `depth` 个候选位置（最新在前）。返回实际个数。
     #[inline(always)]
     fn get_chain(&self, suffix: &[u8], depth: usize, out: &mut [usize]) -> usize {
