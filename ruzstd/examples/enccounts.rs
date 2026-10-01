@@ -42,13 +42,15 @@ fn main() {
         );
         let ph7 = ph[7];
         let ph8 = ph[8];
+        let ph9 = ph[9];
         if ph7 > 0 {
             eprintln!(
-                "  {:<20} 采样: 窗口+get+比较 占比 {:>5.1}% | 其中比较 {:>5.1}% | 其余簿记 {:>5.1}%",
+                "  {:<20} 采样(位置内): 比较 {:>5.1}% | 哈希get {:>5.1}% | 窗口迭代与簿记 {:>5.1}%（样本总占比 {:>5.1}%）",
                 name0,
-                100.0 * ph7 as f64 / tot_phases.max(1) as f64,
                 100.0 * ph8 as f64 / ph7.max(1) as f64,
-                100.0 * (ph7 as f64 - ph8 as f64) / ph7.max(1) as f64
+                100.0 * ph9 as f64 / ph7.max(1) as f64,
+                100.0 * (ph7 as f64 - ph8 as f64 - ph9 as f64) / ph7.max(1) as f64,
+                100.0 * ph7 as f64 / tot_phases.max(1) as f64
             );
         }
         let tot = c[3] + c[4];

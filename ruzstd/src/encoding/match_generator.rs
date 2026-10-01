@@ -116,6 +116,30 @@ struct SuffixStore {
     len_log: u32,
 }
 
+
+/// 每 64 位置采样用的守卫：Drop 时把本位置的时钟差 flush 到相位累加器，
+/// 因此循环里的任何 return（字面量返回 / 结束）都不会丢失样本。
+#[cfg(feature = "encstats")]
+struct SampleGuard {
+    sample: bool,
+    t0: u64,
+    cmp: u64,
+    get: u64,
+}
+
+#[cfg(feature = "encstats")]
+impl Drop for SampleGuard {
+    fn drop(&mut self) {
+        if !self.sample {
+            return;
+        }
+        let t = crate::encstats::tick();
+        crate::encstats::add_phase(7, t - self.t0);
+        crate::encstats::add_phase(8, self.cmp);
+        crate::encstats::add_phase(9, self.get);
+    }
+}
+
 impl SuffixStore {
     fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -227,11 +251,18 @@ impl MatchGenerator {
             // phase7-phase8 ≈ 窗口迭代与哈希 get 的代价。每位置打点会被插桩自身淹没，
             // 所以只在采样点取时钟。
             #[cfg(feature = "encstats")]
-            let (sample, t_probe) = {
+            let mut sample_guard = {
                 pos_ctr = pos_ctr.wrapping_add(1);
                 let s = pos_ctr % 64 == 0;
-                (s, if s { crate::encstats::tick() } else { 0 })
+                SampleGuard {
+                    sample: s,
+                    t0: if s { crate::encstats::tick() } else { 0 },
+                    cmp: 0,
+                    get: 0,
+                }
             };
+            #[cfg(feature = "encstats")]
+            let sample = sample_guard.sample;
             let last_entry = self.window.last().unwrap();
             let data_slice = &last_entry.data;
 
@@ -265,12 +296,17 @@ impl MatchGenerator {
             let _ = &key;
 
             // Look in each window entry
-            #[cfg(feature = "encstats")]
-            let mut cmp_ticks: u64 = 0;
             let mut candidate = None;
             for (match_entry_idx, match_entry) in self.window.iter().enumerate() {
                 let is_last = match_entry_idx == self.window.len() - 1;
-                if let Some(match_index) = match_entry.suffixes.get(key) {
+                #[cfg(feature = "encstats")]
+                let t_get = if sample { crate::encstats::tick() } else { 0 };
+                let hit = match_entry.suffixes.get(key);
+                #[cfg(feature = "encstats")]
+                if sample {
+                    sample_guard.get += crate::encstats::tick() - t_get;
+                }
+                if let Some(match_index) = hit {
                     let match_slice = if is_last {
                         &match_entry.data[match_index..self.suffix_idx]
                     } else {
@@ -283,7 +319,7 @@ impl MatchGenerator {
                     let match_len = Self::common_prefix_len(match_slice, data_slice);
                     #[cfg(feature = "encstats")]
                     if sample {
-                        cmp_ticks += crate::encstats::tick() - t_cmp;
+                        sample_guard.cmp += crate::encstats::tick() - t_cmp;
                     }
 
                     // Collisions in the suffix store might make this check fail
@@ -300,12 +336,7 @@ impl MatchGenerator {
                             debug_assert_eq!(check_slice, &match_slice[..match_len]);
                         }
 
-                        #[cfg(feature = "encstats")]
-                if sample {
-                    crate::encstats::add_phase(7, crate::encstats::tick() - t_probe);
-                    crate::encstats::add_phase(8, cmp_ticks);
-                }
-                if let Some((old_offset, old_match_len)) = candidate {
+                        if let Some((old_offset, old_match_len)) = candidate {
                             if match_len > old_match_len
                                 || (match_len == old_match_len && offset < old_offset)
                             {
