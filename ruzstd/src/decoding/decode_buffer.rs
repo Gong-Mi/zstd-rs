@@ -125,6 +125,22 @@ impl DecodeBuffer {
         self.direct.as_ref().is_some_and(|d| d.overflow)
     }
 
+    #[inline(never)]
+    fn push_direct(&mut self, data: &[u8]) {
+        #[cfg(feature = "seqstats")]
+        crate::seqstats::bump(crate::seqstats::PRODUCED, data.len() as u64);
+        let _ = self.direct_write(data);
+        self.total_output_counter += data.len() as u64;
+    }
+
+    #[inline(never)]
+    fn repeat_direct(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
+        #[cfg(feature = "seqstats")]
+        crate::seqstats::bump(crate::seqstats::PRODUCED, match_length as u64);
+        self.direct_repeat(offset, match_length)
+    }
+
+    #[inline(never)]
     fn direct_write(&mut self, data: &[u8]) -> bool {
         let Some(d) = self.direct.as_mut() else {
             return false;
@@ -144,6 +160,7 @@ impl DecodeBuffer {
     }
 
     /// 直写模式下的周期拷贝（等价于 ringbuffer 的 repeat 路径，但写进 dst）。
+    #[inline(never)]
     fn direct_repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
         let (dst_base, written, cap, overflow) = {
             let d = self.direct.as_ref().expect("direct mode");
@@ -234,56 +251,66 @@ impl DecodeBuffer {
     }
 
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
-        if let Some(d) = self.direct.as_mut() {
-            // 直写：RLE 块直接填调用方缓冲。
-            if d.written + fill_length > d.cap {
-                d.overflow = true;
-                return;
-            }
-            unsafe {
-                // SAFETY: 容量已检查，ptr 生命周期见 set_direct_output 契约。
-                core::ptr::write_bytes(d.ptr.add(d.written), fill_with, fill_length);
-            }
-            d.written += fill_length;
-            self.total_output_counter += fill_length as u64;
+        if self.direct.is_some() {
+            self.extend_and_fill_direct(fill_with, fill_length);
             return;
         }
         self.buffer.extend_and_fill(fill_with, fill_length);
     }
 
+    #[inline(never)]
+    fn extend_and_fill_direct(&mut self, fill_with: u8, fill_length: usize) {
+        let d = self.direct.as_mut().expect("direct mode");
+        if d.written + fill_length > d.cap {
+            d.overflow = true;
+            return;
+        }
+        unsafe {
+            // SAFETY: 容量已检查，ptr 生命周期见 set_direct_output 契约。
+            core::ptr::write_bytes(d.ptr.add(d.written), fill_with, fill_length);
+        }
+        d.written += fill_length;
+        self.total_output_counter += fill_length as u64;
+    }
+
     pub fn extend_from_reader<R: Read>(
         &mut self,
-        mut read: R,
+        read: R,
         fill_length: usize,
     ) -> Result<(), crate::io::Error> {
         if self.direct.is_some() {
-            // 直写：raw 块直接读进调用方缓冲。
-            let (ptr, cap, written) = {
-                let d = self.direct.as_ref().expect("direct mode");
-                (d.ptr, d.cap, d.written)
-            };
-            if written + fill_length > cap {
-                self.direct.as_mut().expect("direct mode").overflow = true;
-                return Ok(());
-            }
-            let target = unsafe {
-                // SAFETY: 容量已按 fill_length 检查；ptr 生命周期见 set_direct_output 契约。
-                core::slice::from_raw_parts_mut(ptr.add(written), fill_length)
-            };
-            read.read_exact(target)?;
-            self.direct.as_mut().expect("direct mode").written += fill_length;
-            self.total_output_counter += fill_length as u64;
-            return Ok(());
+            return self.extend_from_reader_direct(read, fill_length);
         }
         self.buffer.extend_from_reader(read, fill_length)
     }
 
+    #[inline(never)]
+    fn extend_from_reader_direct<R: Read>(
+        &mut self,
+        mut read: R,
+        fill_length: usize,
+    ) -> Result<(), crate::io::Error> {
+        let (ptr, cap, written) = {
+            let d = self.direct.as_ref().expect("direct mode");
+            (d.ptr, d.cap, d.written)
+        };
+        if written + fill_length > cap {
+            self.direct.as_mut().expect("direct mode").overflow = true;
+            return Ok(());
+        }
+        let target = unsafe {
+            // SAFETY: 容量已按 fill_length 检查；ptr 生命周期见 set_direct_output 契约。
+            core::slice::from_raw_parts_mut(ptr.add(written), fill_length)
+        };
+        read.read_exact(target)?;
+        self.direct.as_mut().expect("direct mode").written += fill_length;
+        self.total_output_counter += fill_length as u64;
+        Ok(())
+    }
+
     pub fn push(&mut self, data: &[u8]) {
         if self.direct.is_some() {
-            #[cfg(feature = "seqstats")]
-            crate::seqstats::bump(crate::seqstats::PRODUCED, data.len() as u64);
-            let _ = self.direct_write(data);
-            self.total_output_counter += data.len() as u64;
+            self.push_direct(data);
             return;
         }
         #[cfg(feature = "seqstats")]
@@ -294,9 +321,7 @@ impl DecodeBuffer {
 
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
         if self.direct.is_some() {
-            #[cfg(feature = "seqstats")]
-            crate::seqstats::bump(crate::seqstats::PRODUCED, match_length as u64);
-            return self.direct_repeat(offset, match_length);
+            return self.repeat_direct(offset, match_length);
         }
         if offset > self.buffer.len() {
             self.repeat_from_dict(offset, match_length)
