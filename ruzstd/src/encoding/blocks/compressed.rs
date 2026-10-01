@@ -318,7 +318,14 @@ fn compress_literals(
 ) -> Option<huff0_encoder::HuffmanTable> {
     let reset_idx = writer.index();
 
-    let new_encoder_table = huff0_encoder::HuffmanTable::build_from_data(literals);
+    // 快速预检：接近均匀分布的字面量直接放弃建表，避免白付 60%+ 的建表与回退开销
+    let new_encoder_table = match huff0_encoder::HuffmanTable::try_build_from_data(literals) {
+        Some(t) => t,
+        None => {
+            raw_literals(literals, writer);
+            return None;
+        }
+    };
 
     let (encoder_table, new_table) = if let Some(_table) = last_table {
         if let Some(diff) = _table.can_encode(&new_encoder_table) {

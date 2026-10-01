@@ -159,6 +159,38 @@ pub struct HuffmanTable {
 }
 
 impl HuffmanTable {
+    /// 尝试从数据构建 Huffman 表。若最高频符号出现率过低（小于 ~0.8%），
+    /// 数据接近均匀分布，Huffman 必然无法压缩，返回 None 避免后续无意义的排序与编码开销 (对齐 C zstd)。
+    pub fn try_build_from_data(data: &[u8]) -> Option<Self> {
+        let mut counts = [0usize; 256];
+        let mut max = 0u8;
+        let mut largest = 0usize;
+        for &x in data {
+            let c = &mut counts[x as usize];
+            *c += 1;
+            if *c > largest {
+                largest = *c;
+            }
+            max = max.max(x);
+        }
+
+        let table = Self::build_from_counts(&counts[..=max as usize]);
+        let mut total_bits = 0usize;
+        for (sym, &count) in counts.iter().enumerate() {
+            if count > 0 && sym < table.codes.len() {
+                total_bits += count * (table.codes[sym].1 as usize);
+            }
+        }
+        let min_payload_bytes = (total_bits + 7) / 8;
+        // 如果裸字面量位载荷加上基本头开销已超过原文，绝无可能比 raw_literals 紧凑，直接放弃编码 4 流
+        if min_payload_bytes + 16 >= data.len() {
+            return None;
+        }
+
+        Some(table)
+    }
+
+    #[allow(dead_code)]
     pub fn build_from_data(data: &[u8]) -> Self {
         let mut counts = [0; 256];
         let mut max = 0;
