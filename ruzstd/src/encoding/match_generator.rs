@@ -501,7 +501,7 @@ impl MatchGenerator {
         }
         let slice = &last_entry.data[self.suffix_idx..idx];
         for (key_index, key) in slice.windows(MIN_MATCH_LEN).enumerate() {
-                            last_entry.suffixes.insert(key, self.suffix_idx + key_index);
+            last_entry.suffixes.insert(key, self.suffix_idx + key_index);
         }
     }
 
@@ -665,7 +665,7 @@ fn matches() {
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 23,
+                offset: 11,
                 match_len: 6,
             },
             &mut reconstructed,
