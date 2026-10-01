@@ -6,8 +6,24 @@ use core::hash::Hasher;
 use super::ringbuffer::RingBuffer;
 use crate::decoding::errors::DecodeBufferError;
 
+/// 直写后端的绑定状态：调用方给了连续 dst 时，解码直接写进它，
+/// 不再"先写环形缓冲、再抽出"——省掉每个输出字节的第二次写与一次读。
+struct DirectOut {
+    /// 调用方缓冲的起点（仅在本帧解码期间有效，由 `set_direct_output` 的
+    /// 调用方保证生命周期覆盖整个解码过程）。
+    ptr: *mut u8,
+    cap: usize,
+    /// 已写入 dst 的字节数；同时是本帧可回溯窗口的长度。
+    written: usize,
+    /// 已通过 read/read_all 交代给调用方的字节数。
+    drained: usize,
+    /// 曾出现超出 dst 容量的写入尝试（调用方缓冲太小）。
+    overflow: bool,
+}
+
 pub struct DecodeBuffer {
     buffer: RingBuffer,
+    direct: Option<DirectOut>,
     pub dict_content: Vec<u8>,
 
     pub window_size: usize,
@@ -16,8 +32,19 @@ pub struct DecodeBuffer {
     pub hash: twox_hash::XxHash64,
 }
 
+// SAFETY: `direct` 只在 `decode_all` 的单次调用内绑定（绑定到解绑之间不执行用户
+// 代码），因此不可能在持有裸指针的期间把解码器移到别的线程；指针指向的缓冲由
+// `set_direct_output` 的 unsafe 契约保证生命周期与独占。
+unsafe impl Send for DecodeBuffer {}
+
 impl Read for DecodeBuffer {
     fn read(&mut self, target: &mut [u8]) -> Result<usize, Error> {
+        if let Some(d) = self.direct.as_mut() {
+            // 直写：字节已经在调用方缓冲里，这里只交代进度。
+            let n = d.written - d.drained;
+            d.drained = d.written;
+            return Ok(n);
+        }
         let max_amount = self.can_drain_to_window_size().unwrap_or(0);
         let amount = max_amount.min(target.len());
 
@@ -35,6 +62,7 @@ impl DecodeBuffer {
     pub fn new(window_size: usize) -> DecodeBuffer {
         DecodeBuffer {
             buffer: RingBuffer::new(),
+            direct: None,
             dict_content: Vec::new(),
             window_size,
             total_output_counter: 0,
@@ -45,6 +73,7 @@ impl DecodeBuffer {
 
     pub fn reset(&mut self, window_size: usize) {
         self.window_size = window_size;
+        self.direct = None;
         self.buffer.clear();
         self.buffer.reserve(self.window_size);
         self.dict_content.clear();
@@ -56,27 +85,219 @@ impl DecodeBuffer {
     }
 
     pub fn len(&self) -> usize {
-        self.buffer.len()
+        match &self.direct {
+            Some(d) => d.written,
+            None => self.buffer.len(),
+        }
+    }
+
+    /// 把调用方的连续缓冲绑定为输出目标（known 尺寸腿）。
+    ///
+    /// # Safety
+    ///
+    /// 调用方必须保证 `dst` 指向的内存在 `clear_direct_output` 之前一直有效、
+    /// 不被别名写入；解码过程中所有输出都写进这块内存，`read`/`read_all`
+    /// 只报告进度、不再拷贝。
+    pub unsafe fn set_direct_output(&mut self, dst: &mut [u8]) {
+        self.direct = Some(DirectOut {
+            ptr: dst.as_mut_ptr(),
+            cap: dst.len(),
+            written: 0,
+            drained: 0,
+            overflow: false,
+        });
+    }
+
+    /// 解开直写绑定并返回本帧写入的字节数。
+    pub fn clear_direct_output(&mut self) -> usize {
+        match self.direct.take() {
+            Some(d) => d.written,
+            None => 0,
+        }
+    }
+
+    /// 本次直写是否发生过容量不足（对应 TargetTooSmall）。
+    pub fn direct_overflowed(&self) -> bool {
+        self.direct.as_ref().is_some_and(|d| d.overflow)
+    }
+
+    fn direct_write(&mut self, data: &[u8]) -> bool {
+        let Some(d) = self.direct.as_mut() else {
+            return false;
+        };
+        if d.written + data.len() > d.cap {
+            d.overflow = true;
+            return true;
+        }
+        unsafe {
+            // SAFETY: 容量已检查；ptr 生命周期由 set_direct_output 的调用方保证，
+            // 且 written 之前的区域是本帧自己写过的，不与 data 重叠（data 来自
+            // literals_buffer 或同帧更早的输出，见 repeat 的调用约定）。
+            core::ptr::copy_nonoverlapping(data.as_ptr(), d.ptr.add(d.written), data.len());
+        }
+        d.written += data.len();
+        true
+    }
+
+    /// 直写模式下的周期拷贝（等价于 ringbuffer 的 repeat 路径，但写进 dst）。
+    fn direct_repeat(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
+        let (dst_base, written, cap, overflow) = match self.direct.as_ref() {
+            Some(d) => (d.ptr, d.written, d.cap, d.overflow),
+            None => return Ok(()),
+        };
+        let _ = overflow;
+        if written + match_length > cap {
+            if let Some(d) = self.direct.as_mut() {
+                d.overflow = true;
+            }
+            return Ok(());
+        }
+        if offset > written {
+            // 冷路径：字典 / 跨帧——先把需要的那段字典字节落进 dst，再以"现有总长"
+            // 为周期继续（与 RingBuffer 版的 repeat_from_dict 同义：此时 offset 指到
+            // 缓冲区起点，即字典与输出开头相接的位置）。
+            if self.total_output_counter > self.window_size as u64 {
+                return Err(DecodeBufferError::OffsetTooBig {
+                    offset,
+                    buf_len: written,
+                });
+            }
+            let bytes_from_dict = offset - written;
+            let dlen = self.dict_content.len();
+            if bytes_from_dict > dlen {
+                return Err(DecodeBufferError::NotEnoughBytesInDictionary {
+                    got: dlen,
+                    need: bytes_from_dict,
+                });
+            }
+            let take = bytes_from_dict.min(match_length);
+            let low = dlen - bytes_from_dict;
+            let new_written = {
+                // 字段级拆分借用：dict_content（只读）与 direct（可变）互不相干。
+                let dict_slice = &self.dict_content[low..low + take];
+                let Some(d) = self.direct.as_mut() else {
+                    return Ok(());
+                };
+                if d.written + take > d.cap {
+                    d.overflow = true;
+                    return Ok(());
+                }
+                unsafe {
+                    // SAFETY: 容量已检查；take 来自 dict_content，dst 与字典不重叠。
+                    core::ptr::copy_nonoverlapping(dict_slice.as_ptr(), d.ptr.add(d.written), take);
+                }
+                d.written += take;
+                d.written
+            };
+            self.total_output_counter += take as u64;
+            let rest = match_length - take;
+            if rest == 0 {
+                return Ok(());
+            }
+            return self.direct_repeat(new_written, rest);
+        }
+
+        let start_idx = written - offset;
+        // 与 repeat_in_chunks 同样的倍增步长：overlap 时按 1x/2x/4x… 拷贝。
+        let mut copied = 0usize;
+        let mut step = offset;
+        while copied < match_length {
+            if step > match_length - copied {
+                step = match_length - copied;
+            }
+            unsafe {
+                // SAFETY: 源**固定**为 start_idx（模式以 offset 为周期，所以"再拷一遍
+                // 开头 step 个字节"等价于接着周期序列的后续字节——与 RingBuffer 版
+                // extend_from_within_unchecked(start_idx, step) 同义）。设已拷总量
+                // copied_j，非截断步长满足 step_j = copied_j + offset（归纳：step_0 =
+                // offset，之后每步翻倍），于是源末端 start_idx + step_j == written + copied_j
+                // 恰好等于目标起点 ⇒ 两区间相邻不重叠；dst 容量在入口已按 match_length 检查。
+                core::ptr::copy_nonoverlapping(
+                    dst_base.add(start_idx),
+                    dst_base.add(written + copied),
+                    step,
+                );
+            }
+            copied += step;
+            if offset == 0 {
+                break;
+            }
+            step *= 2;
+        }
+        if let Some(d) = self.direct.as_mut() {
+            d.written += match_length;
+        }
+        self.total_output_counter += match_length as u64;
+        Ok(())
     }
 
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
+        if let Some(d) = self.direct.as_mut() {
+            // 直写：RLE 块直接填调用方缓冲。
+            if d.written + fill_length > d.cap {
+                d.overflow = true;
+                return;
+            }
+            unsafe {
+                // SAFETY: 容量已检查，ptr 生命周期见 set_direct_output 契约。
+                core::ptr::write_bytes(d.ptr.add(d.written), fill_with, fill_length);
+            }
+            d.written += fill_length;
+            self.total_output_counter += fill_length as u64;
+            return;
+        }
         self.buffer.extend_and_fill(fill_with, fill_length);
     }
 
     pub fn extend_from_reader<R: Read>(
         &mut self,
-        read: R,
+        mut read: R,
         fill_length: usize,
     ) -> Result<(), crate::io::Error> {
+        if self.direct.is_some() {
+            // 直写：raw 块直接读进调用方缓冲。
+            let (ptr, cap, written) = match self.direct.as_ref() {
+                Some(d) => (d.ptr, d.cap, d.written),
+                None => return Ok(()),
+            };
+            if written + fill_length > cap {
+                if let Some(d) = self.direct.as_mut() {
+                    d.overflow = true;
+                }
+                return Ok(());
+            }
+            let target = unsafe {
+                // SAFETY: 容量已按 fill_length 检查；ptr 生命周期见 set_direct_output 契约。
+                core::slice::from_raw_parts_mut(ptr.add(written), fill_length)
+            };
+            read.read_exact(target)?;
+            if let Some(d) = self.direct.as_mut() {
+                d.written += fill_length;
+            }
+            self.total_output_counter += fill_length as u64;
+            return Ok(());
+        }
         self.buffer.extend_from_reader(read, fill_length)
     }
 
     pub fn push(&mut self, data: &[u8]) {
+        if self.direct.is_some() {
+            let _ = self.direct_write(data);
+            self.total_output_counter += data.len() as u64;
+            return;
+        }
         self.buffer.extend(data);
         self.total_output_counter += data.len() as u64;
     }
 
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
+        if self.direct.is_some() {
+            return self.direct_repeat(offset, match_length);
+        }
         if offset > self.buffer.len() {
             self.repeat_from_dict(offset, match_length)
         } else {
@@ -179,6 +400,10 @@ impl DecodeBuffer {
 
     /// Check if and how many bytes can currently be drawn from the buffer
     pub fn can_drain_to_window_size(&self) -> Option<usize> {
+        if self.direct.is_some() {
+            // 直写下没有"待抽出"的字节，全部已在调用方缓冲里。
+            return None;
+        }
         if self.buffer.len() > self.window_size {
             Some(self.buffer.len() - self.window_size)
         } else {
@@ -188,7 +413,19 @@ impl DecodeBuffer {
 
     //How many bytes can be drained if the window_size does not have to be maintained
     pub fn can_drain(&self) -> usize {
-        self.buffer.len()
+        match &self.direct {
+            Some(d) => d.written - d.drained,
+            None => self.buffer.len(),
+        }
+    }
+
+    /// 直写模式下的进度交代（等价于 read 的效果，但不需要传入调用方切片）。
+    /// 非直写模式返回 None。
+    pub fn direct_progress(&mut self) -> Option<usize> {
+        let d = self.direct.as_mut()?;
+        let n = d.written - d.drained;
+        d.drained = d.written;
+        Some(n)
     }
 
     /// Drain as much as possible while retaining enough so that decoding si still possible with the required window_size
@@ -238,6 +475,11 @@ impl DecodeBuffer {
     }
 
     pub fn read_all(&mut self, target: &mut [u8]) -> Result<usize, Error> {
+        if let Some(d) = self.direct.as_mut() {
+            let n = d.written - d.drained;
+            d.drained = d.written;
+            return Ok(n);
+        }
         let amount = self.buffer.len().min(target.len());
 
         let mut written = 0;
@@ -252,6 +494,7 @@ impl DecodeBuffer {
     /// Semantics of write_bytes:
     /// Should dump as many of the provided bytes as possible to whatever sink until no bytes are left or an error is encountered
     /// Return how many bytes have actually been dumped to the sink.
+    #[allow(clippy::too_many_arguments)]
     fn drain_to(
         &mut self,
         amount: usize,
