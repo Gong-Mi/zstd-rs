@@ -3,7 +3,7 @@ use super::sequence_section_decoder::{lookup_ll_code, lookup_ml_code, maybe_upda
 use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::SequencesHeader;
 use crate::blocks::sequence_section::MAX_OFFSET_CODE;
-use crate::decoding::decode_buffer::DecodeBuffer;
+use crate::decoding::decode_buffer::{DecodeBuffer, SeqOut};
 use crate::decoding::errors::DecodeBufferError;
 use crate::decoding::errors::FSEDecoderError;
 use crate::decoding::errors::{DecodeSequenceError, ExecuteSequencesError};
@@ -49,11 +49,11 @@ impl From<DecodeBufferError> for FusedSequencesError {
 /// `execute_sequences` for valid input, but avoids materializing the
 /// intermediate `Vec<Sequence>` (a write+read of 12 bytes per sequence) and
 /// re-walking the literals buffer in a second loop.
-pub fn decode_and_execute_sequences(
+pub fn decode_and_execute_sequences<O: SeqOut>(
     section: &SequencesHeader,
     source: &[u8],
     fse: &mut FSEScratch,
-    buffer: &mut DecodeBuffer,
+    buffer: &mut O,
     literals_buffer: &[u8],
     offset_hist: &mut [u32; 3],
 ) -> Result<(), FusedSequencesError> {
@@ -158,7 +158,7 @@ pub fn decode_and_execute_sequences(
                 crate::seqstats::bump(crate::seqstats::LIT_CALLS, 1);
                 crate::seqstats::bump(crate::seqstats::LIT_BYTES, seq_ll as u64);
             }
-            buffer.push(literals);
+            buffer.push_literals(literals);
         }
 
         let actual_offset = do_offset_history(offset, seq_ll, &mut *offset_hist);
@@ -171,7 +171,7 @@ pub fn decode_and_execute_sequences(
                 crate::seqstats::bump(crate::seqstats::MATCH_CALLS, 1);
                 crate::seqstats::bump(crate::seqstats::MATCH_BYTES, seq_ml as u64);
             }
-            buffer.repeat(actual_offset as usize, seq_ml as usize)?;
+            buffer.repeat_match(actual_offset as usize, seq_ml as usize)?;
         }
 
         seq_sum += seq_ml;
@@ -211,7 +211,7 @@ pub fn decode_and_execute_sequences(
 
     if literals_copy_counter < literals_buffer.len() {
         let rest_literals = &literals_buffer[literals_copy_counter..];
-        buffer.push(rest_literals);
+        buffer.push_literals(rest_literals);
         seq_sum += rest_literals.len() as u32;
     }
 

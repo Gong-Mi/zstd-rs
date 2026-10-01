@@ -120,27 +120,33 @@ impl DecodeBuffer {
         }
     }
 
+    /// 当前是否处于直写模式（序列循环据此按类型分派输出目标）。
+    pub fn direct_mode(&self) -> bool {
+        self.direct.is_some()
+    }
+
     /// 本次直写是否发生过容量不足（对应 TargetTooSmall）。
     pub fn direct_overflowed(&self) -> bool {
         self.direct.as_ref().is_some_and(|d| d.overflow)
     }
 
-    #[inline(never)]
-    fn push_direct(&mut self, data: &[u8]) {
+    pub(crate) fn push_direct(&mut self, data: &[u8]) {
         #[cfg(feature = "seqstats")]
         crate::seqstats::bump(crate::seqstats::PRODUCED, data.len() as u64);
         let _ = self.direct_write(data);
         self.total_output_counter += data.len() as u64;
     }
 
-    #[inline(never)]
-    fn repeat_direct(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
+    pub(crate) fn repeat_direct(
+        &mut self,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
         #[cfg(feature = "seqstats")]
         crate::seqstats::bump(crate::seqstats::PRODUCED, match_length as u64);
         self.direct_repeat(offset, match_length)
     }
 
-    #[inline(never)]
     fn direct_write(&mut self, data: &[u8]) -> bool {
         let Some(d) = self.direct.as_mut() else {
             return false;
@@ -160,7 +166,6 @@ impl DecodeBuffer {
     }
 
     /// 直写模式下的周期拷贝（等价于 ringbuffer 的 repeat 路径，但写进 dst）。
-    #[inline(never)]
     fn direct_repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
         let (dst_base, written, cap, overflow) = {
             let d = self.direct.as_ref().expect("direct mode");
@@ -309,10 +314,6 @@ impl DecodeBuffer {
     }
 
     pub fn push(&mut self, data: &[u8]) {
-        if self.direct.is_some() {
-            self.push_direct(data);
-            return;
-        }
         #[cfg(feature = "seqstats")]
         crate::seqstats::bump(crate::seqstats::PRODUCED, data.len() as u64);
         self.buffer.extend(data);
@@ -320,9 +321,6 @@ impl DecodeBuffer {
     }
 
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
-        if self.direct.is_some() {
-            return self.repeat_direct(offset, match_length);
-        }
         if offset > self.buffer.len() {
             self.repeat_from_dict(offset, match_length)
         } else {
@@ -728,5 +726,72 @@ mod tests {
             }
         }
         assert_eq!(short_writer.buf.len(), repeats * 50 + 100);
+    }
+}
+
+/// 序列循环对输出目标的最小接口：只写 literals 与周期拷贝两件事。
+///
+/// 之所以做成 trait 而不是在 `DecodeBuffer` 的 push/repeat 里 `if direct`：实测
+/// 后者会让**共享热路径**多一次判别/一次不可内联调用，把另一条 API 腿拖慢
+/// （v1 stream +1.1~+9.9%；v2 收敛了 stream 却让 known 腿的 text +6.9%）。
+/// 泛型化之后两条腿各自实例化，热循环里没有任何模式判别。
+pub trait SeqOut {
+    /// 目前累计产出的字节数（序列循环用它算本块差量）。
+    fn len(&self) -> usize;
+    fn push_literals(&mut self, data: &[u8]);
+    fn repeat_match(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError>;
+}
+
+impl SeqOut for DecodeBuffer {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    #[inline(always)]
+    fn push_literals(&mut self, data: &[u8]) {
+        debug_assert!(
+            self.direct.is_none(),
+            "直写模式下序列循环必须用 DstOut，不能走环形后端"
+        );
+        self.push(data);
+    }
+
+    #[inline(always)]
+    fn repeat_match(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
+        debug_assert!(
+            self.direct.is_none(),
+            "直写模式下序列循环必须用 DstOut，不能走环形后端"
+        );
+        self.repeat(offset, match_length)
+    }
+}
+
+/// 直写侧的输出目标视图：借用同一个 `DecodeBuffer`（拿它的直写状态、字典与窗口
+/// 记账），但只做"写进调用方缓冲"这一件事。
+pub struct DstOut<'a> {
+    buf: &'a mut DecodeBuffer,
+}
+
+impl<'a> DstOut<'a> {
+    pub fn new(buf: &'a mut DecodeBuffer) -> Self {
+        Self { buf }
+    }
+}
+
+impl SeqOut for DstOut<'_> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    #[inline(always)]
+    fn push_literals(&mut self, data: &[u8]) {
+        self.buf.push_direct(data);
+    }
+
+    #[inline(always)]
+    fn repeat_match(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
+        self.buf.repeat_direct(offset, match_length)
     }
 }

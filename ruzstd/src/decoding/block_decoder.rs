@@ -4,6 +4,7 @@ use super::super::blocks::literals_section::LiteralsSection;
 use super::super::blocks::literals_section::LiteralsSectionType;
 use super::super::blocks::sequence_section::SequencesHeader;
 use super::literals_section_decoder::decode_literals;
+use super::decode_buffer::DstOut;
 use super::sequence_execution::decode_and_execute_sequences;
 use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::DecodeSequenceError;
@@ -172,14 +173,28 @@ impl BlockDecoder {
         vprintln!("Slice for sequences: {}", raw.len());
 
         if seq_section.num_sequences != 0 {
-            decode_and_execute_sequences(
-                &seq_section,
-                raw,
-                &mut workspace.fse,
-                &mut workspace.buffer,
-                &workspace.literals_buffer,
-                &mut workspace.offset_hist,
-            )
+            // 输出目标按**类型**分派（每块一次）：环形后端与直写后端各实例化一份
+            // 序列循环，循环内部没有任何模式判别。
+            let seq_result = if workspace.buffer.direct_mode() {
+                decode_and_execute_sequences(
+                    &seq_section,
+                    raw,
+                    &mut workspace.fse,
+                    &mut DstOut::new(&mut workspace.buffer),
+                    &workspace.literals_buffer,
+                    &mut workspace.offset_hist,
+                )
+            } else {
+                decode_and_execute_sequences(
+                    &seq_section,
+                    raw,
+                    &mut workspace.fse,
+                    &mut workspace.buffer,
+                    &workspace.literals_buffer,
+                    &mut workspace.offset_hist,
+                )
+            };
+            seq_result
             .map_err(|e| match e {
                 crate::decoding::sequence_execution::FusedSequencesError::Decode(d) => {
                     DecompressBlockError::from(d)
@@ -196,7 +211,11 @@ impl BlockDecoder {
                     },
                 ));
             }
-            workspace.buffer.push(&workspace.literals_buffer);
+            if workspace.buffer.direct_mode() {
+                workspace.buffer.push_direct(&workspace.literals_buffer);
+            } else {
+                workspace.buffer.push(&workspace.literals_buffer);
+            }
             workspace.sequences.clear();
         }
 
