@@ -300,11 +300,12 @@ impl MatchGenerator {
             if let Some((match_entry_idx, match_index, offset, mut match_len)) = candidate {
                 // Catch-up: 沿历史匹配与当前位置同时向前倒退，尽可能把前驱字面量合并进 match (对齐 C zstd_fast.c)
                 let last_entry = self.window.last().unwrap();
+                let match_data = &self.window[match_entry_idx].data[..match_index];
+                let curr_data = &last_entry.data[self.last_idx_in_sequence..self.suffix_idx];
+                let max_back = match_data.len().min(curr_data.len());
                 let mut back = 0;
-                while self.suffix_idx > self.last_idx_in_sequence + back && match_index > back {
-                    let prev_match_byte = self.window[match_entry_idx].data[match_index - 1 - back];
-                    let prev_curr_byte = last_entry.data[self.suffix_idx - 1 - back];
-                    if prev_match_byte == prev_curr_byte {
+                while back < max_back {
+                    if match_data[match_data.len() - 1 - back] == curr_data[curr_data.len() - 1 - back] {
                         back += 1;
                     } else {
                         break;
