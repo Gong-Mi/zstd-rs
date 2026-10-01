@@ -118,6 +118,10 @@ struct SuffixStore {
     // 而"被逐位置访问的位置数"取决于匹配覆盖了多少字节——多一个候选能拿到更长匹配，
     // 反过来减少要逐位置走的位置数，ratio 与时间同向受益（不是此消彼长）。
     slots: Vec<[Option<NonZeroUsize>; 2]>,
+    /// 链：`links[pos]` = 同一 key 的上一个位置（+1 编码，0 表示链尾）。
+    /// 只靠槽位覆盖会丢"足够远"的候选（候选切片止于当前位置，太近的位置一律 < MIN_MATCH_LEN），
+    /// 链把更老的位置保留下来，按有界步数走查取"足够远且更长"的候选。
+    links: Vec<u32>,
     len_log: u32,
 }
 
@@ -151,6 +155,7 @@ impl SuffixStore {
         // 目的是让桶碰撞/同 key 复访真正发生，使双槽的第二个候选有内容可选。
         Self {
             slots: alloc::vec![[None, None]; capacity],
+            links: Vec::new(),
             len_log: capacity.ilog2().min(14),
         }
     }
@@ -181,16 +186,35 @@ impl SuffixStore {
         self.slots[key][0].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
     }
 
-    /// 同一 key 的次新位置（第二个候选）。
+    /// 同一 key 的次新位置（供另一条匹配路径使用）。
     #[inline(always)]
     fn get_second(&self, suffix: &[u8]) -> Option<usize> {
         let key = self.key(suffix);
-        let v = self.slots[key][1];
-        #[cfg(feature = "encstats")]
-        if v.is_some() {
-            crate::encstats::bump(crate::encstats::SECOND_POPULATED, 1);
+        self.slots[key][1].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
+    }
+
+    /// 沿链收集至多 `depth` 个候选位置（最新在前）。返回实际个数。
+    #[inline(always)]
+    fn get_chain(&self, suffix: &[u8], depth: usize, out: &mut [usize]) -> usize {
+        let key = self.key(suffix);
+        let mut cur = match self.slots[key][0] {
+            Some(v) => <NonZeroUsize as Into<usize>>::into(v) - 1,
+            None => return 0,
+        };
+        let mut n = 0usize;
+        while n < depth && n < out.len() {
+            out[n] = cur;
+            n += 1;
+            // 链上一位（0 表示链尾）
+            let link = self.links.get(cur).copied().unwrap_or(0);
+            if link == 0 {
+                break;
+            }
+            cur = link as usize - 1;
         }
-        v.map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
+        #[cfg(feature = "encstats")]
+        crate::encstats::bump(crate::encstats::SECOND_POPULATED, (n.saturating_sub(1)) as u64);
+        n
     }
 
     #[inline(always)]
@@ -328,32 +352,26 @@ impl MatchGenerator {
                 let is_last = match_entry_idx == self.window.len() - 1;
                 #[cfg(feature = "encstats")]
                 let t_get = if sample { crate::encstats::tick() } else { 0 };
-                let hit = match_entry.suffixes.get(key);
+                // 有界链走查（与另一条匹配路径一致）：最多 CHAIN_DEPTH 个候选，最新在前。
+                // 候选切片止于当前位置 ⇒ 太近的位置一律 < MIN_MATCH_LEN，链保留更老的位置。
+                const CHAIN_DEPTH: usize = 8;
+                let mut chain_buf = [0usize; CHAIN_DEPTH];
+                let chain_len = match_entry.suffixes.get_chain(key, CHAIN_DEPTH, &mut chain_buf);
                 #[cfg(feature = "encstats")]
                 {
                     if is_last {
                         crate::encstats::bump(crate::encstats::PROBE_LAST, 1);
-                        if hit.is_some() {
+                        if chain_len > 0 {
                             crate::encstats::bump(crate::encstats::HIT_LAST, 1);
                         }
                     } else {
                         crate::encstats::bump(crate::encstats::PROBE_OLD, 1);
-                        if hit.is_some() {
+                        if chain_len > 0 {
                             crate::encstats::bump(crate::encstats::HIT_OLD, 1);
                         }
                     }
                 }
-                #[cfg(feature = "encstats")]
-                if sample {
-                    sample_guard.get += crate::encstats::tick() - t_get;
-                }
-                let second = match_entry.suffixes.get_second(key);
-                #[cfg(feature = "encstats")]
-                if second.is_some() {
-                    crate::encstats::bump(crate::encstats::SECOND_HITS, 1);
-                }
-                let hits = [hit, second];
-                for &match_index in hits.iter().flatten() {
+                for &match_index in chain_buf[..chain_len].iter() {
                     let match_slice = if is_last {
                         &match_entry.data[match_index..self.suffix_idx]
                     } else {
@@ -404,9 +422,7 @@ impl MatchGenerator {
                 // We still insert the current position's key so future lookups work.
                 let last_entry = self.window.last_mut().unwrap();
                 let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-                if !last_entry.suffixes.contains_key(key) {
-                    last_entry.suffixes.insert(key, self.suffix_idx);
-                }
+                                    last_entry.suffixes.insert(key, self.suffix_idx);
 
                 // All literals that were not included between this match and the last are now included here
                 let last_entry = self.window.last().unwrap();
@@ -426,9 +442,7 @@ impl MatchGenerator {
 
             let last_entry = self.window.last_mut().unwrap();
             let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-            if !last_entry.suffixes.contains_key(key) {
-                last_entry.suffixes.insert(key, self.suffix_idx);
-            }
+                            last_entry.suffixes.insert(key, self.suffix_idx);
             // Step acceleration: skip ahead faster at later positions in the block.
             // Positions near the start are more valuable as match targets, so we
             // search them densely. Later positions are less likely to be referenced.
@@ -472,9 +486,7 @@ impl MatchGenerator {
         }
         let slice = &last_entry.data[self.suffix_idx..idx];
         for (key_index, key) in slice.windows(MIN_MATCH_LEN).enumerate() {
-            if !last_entry.suffixes.contains_key(key) {
-                last_entry.suffixes.insert(key, self.suffix_idx + key_index);
-            }
+                            last_entry.suffixes.insert(key, self.suffix_idx + key_index);
         }
     }
 
