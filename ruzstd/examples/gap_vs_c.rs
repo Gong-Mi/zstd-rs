@@ -129,11 +129,14 @@ fn cpu_seconds() -> f64 {
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut reps, mut iters, mut size_mb) = (5u32, 7u32, 8usize);
+    #[allow(unused_mut, unused_assignments)]
+    let mut profile = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--reps" => reps = args.next().and_then(|v| v.parse().ok()).unwrap_or(reps),
             "--iters" => iters = args.next().and_then(|v| v.parse().ok()).unwrap_or(iters),
             "--size-mb" => size_mb = args.next().and_then(|v| v.parse().ok()).unwrap_or(size_mb),
+            "--profile" => profile = true,
             other => eprintln!("ignoring unknown arg {other}"),
         }
     }
@@ -231,8 +234,72 @@ fn main() {
         }
     }
 
+    #[cfg(feature = "prof")]
+    if profile {
+        for (name, comp, orig_len) in &encoded {
+            let orig = &corpora.iter().find(|(n, _)| n == name).unwrap().1;
+            report_profile(name, comp, *orig_len);
+            let _ = orig;
+        }
+    }
+    #[cfg(not(feature = "prof"))]
+    if profile {
+        eprintln!(
+            "--profile needs the `prof` feature: cargo run --features prof --example gap_vs_c"
+        );
+    }
+
     if failures > 0 {
         eprintln!("{failures} assertion failure(s)");
         std::process::exit(1);
     }
+}
+
+/// One instrumented decode per corpus; prints one JSON line with the block-level
+/// split (literals vs sequence loop), the literal composition and the sampled
+/// in-loop phase shares. Ratios only — the instrumented build is slower than a
+/// clean one, so its wall time is not comparable to anything.
+#[cfg(feature = "prof")]
+fn report_profile(label: &str, comp: &[u8], orig_len: u32) {
+    use ruzstd::decoding::prof as p;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    fn get(c: &AtomicU64) -> f64 {
+        c.load(Ordering::Relaxed) as f64
+    }
+
+    p::reset();
+    let out = ruzstd_decode(comp);
+    assert_eq!(
+        out.len(),
+        orig_len as usize,
+        "profile pass decoded a wrong length"
+    );
+
+    let lit = get(&p::LITERALS_TICKS);
+    let seq = get(&p::SEQ_LOOP_TICKS);
+    let phased = (lit + seq).max(1.0);
+    let samples = get(&p::SAMPLES).max(1.0);
+    let inloop =
+        (get(&p::FSE_TICKS) + get(&p::LIT_COPY_TICKS) + get(&p::MATCH_COPY_TICKS)).max(1.0);
+
+    println!(
+        "{{\"kind\":\"profile\",\"corpus\":\"{label}\",\"literals_pct\":{:.1},\"seq_loop_pct\":{:.1},\"lit_raw_mb\":{:.2},\"lit_rle_mb\":{:.2},\"lit_huf_mb\":{:.2},\"huf4_sections\":{},\"huf1_sections\":{},\"lit_blocks_raw\":{},\"lit_blocks_rle\":{},\"lit_blocks_huf\":{},\"seqs\":{},\"samples\":{},\"inloop_fse_pct\":{:.1},\"inloop_litcopy_pct\":{:.1},\"inloop_matchcopy_pct\":{:.1}}}",
+        get(&p::LITERALS_TICKS) * 100.0 / phased,
+        get(&p::SEQ_LOOP_TICKS) * 100.0 / phased,
+        get(&p::LIT_RAW_BYTES) / 1048576.0,
+        get(&p::LIT_RLE_BYTES) / 1048576.0,
+        get(&p::LIT_HUF_BYTES) / 1048576.0,
+        get(&p::HUF4_SECTIONS) as u64,
+        get(&p::HUF1_SECTIONS) as u64,
+        get(&p::LIT_BLOCKS_RAW) as u64,
+        get(&p::LIT_BLOCKS_RLE) as u64,
+        get(&p::LIT_BLOCKS_HUF) as u64,
+        get(&p::SEQS) as u64,
+        get(&p::SAMPLES) as u64,
+        get(&p::FSE_TICKS) * 100.0 / inloop,
+        get(&p::LIT_COPY_TICKS) * 100.0 / inloop,
+        get(&p::MATCH_COPY_TICKS) * 100.0 / inloop,
+    );
 }

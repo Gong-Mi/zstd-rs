@@ -188,6 +188,35 @@ jobs:
           ITERS: ${{ steps.refs.outputs.iters }}
           SIZE_MB: ${{ steps.refs.outputs.size_mb }}
 
+      - name: Profile head (块级打点 + 每 64 序列采样)
+        working-directory: head
+        run: |
+          cargo run --release --quiet --features prof --example gap_vs_c -- \
+            --profile --reps 0 --iters 1 --size-mb ${{ steps.refs.outputs.size_mb }} \
+            > ../profile.jsonl 2> ../profile.log || { cat ../profile.log; exit 1; }
+          python3 - <<'PY'
+          import json, os
+          # 本步的 working-directory 是 head/，产物写在仓库根
+          path = os.path.join(os.environ['GITHUB_WORKSPACE'], 'profile.jsonl')
+          rows = ['| corpus | literals % | seq loop % | lit raw/huf MB | huf 4-stream/1-stream | seqs | in-loop FSE / litcopy / matchcopy % |',
+                  '|---|---|---|---|---|---|---|']
+          for line in open(path):
+              line = line.strip()
+              if not line.startswith('{'):
+                  continue
+              o = json.loads(line)
+              if o.get('kind') != 'profile':
+                  continue
+              rows.append(f"| {o['corpus']} | {o['literals_pct']} | {o['seq_loop_pct']} | "
+                          f"{o['lit_raw_mb']}/{o['lit_huf_mb']} | {o['huf4_sections']}/{o['huf1_sections']} | "
+                          f"{o['seqs']} | {o['inloop_fse_pct']} / {o['inloop_litcopy_pct']} / {o['inloop_matchcopy_pct']} |")
+          out = '\n'.join(rows)
+          print(out)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('\n## 解码相位归因（head 侧；块级打点 + 每 64 序列采样，只看占比）\n\n')
+              f.write(out + '\n')
+          PY
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -197,3 +226,5 @@ jobs:
             base.jsonl
             head.jsonl
             run.log
+            profile.jsonl
+            profile.log
