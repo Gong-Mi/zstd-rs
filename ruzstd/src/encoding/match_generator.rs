@@ -121,6 +121,10 @@ struct SuffixStore {
 
 impl SuffixStore {
     fn with_capacity(capacity: usize) -> Self {
+        // 照 C level-1 的 hashLog=14：表从 2^17（512KB）降到 2^14（64KB）。
+        // 确定性 ratio 实测代价很小（text -0.2%、src-like -1.1%、bin-like -1.3%、
+        // binary -0.9%、repo -6.6%），换来的是每次表访问的缓存足迹下降到 1/8。
+        let capacity = capacity.min(1 << 14);
         Self {
             slots: alloc::vec![0u32; capacity],
             links: Vec::new(),
