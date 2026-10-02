@@ -161,7 +161,11 @@ impl SuffixStore {
         crate::encstats::bump(crate::encstats::PROBES, 1);
         let key = self.key(suffix);
         let raw = self.slots[key];
-        let hit = if raw == 0 { None } else { Some(raw as usize - 1) };
+        let hit = if raw == 0 {
+            None
+        } else {
+            Some(raw as usize - 1)
+        };
         #[cfg(feature = "encstats")]
         if hit.is_some() {
             crate::encstats::bump(crate::encstats::HITS, 1);
