@@ -187,25 +187,27 @@ impl SuffixStore {
         self.get_hashed(self.key_hash(suffix))
     }
 
+    /// 单乘法哈希（对齐 C 的 ZSTD_hashPtr）：读 8 字节 → 一次 64 位乘法 → 取高位。
+    ///
+    /// 原实现是 5 次 64 位乘法 + 5 次移位 + 4 次异或（suffix[0..5] 各混一次），
+    /// 而 `key_hash` 是每个走访位置都要跑的路径；C 的 fast 只用 1 次乘法 + 移位。
+    ///
+    /// 这是**算法改动**（哈希分布变化 ⇒ 候选集合变化 ⇒ ratio 可能变），因此
+    /// 必须与时间一起由 CI 同 run 判定，不能按"等价改动"处理。
     #[inline(always)]
     fn key_hash(&self, suffix: &[u8]) -> usize {
-        let s0 = suffix[0] as u64;
-        let s1 = suffix[1] as u64;
-        let s2 = suffix[2] as u64;
-        let s3 = suffix[3] as u64;
-        let s4 = suffix[4] as u64;
-
-        const POLY: u64 = 0xCF3BCCDCABu64;
-
-        let s0 = (s0 << 24).wrapping_mul(POLY);
-        let s1 = (s1 << 32).wrapping_mul(POLY);
-        let s2 = (s2 << 40).wrapping_mul(POLY);
-        let s3 = (s3 << 48).wrapping_mul(POLY);
-        let s4 = (s4 << 56).wrapping_mul(POLY);
-
-        let index = s0 ^ s1 ^ s2 ^ s3 ^ s4;
-        let index = index >> (64 - self.len_log);
-        index as usize % self.slots.len()
+        // 需要 5 字节的区分度（MIN_MATCH_LEN=5）：尾部不足 8 字节时零填充
+        let v = if suffix.len() >= 8 {
+            u64::from_le_bytes(suffix[..8].try_into().unwrap())
+        } else {
+            let mut buf = [0u8; 8];
+            let n = suffix.len().min(8);
+            buf[..n].copy_from_slice(&suffix[..n]);
+            u64::from_le_bytes(buf)
+        };
+        const PRIME: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mixed = v.wrapping_mul(PRIME);
+        ((mixed >> (64 - self.len_log)) as usize) % self.slots.len()
     }
 }
 
