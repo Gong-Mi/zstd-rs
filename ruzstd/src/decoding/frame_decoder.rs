@@ -557,20 +557,71 @@ impl FrameDecoder {
                 }
                 Err(e) => return Err(e),
             };
-            loop {
-                self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
-                let bytes_written = self
-                    .read(output)
-                    .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
+            // 直写模式：把调用方剩余的连续缓冲整块绑定为输出目标，解码直接写进去，
+            // 省掉"先写环形缓冲、每 1MB 再抽出到调用方"的那一趟（实测 24MB 真内核语料
+            // 下 produced 25,165,824 B / drained 24,477,696 B ⇒ 每个输出字节写两次）。
+            //
+            // SAFETY: `output` 的生命周期覆盖下面的整个内层循环，期间不解绑、不把
+            // 解码器移出本线程（DecodeBuffer 的 Send 契约见 decode_buffer.rs）。
+            unsafe {
+                self.state
+                    .as_mut()
+                    .unwrap()
+                    .decoder_scratch
+                    .buffer
+                    .set_direct_output(output);
+            }
+            let frame_result = loop {
+                let remaining = output
+                    .len()
+                    .saturating_sub(self.state.as_mut().unwrap().decoder_scratch.buffer.len());
+                if let Err(e) = self.decode_blocks(
+                    &mut input,
+                    BlockDecodingStrategy::UptoBytes(remaining.max(1)),
+                ) {
+                    break Err(e);
+                }
+                let bytes_written = match self
+                    .state
+                    .as_mut()
+                    .unwrap()
+                    .decoder_scratch
+                    .buffer
+                    .direct_progress()
+                {
+                    Some(n) => n,
+                    None => match self
+                        .read(output)
+                        .map_err(FrameDecoderError::FailedToDrainDecodebuffer)
+                    {
+                        Ok(n) => n,
+                        Err(e) => break Err(e),
+                    },
+                };
                 output = &mut output[bytes_written..];
                 total_bytes_written += bytes_written;
-                if self.can_collect() != 0 {
-                    return Err(FrameDecoderError::TargetTooSmall);
+                if self.can_collect() != 0
+                    || self
+                        .state
+                        .as_ref()
+                        .unwrap()
+                        .decoder_scratch
+                        .buffer
+                        .direct_overflowed()
+                {
+                    break Err(FrameDecoderError::TargetTooSmall);
                 }
                 if self.is_finished() {
-                    break;
+                    break Ok(());
                 }
-            }
+            };
+            self.state
+                .as_mut()
+                .unwrap()
+                .decoder_scratch
+                .buffer
+                .clear_direct_output();
+            frame_result?;
         }
 
         Ok(total_bytes_written)

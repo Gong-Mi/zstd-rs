@@ -12,23 +12,24 @@ use crate::{
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut literals_vec = Vec::new();
     let mut sequences = Vec::new();
-    state.matcher.start_matching(|seq| {
-        match seq {
-            Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
-                literals_vec.extend_from_slice(literals);
-                sequences.push(crate::blocks::sequence_section::Sequence {
-                    ll: literals.len() as u32,
-                    ml: match_len as u32,
-                    of: (offset + 3) as u32, // TODO make use of the offset history
-                });
-            }
+    // 取出偏移历史到局部，避免与 `state.matcher` 的可变借用冲突（块尾写回）
+    let mut offset_hist = state.offset_hist;
+    state.matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            literals_vec.extend_from_slice(literals);
+            sequences.push(crate::blocks::sequence_section::Sequence {
+                ll: literals.len() as u32,
+                ml: match_len as u32,
+                of: encode_offset_value(offset as u32, literals.len() as u32, &mut offset_hist),
+            });
         }
     });
+    state.offset_hist = offset_hist;
 
     // literals section
 
@@ -298,6 +299,64 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
     }
 }
 
+/// 为 (实际偏移, 字面量长度) 选出最小的 Offset_Value，并按解码端 `do_offset_history`
+/// 的规则更新偏移历史（1..=3 为重复偏移码，≥4 表示新偏移 = 值 - 3）。
+///
+/// 与解码端逐分支镜像：ll>0 时 1/2/3 → hist[0]/hist[1]/hist[2]；ll==0 时
+/// 1/2/3 → hist[1]/hist[2]/hist[0]-1。历史更新也必须一致，否则后续序列的
+/// 重复偏移码会解成别的偏移（cross_validate 的 "ruzstd 编码 → C 解码" 是验证门）。
+fn encode_offset_value(actual_offset: u32, lit_len: u32, hist: &mut [u32; 3]) -> u32 {
+    let value = if lit_len > 0 {
+        if actual_offset == hist[0] {
+            1
+        } else if actual_offset == hist[1] {
+            2
+        } else if actual_offset == hist[2] {
+            3
+        } else {
+            actual_offset + 3
+        }
+    } else if actual_offset == hist[1] {
+        1
+    } else if actual_offset == hist[2] {
+        2
+    } else if hist[0] > 0 && actual_offset == hist[0] - 1 {
+        3
+    } else {
+        actual_offset + 3
+    };
+
+    if lit_len > 0 {
+        match value {
+            // 复用最近偏移：历史不变
+            1 => {}
+            2 => {
+                hist[1] = hist[0];
+                hist[0] = actual_offset;
+            }
+            _ => {
+                hist[2] = hist[1];
+                hist[1] = hist[0];
+                hist[0] = actual_offset;
+            }
+        }
+    } else {
+        match value {
+            // ll==0：解码端把 hist[1]/hist[2] 当作最近偏移；码 1 只做部分后移
+            1 => {
+                hist[1] = hist[0];
+                hist[0] = actual_offset;
+            }
+            _ => {
+                hist[2] = hist[1];
+                hist[1] = hist[0];
+                hist[0] = actual_offset;
+            }
+        }
+    }
+    value
+}
+
 fn encode_offset(len: u32) -> (u8, u32, usize) {
     let log = len.ilog2();
     let lower = len & ((1 << log) - 1);
@@ -373,5 +432,39 @@ fn compress_literals(
         Some(new_encoder_table)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod offset_value_tests {
+    use super::encode_offset_value;
+    use crate::decoding::sequence_execution::do_offset_history;
+
+    /// 编码侧选的码必须被解码端规则还原成同一个偏移，且两侧历史演进一致。
+    /// 覆盖 ll>0 与 ll==0（后者的码→历史映射不同）以及新偏移路径。
+    #[test]
+    fn round_trip_against_decoder_rule() {
+        let offsets = [1u32, 2, 3, 4, 5, 8, 16, 63, 64, 1000];
+        for &start in &[[1u32, 4, 8], [4, 8, 1], [7, 7, 7], [2, 3, 5]] {
+            for &ll in &[1u32, 5, 100] {
+                for &ll0 in &[0u32] {
+                    for &lit in &[ll, ll0] {
+                        let mut eh = start;
+                        let mut dh = start;
+                        for (i, &off) in offsets.iter().enumerate() {
+                            // 每 3 步插一个新偏移，保证历史被推动
+                            let actual = if i % 3 == 2 { 17 + i as u32 } else { off };
+                            let value = encode_offset_value(actual, lit, &mut eh);
+                            let decoded = do_offset_history(value, lit, &mut dh);
+                            assert_eq!(
+                                decoded, actual,
+                                "start={start:?} ll={lit} value={value} 应还原 {actual}"
+                            );
+                            assert_eq!(eh, dh, "历史演进必须一致 (start={start:?}, ll={lit})");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

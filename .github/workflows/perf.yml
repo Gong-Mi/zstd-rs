@@ -1,0 +1,199 @@
+--- 
+name: perf A/B
+
+# 性能结论只在 CI 出（同 runner、同窗口、可重复）；
+# 本地设备负载不稳，只做构建验证与测试/断言。
+#
+# 协议：base/head 两侧各自构建同一份 harness，然后 **交错** 跑
+# （base→head→base→head …），每轮都测墙钟与进程 CPU 时间
+# （/proc/self/stat 的 utime+stime），每语料取跨轮最小值。
+# 交错抵消同一 runner 上的时间漂移；CPU 时间对邻居负载/降频远比墙钟钝。
+# 两者都只是参考量：判据是同一 run 内的 base/head 差值，外加 C 参照自身漂移作噪声底。
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'base ref/SHA (对照侧)'
+        default: 'master'
+        required: false
+      head_ref:
+        description: 'head ref/SHA (被测侧, 空=当前 ref)'
+        default: ''
+        required: false
+      reps:
+        description: '交错轮数 (每轮两侧各跑一次)'
+        default: '8'
+        required: false
+      iters:
+        description: '每轮每语料 best-of'
+        default: '9'
+        required: false
+      size_mb:
+        description: '每语料大小 (MB)'
+        default: '16'
+        required: false
+      arm_crosscheck:
+        description: '在 arm64 Linux runner 上复核 (默认关闭, 很少用到)'
+        default: 'false'
+        required: false
+  push:
+    branches:
+      - 'ci-perf*'
+      - 'perf/*'
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  ab:
+    name: bench A/B (base vs head)
+    # 普通 PR 不跑；加 `perf` label 或走 push/workflow_dispatch
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'perf')
+    # 默认 x86_64（快、够用）；只有显式要求时在 arm64 Linux runner 上复核。
+    # arm64 runner 很少轮到，所以不做成默认路径。
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.arm_crosscheck == 'true') && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+      - name: Resolve refs
+        id: refs
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            base="${{ github.event.inputs.base_ref }}"; [ -z "$base" ] && base="master"
+            head="${{ github.event.inputs.head_ref }}"
+            [ -z "$head" ] && head="${{ github.sha }}"
+            echo "base=$base" >> "$GITHUB_OUTPUT"
+            echo "head=$head" >> "$GITHUB_OUTPUT"
+          fi
+          echo "reps=${{ github.event.inputs.reps || '8' }}" >> "$GITHUB_OUTPUT"
+          echo "iters=${{ github.event.inputs.iters || '9' }}" >> "$GITHUB_OUTPUT"
+          echo "size_mb=${{ github.event.inputs.size_mb || '16' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout base (对照侧)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.refs.outputs.base }}
+          path: base
+          fetch-depth: 1
+
+      - name: Checkout head (被测侧)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.refs.outputs.head }}
+          path: head
+          fetch-depth: 1
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo (base)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: base
+      - name: Cache cargo (head)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: head
+
+      # harness 是自包含的 example：拷进两侧，保证对照侧也有同一份测量代码
+      - name: Share harness into base
+        run: |
+          mkdir -p base/ruzstd/examples
+          cp head/ruzstd/examples/gap_vs_c.rs base/ruzstd/examples/gap_vs_c.rs
+
+      - name: Build harness (both sides)
+        run: |
+          (cd base && cargo build --release --example gap_vs_c)
+          (cd head && cargo build --release --example gap_vs_c)
+          mkdir -p bins
+          cp base/target/release/examples/gap_vs_c bins/base
+          cp head/target/release/examples/gap_vs_c bins/head
+          ls -l bins
+
+      - name: Interleaved rounds (base/head alternating)
+        env:
+          REPS: ${{ steps.refs.outputs.reps }}
+          ITERS: ${{ steps.refs.outputs.iters }}
+          SIZE_MB: ${{ steps.refs.outputs.size_mb }}
+        run: |
+          set -euo pipefail
+          : > base.jsonl
+          : > head.jsonl
+          : > run.log
+          for i in $(seq 1 "$REPS"); do
+            echo "--- round $i: base ---" >> run.log
+            ./bins/base --reps 1 --iters "$ITERS" --size-mb "$SIZE_MB" >> base.jsonl 2>> run.log
+            echo "--- round $i: head ---" >> run.log
+            ./bins/head --reps 1 --iters "$ITERS" --size-mb "$SIZE_MB" >> head.jsonl 2>> run.log
+          done
+          echo "== 最后两轮 =="
+          tail -8 run.log
+
+      - name: Compare
+        run: |
+          python3 - <<'PY'
+          import json, collections, os
+
+          def load(path):
+              """min wall / min cpu per corpus, across all rounds."""
+              best = collections.defaultdict(lambda: float('inf'))
+              for line in open(path):
+                  line = line.strip()
+                  if not line.startswith('{'):
+                      continue
+                  o = json.loads(line)
+                  if o.get('kind') != 'sample':
+                      continue
+                  c = o['corpus']
+                  for key, field in (('wall', 'ruzstd_ms'), ('cpu', 'ruzstd_cpu_ms'),
+                                     ('cwall', 'c_ms'), ('ccpu', 'c_cpu_ms')):
+                      best[key + ':' + c] = min(best[key + ':' + c], o[field])
+              return best
+
+          base, head = load('base.jsonl'), load('head.jsonl')
+          corpora = sorted({k.split(':', 1)[1] for k in base})
+          rows = ['| corpus | base wall | head wall | Δwall | base cpu | head cpu | Δcpu | base gap | head gap |',
+                  '|---|---|---|---|---|---|---|---|---|']
+          for c in corpora:
+              bw, hw = base['wall:' + c], head['wall:' + c]
+              bc, hc = base['cpu:' + c], head['cpu:' + c]
+              bcw, hcw = base['cwall:' + c], head['cwall:' + c]
+              rows.append(f'| {c} | {bw:.3f} ms | {hw:.3f} ms | {100*(hw-bw)/bw:+.2f}% | '
+                          f'{bc:.3f} ms | {hc:.3f} ms | {100*(hc-bc)/bc:+.2f}% | '
+                          f'{bw/bcw:.2f}x | {hw/hcw:.2f}x |')
+          rows += ['', '| corpus | base C wall | head C wall | C 墙钟漂移(噪声底) | base C cpu | head C cpu | C CPU 漂移 |',
+                   '|---|---|---|---|---|---|---|']
+          for c in corpora:
+              bcw, hcw = base['cwall:' + c], head['cwall:' + c]
+              bcc, hcc = base['ccpu:' + c], head['ccpu:' + c]
+              rows.append(f'| {c} | {bcw:.3f} ms | {hcw:.3f} ms | {100*(hcw-bcw)/bcw:+.2f}% | '
+                          f'{bcc:.3f} ms | {hcc:.3f} ms | {100*(hcc-bcc)/bcc:+.2f}% |')
+          out = '\n'.join(rows)
+          print(out)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('## perf A/B（交错跑，base vs head）\n\n')
+              f.write(f"base=`{os.environ.get('BASE_LABEL','')}` head=`{os.environ.get('HEAD_LABEL','')}` "
+                      f"rounds=`{os.environ.get('REPS','')}` iters=`{os.environ.get('ITERS','')}` "
+                      f"size=`{os.environ.get('SIZE_MB','')}`MB\n\n")
+              f.write(out + '\n')
+              f.write('\n> wall=墙钟；cpu=进程 utime+stime（对邻居负载/降频更钝）。'
+                      '判据是同 run 内 base/head 差值；"C 漂移"两列=同一窗口的噪声底。跨 run 绝对值不可比。\n')
+          PY
+        env:
+          BASE_LABEL: ${{ steps.refs.outputs.base }}
+          HEAD_LABEL: ${{ steps.refs.outputs.head }}
+          REPS: ${{ steps.refs.outputs.reps }}
+          ITERS: ${{ steps.refs.outputs.iters }}
+          SIZE_MB: ${{ steps.refs.outputs.size_mb }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-ab-logs
+          path: |
+            base.jsonl
+            head.jsonl
+            run.log

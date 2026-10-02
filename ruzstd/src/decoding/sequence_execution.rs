@@ -1,49 +1,199 @@
-use super::scratch::DecoderScratch;
-use crate::decoding::errors::ExecuteSequencesError;
+use super::scratch::FSEScratch;
+use super::sequence_section_decoder::{lookup_ll_code, lookup_ml_code, maybe_update_fse_tables};
+use crate::bit_io::BitReaderReversed;
+use crate::blocks::sequence_section::SequencesHeader;
+use crate::blocks::sequence_section::MAX_OFFSET_CODE;
+use crate::decoding::decode_buffer::DecodeBuffer;
+use crate::decoding::errors::DecodeBufferError;
+use crate::decoding::errors::FSEDecoderError;
+use crate::decoding::errors::{DecodeSequenceError, ExecuteSequencesError};
+use crate::fse::FSEDecoder;
 
-/// Take the provided decoder and execute the sequences stored within
-pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequencesError> {
-    let mut literals_copy_counter = 0;
-    let old_buffer_size = scratch.buffer.len();
-    let mut seq_sum = 0;
+/// Error type for the fused sequence decode+execute pass.
+///
+/// On corrupt input the fused pass may report an execution error for an early
+/// sequence where the two-pass version would have reported a decode error for
+/// a later sequence; both are fatal for the frame either way. For valid input
+/// the output is bit-identical to the two-pass version.
+#[derive(Debug)]
+pub enum FusedSequencesError {
+    Decode(DecodeSequenceError),
+    Execute(ExecuteSequencesError),
+}
 
-    for idx in 0..scratch.sequences.len() {
-        let seq = scratch.sequences[idx];
+impl From<DecodeSequenceError> for FusedSequencesError {
+    fn from(val: DecodeSequenceError) -> Self {
+        Self::Decode(val)
+    }
+}
+impl From<ExecuteSequencesError> for FusedSequencesError {
+    fn from(val: ExecuteSequencesError) -> Self {
+        Self::Execute(val)
+    }
+}
+impl From<FSEDecoderError> for FusedSequencesError {
+    fn from(val: FSEDecoderError) -> Self {
+        Self::Decode(DecodeSequenceError::from(val))
+    }
+}
+impl From<DecodeBufferError> for FusedSequencesError {
+    fn from(val: DecodeBufferError) -> Self {
+        Self::Execute(ExecuteSequencesError::from(val))
+    }
+}
 
-        if seq.ll > 0 {
-            let high = literals_copy_counter + seq.ll as usize;
-            if high > scratch.literals_buffer.len() {
+/// Decode the sequence section and execute each sequence inline, in a single
+/// pass over the bit stream.
+///
+/// This is bit-identical to `decode_sequences` followed by
+/// `execute_sequences` for valid input, but avoids materializing the
+/// intermediate `Vec<Sequence>` (a write+read of 12 bytes per sequence) and
+/// re-walking the literals buffer in a second loop.
+pub fn decode_and_execute_sequences(
+    section: &SequencesHeader,
+    source: &[u8],
+    fse: &mut FSEScratch,
+    buffer: &mut DecodeBuffer,
+    literals_buffer: &[u8],
+    offset_hist: &mut [u32; 3],
+) -> Result<(), FusedSequencesError> {
+    let bytes_read = maybe_update_fse_tables(section, source, fse)?;
+
+    let bit_stream = &source[bytes_read..];
+    let mut br = BitReaderReversed::new(bit_stream);
+
+    //skip the 0 padding at the end of the last byte of the bit stream and throw away the first 1 found
+    let mut skipped_bits = 0;
+    loop {
+        let val = br.get_bits(1);
+        skipped_bits += 1;
+        if val == 1 || skipped_bits > 8 {
+            break;
+        }
+    }
+    if skipped_bits > 8 {
+        //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
+        return Err(DecodeSequenceError::ExtraPadding { skipped_bits }.into());
+    }
+
+    let ll_rle = fse.ll_rle;
+    let ml_rle = fse.ml_rle;
+    let of_rle = fse.of_rle;
+    let mut ll_dec = FSEDecoder::new(&fse.literal_lengths);
+    let mut ml_dec = FSEDecoder::new(&fse.match_lengths);
+    let mut of_dec = FSEDecoder::new(&fse.offsets);
+
+    if ll_rle.is_none() {
+        ll_dec.init_state(&mut br)?;
+    }
+    if of_rle.is_none() {
+        of_dec.init_state(&mut br)?;
+    }
+    if ml_rle.is_none() {
+        ml_dec.init_state(&mut br)?;
+    }
+
+    let num_sequences = section.num_sequences as usize;
+
+    let mut literals_copy_counter = 0usize;
+    let old_buffer_size = buffer.len();
+    let mut seq_sum = 0u32;
+
+    for seq_idx in 0..num_sequences {
+        let ll_code = if let Some(ll_rle) = ll_rle {
+            ll_rle
+        } else {
+            ll_dec.decode_symbol()
+        };
+        let ml_code = if let Some(ml_rle) = ml_rle {
+            ml_rle
+        } else {
+            ml_dec.decode_symbol()
+        };
+        let of_code = if let Some(of_rle) = of_rle {
+            of_rle
+        } else {
+            of_dec.decode_symbol()
+        };
+
+        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
+        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
+
+        if of_code > MAX_OFFSET_CODE {
+            return Err(DecodeSequenceError::UnsupportedOffset {
+                offset_code: of_code,
+            }
+            .into());
+        }
+
+        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
+        let offset = obits as u32 + (1u32 << of_code);
+
+        if offset == 0 {
+            return Err(DecodeSequenceError::ZeroOffset.into());
+        }
+
+        let seq_ll = ll_value + ll_add as u32;
+        let seq_ml = ml_value + ml_add as u32;
+
+        // ── inline execution ( mirrors execute_sequences ) ──
+        if seq_ll > 0 {
+            let high = literals_copy_counter + seq_ll as usize;
+            if high > literals_buffer.len() {
                 return Err(ExecuteSequencesError::NotEnoughBytesForSequence {
                     wanted: high,
-                    have: scratch.literals_buffer.len(),
-                });
+                    have: literals_buffer.len(),
+                }
+                .into());
             }
-            let literals = &scratch.literals_buffer[literals_copy_counter..high];
-            literals_copy_counter += seq.ll as usize;
+            let literals = &literals_buffer[literals_copy_counter..high];
+            literals_copy_counter = high;
 
-            scratch.buffer.push(literals);
+            buffer.push(literals);
         }
 
-        let actual_offset = do_offset_history(seq.of, seq.ll, &mut scratch.offset_hist);
+        let actual_offset = do_offset_history(offset, seq_ll, &mut *offset_hist);
         if actual_offset == 0 {
-            return Err(ExecuteSequencesError::ZeroOffset);
+            return Err(ExecuteSequencesError::ZeroOffset.into());
         }
-        if seq.ml > 0 {
-            scratch
-                .buffer
-                .repeat(actual_offset as usize, seq.ml as usize)?;
+        if seq_ml > 0 {
+            buffer.repeat(actual_offset as usize, seq_ml as usize)?;
         }
 
-        seq_sum += seq.ml;
-        seq_sum += seq.ll;
+        seq_sum += seq_ml;
+        seq_sum += seq_ll;
+
+        if seq_idx + 1 < num_sequences {
+            if ll_rle.is_none() {
+                ll_dec.update_state(&mut br);
+            }
+            if ml_rle.is_none() {
+                ml_dec.update_state(&mut br);
+            }
+            if of_rle.is_none() {
+                of_dec.update_state(&mut br);
+            }
+        }
+
+        if br.bits_remaining() < 0 {
+            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences.into());
+        }
     }
-    if literals_copy_counter < scratch.literals_buffer.len() {
-        let rest_literals = &scratch.literals_buffer[literals_copy_counter..];
-        scratch.buffer.push(rest_literals);
+
+    if br.bits_remaining() > 0 {
+        return Err(DecodeSequenceError::ExtraBits {
+            bits_remaining: br.bits_remaining(),
+        }
+        .into());
+    }
+
+    if literals_copy_counter < literals_buffer.len() {
+        let rest_literals = &literals_buffer[literals_copy_counter..];
+        buffer.push(rest_literals);
         seq_sum += rest_literals.len() as u32;
     }
 
-    let diff = scratch.buffer.len() - old_buffer_size;
+    let diff = buffer.len() - old_buffer_size;
     assert!(
         seq_sum as usize == diff,
         "Seq_sum: {} is different from the difference in buffersize: {}",
@@ -56,7 +206,7 @@ pub fn execute_sequences(scratch: &mut DecoderScratch) -> Result<(), ExecuteSequ
 /// Update the most recently used offsets to reflect the provided offset value, and return the
 /// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
 /// before you get a functional number.
-fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
+pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     let actual_offset = if lit_len > 0 {
         match offset_value {
             1..=3 => scratch[offset_value as usize - 1],
