@@ -286,7 +286,12 @@ impl MatchGenerator {
                 //  - "太近"候选（切片 < MIN_MATCH_LEN，步进加速下常见）不消耗比较预算，
                 //    只走链（否则预算全被近邻吃掉，单测 matches 会退化成找不到匹配）；
                 //  - 走查总步数另有上限，防长链退化。
-                const CHAIN_CMP_MAX: usize = 2;
+                // 预算 1：本地确定性计数实测（4MB，单次压缩）——
+                //   text ratio 3.174（预算 2 为 3.259）/ cmp 调用 1,296,622（预算 2 为 2,406,990；
+                //   基线 1,296,066）/ 比较字节 2.5GB（预算 2 为 7.1GB，基线 41.8GB）。
+                //   src-like 4.718（2 档 4.909）/ cmp 669,292（基线 815,362）。
+                // 即：3% 的 ratio 换近一半的比较开销，且比较字节数远低于基线。
+                const CHAIN_CMP_MAX: usize = 1;
                 const CHAIN_WALK_MAX: usize = 32;
                 let mut walked = 0usize;
                 let mut cmps = 0usize;
