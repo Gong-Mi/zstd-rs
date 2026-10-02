@@ -50,25 +50,41 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
     } else {
         encode_seqnum(sequences.len(), &mut writer);
 
-        // Choose the tables
-        // TODO store previously used tables
+        // 复用判定用的"本块符号存在位图"（ll/ml/of 码值都 < 64，一趟算完）
+        let (mut ll_present, mut ml_present, mut of_present) = (0u64, 0u64, 0u64);
+        for seq in &sequences {
+            let (ll_c, ml_c, of_c) = (
+                encode_literal_length(seq.ll).0,
+                encode_match_len(seq.ml).0,
+                encode_offset(seq.of).0,
+            );
+            debug_assert!(ll_c < 64 && ml_c < 64 && of_c < 64);
+            ll_present |= 1u64 << ll_c;
+            ml_present |= 1u64 << ml_c;
+            of_present |= 1u64 << of_c;
+        }
+
+        // Choose the tables：上一张覆盖本块全部符号就复用（RepeateLast），否则重建
         let ll_mode = choose_table(
             state.fse_tables.ll_previous.as_ref(),
             &state.fse_tables.ll_default,
             sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
             9,
+            ll_present,
         );
         let ml_mode = choose_table(
             state.fse_tables.ml_previous.as_ref(),
             &state.fse_tables.ml_default,
             sequences.iter().map(|seq| encode_match_len(seq.ml).0),
             9,
+            ml_present,
         );
         let of_mode = choose_table(
             state.fse_tables.of_previous.as_ref(),
             &state.fse_tables.of_default,
             sequences.iter().map(|seq| encode_offset(seq.of).0),
             8,
+            of_present,
         );
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
@@ -101,6 +117,9 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 enum FseTableMode<'a> {
+    /// 格式里还有"预定义表"这一种模式；本实现始终走 新表/复用上一张 两条路，
+    /// 保留该变体以对应格式定义。
+    #[allow(dead_code)]
     Predefined(&'a FSETable),
     Encoded(FSETable),
     RepeateLast(&'a FSETable),
@@ -118,20 +137,20 @@ impl FseTableMode<'_> {
 
 fn choose_table<'a>(
     previous: Option<&'a FSETable>,
-    default_table: &'a FSETable,
+    _default_table: &'a FSETable,
     data: impl Iterator<Item = u8>,
     max_log: u8,
+    present: u64,
 ) -> FseTableMode<'a> {
-    // TODO check if the new table is better than the predefined and previous table
-    let use_new_table = true;
-    let use_previous_table = false;
-    if use_previous_table {
-        FseTableMode::RepeateLast(previous.unwrap())
-    } else if use_new_table {
-        FseTableMode::Encoded(build_table_from_data(data, max_log, true))
-    } else {
-        FseTableMode::Predefined(default_table)
+    // 参考实现每块做一次 "新表 vs 复用上一张" 的判定；这里同样：上一张表存在且
+    // **覆盖本块全部符号**才复用（覆盖性是正确性门，不是性能门——解码端遇到未覆盖
+    // 符号会取到空状态表）。
+    if let Some(prev) = previous {
+        if prev.covers_present(present) {
+            return FseTableMode::RepeateLast(prev);
+        }
     }
+    FseTableMode::Encoded(build_table_from_data(data, max_log, true))
 }
 
 fn encode_table(mode: &FseTableMode<'_>, writer: &mut BitWriter<&mut Vec<u8>>) {
