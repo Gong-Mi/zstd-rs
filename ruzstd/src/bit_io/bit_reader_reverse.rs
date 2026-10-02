@@ -160,6 +160,20 @@ impl<'s> BitReaderReversed<'s> {
 
         (self.get_bits(n1), self.get_bits(n2), self.get_bits(n3))
     }
+
+    /// Ensure at least 48 real bits are unread, then return the unread region
+    /// of the bit container left-aligned: the next bit to be consumed is the
+    /// most significant bit of the returned value. Caller consumes the actually
+    /// used bits via `consume`.
+    ///
+    /// Callers must only rely on the first `min(48, bits_remaining())` bits.
+    #[inline(always)]
+    pub fn unread_window(&mut self) -> u64 {
+        if self.bits_consumed + 48 > 64 {
+            self.refill();
+        }
+        self.bit_container << self.bits_consumed
+    }
 }
 
 #[cfg(test)]
