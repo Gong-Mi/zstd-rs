@@ -6,7 +6,6 @@
 //! The task here is to efficiently find matches in the already encoded data for the current suffix of the not yet encoded data.
 
 use alloc::vec::Vec;
-use core::num::NonZeroUsize;
 
 use super::CompressionLevel;
 use super::Matcher;
@@ -44,7 +43,7 @@ impl Matcher for MatchGeneratorDriver {
             data.resize(data.capacity(), 0);
             vec_pool.push(data);
             suffixes.slots.clear();
-            suffixes.slots.resize(suffixes.slots.capacity(), None);
+            suffixes.slots.resize(suffixes.slots.capacity(), 0u32);
             suffixes.links.clear();
             suffix_pool.push(suffixes);
         });
@@ -86,7 +85,7 @@ impl Matcher for MatchGeneratorDriver {
                 data.resize(data.capacity(), 0);
                 vec_pool.push(data);
                 suffixes.slots.clear();
-                suffixes.slots.resize(suffixes.slots.capacity(), None);
+                suffixes.slots.resize(suffixes.slots.capacity(), 0u32);
                 suffixes.links.clear();
                 suffix_pool.push(suffixes);
             });
@@ -107,12 +106,11 @@ impl Matcher for MatchGeneratorDriver {
 /// This stores the index of a suffix of a string by hashing the first few bytes of that suffix
 /// This means that collisions just overwrite and that you need to check validity after a get
 struct SuffixStore {
-    // We use NonZeroUsize to enable niche optimization here.
-    // On store we do +1 and on get -1
-    // This is ok since usize::MAX is never a valid offset
-    //
+    // 表项用 u32（与 C 的 hashTable 一致）：0 = 空，否则位置+1。
+    // 用 Option<NonZeroUsize> 时每项 8 字节，表一样大却占两倍内存 ——
+    // 128K 槽的表是 1MB vs 512KB，直接决定有多少次访问越过 L2。
     // 单槽保留每 key 最近位置；更早的位置由 links 链保留（见下）。
-    slots: Vec<Option<NonZeroUsize>>,
+    slots: Vec<u32>,
     /// 链：`links[pos]` = 同一 key 的上一个位置（+1 编码，0 表示链尾）。
     /// 只靠槽位覆盖会丢"足够远"的候选（候选切片止于当前位置，太近的位置一律 < MIN_MATCH_LEN），
     /// 链把更老的位置保留下来，按有界步数走查取"足够远且更长"的候选。
@@ -123,7 +121,7 @@ struct SuffixStore {
 impl SuffixStore {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            slots: alloc::vec![None; capacity],
+            slots: alloc::vec![0u32; capacity],
             links: Vec::new(),
             len_log: capacity.ilog2(),
         }
@@ -137,13 +135,15 @@ impl SuffixStore {
         // 链：同 key 已有上一个位置才写 links（random 类无重复 key 的语料
         // 因此零链簿记，插入路径与单槽基线同成本）；候选切片止于当前位置
         // ⇒ 只有"足够远"的位置才给得出合法匹配，链把更老的位置留住。
-        if let Some(prev) = self.slots[key] {
+        let prev = self.slots[key];
+        if prev != 0 {
             if idx >= self.links.len() {
                 self.links.resize(idx + 1, 0);
             }
-            self.links[idx] = prev.get() as u32;
+            // links 与 slots 同为"位置+1"编码，直接套用
+            self.links[idx] = prev;
         }
-        self.slots[key] = Some(NonZeroUsize::new(idx + 1).unwrap());
+        self.slots[key] = idx as u32 + 1;
     }
 
     /// `pos` 在链上的上一位置（None = 链尾）。供融合走查用。
@@ -160,7 +160,8 @@ impl SuffixStore {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::PROBES, 1);
         let key = self.key(suffix);
-        let hit = self.slots[key].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1);
+        let raw = self.slots[key];
+        let hit = if raw == 0 { None } else { Some(raw as usize - 1) };
         #[cfg(feature = "encstats")]
         if hit.is_some() {
             crate::encstats::bump(crate::encstats::HITS, 1);
