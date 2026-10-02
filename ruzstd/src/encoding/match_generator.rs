@@ -187,7 +187,6 @@ impl SuffixStore {
         self.get_hashed(self.key_hash(suffix))
     }
 
-    #[inline(always)]
     /// 单乘法哈希（对齐 C 的 ZSTD_hashPtr）：读 8 字节 → 一次 64 位乘法 → 取高位。
     ///
     /// 原实现是 5 次 64 位乘法 + 5 次移位 + 4 次异或（suffix[0..5] 各混一次），
