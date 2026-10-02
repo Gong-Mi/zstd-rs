@@ -293,10 +293,20 @@ impl MatchGenerator {
                 //   基线 1,296,066）/ 比较字节 2.5GB（预算 2 为 7.1GB，基线 41.8GB）。
                 //   src-like 4.718（2 档 4.909）/ cmp 669,292（基线 815,362）。
                 // 即：3% 的 ratio 换近一半的比较开销，且比较字节数远低于基线。
+                // 条件预算：内容比较硬预算仍是 1 次；若首次比较命中且匹配长度
+                // ≥ LONG_HIT_CUT，则额外允许 1 次比较（长匹配处多一个候选才换得来
+                // ratio，短匹配处纯亏）。
+                // 本地确定性计数（4MB 单次压缩，base text cmp 1,296,066 / ratio 2.480）：
+                //   budget1     text 3.174/1,296,622  src-like 4.718/669,292  bin-like 1.482/820,086
+                //   cond-long8  text 3.176/1,524,382  src-like 4.871/969,684  bin-like 1.516/784,322
+                //   budget2     text 3.259/2,406,990  src-like 4.909/1,187,948 bin-like 1.527/1,097,398
                 const CHAIN_CMP_MAX: usize = 1;
+                const LONG_HIT_CUT: usize = 8;
                 const CHAIN_WALK_MAX: usize = 32;
                 let mut walked = 0usize;
                 let mut cmps = 0usize;
+                // 首次比较命中长度：条件预算用它决定要不要花第二次比较
+                let mut last_hit_len = 0usize;
                 let mut cur = match_entry.suffixes.get(key);
                 while let Some(match_index) = cur {
                     let match_slice = if is_last {
@@ -314,7 +324,7 @@ impl MatchGenerator {
                         cur = match_entry.suffixes.link_of(match_index);
                         continue;
                     }
-                    if cmps >= CHAIN_CMP_MAX {
+                    if cmps >= CHAIN_CMP_MAX && !(cmps == 1 && last_hit_len >= LONG_HIT_CUT) {
                         break;
                     }
                     cmps += 1;
@@ -345,6 +355,7 @@ impl MatchGenerator {
                         } else {
                             candidate = Some((match_entry_idx, match_index, offset, match_len));
                         }
+                        last_hit_len = match_len;
                         cur = match_entry.suffixes.link_of(match_index);
                     } else {
                         // 候选切片足够长却内容不匹配 ⇒ 放弃整条链：同槽更老的候选
