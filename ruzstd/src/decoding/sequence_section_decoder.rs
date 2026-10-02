@@ -1,286 +1,121 @@
 use super::super::blocks::sequence_section::ModeType;
-use super::super::blocks::sequence_section::Sequence;
 use super::super::blocks::sequence_section::SequencesHeader;
 use super::scratch::FSEScratch;
-use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
 use crate::decoding::errors::DecodeSequenceError;
-use crate::fse::FSEDecoder;
 use alloc::vec::Vec;
-
-/// Decode the provided source as a series of sequences into the supplied `target`.
-pub fn decode_sequences(
-    section: &SequencesHeader,
-    source: &[u8],
-    scratch: &mut FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
-    let bytes_read = maybe_update_fse_tables(section, source, scratch)?;
-
-    vprintln!("Updating tables used {} bytes", bytes_read);
-
-    let bit_stream = &source[bytes_read..];
-
-    let mut br = BitReaderReversed::new(bit_stream);
-
-    //skip the 0 padding at the end of the last byte of the bit stream and throw away the first 1 found
-    let mut skipped_bits = 0;
-    loop {
-        let val = br.get_bits(1);
-        skipped_bits += 1;
-        if val == 1 || skipped_bits > 8 {
-            break;
-        }
-    }
-    if skipped_bits > 8 {
-        //if more than 7 bits are 0, this is not the correct end of the bitstream. Either a bug or corrupted data
-        return Err(DecodeSequenceError::ExtraPadding { skipped_bits });
-    }
-
-    if scratch.ll_rle.is_some() || scratch.ml_rle.is_some() || scratch.of_rle.is_some() {
-        decode_sequences_with_rle(section, &mut br, scratch, target)
-    } else {
-        decode_sequences_without_rle(section, &mut br, scratch, target)
-    }
-}
-
-fn decode_sequences_with_rle(
-    section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
-    scratch: &FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
-
-    if scratch.ll_rle.is_none() {
-        ll_dec.init_state(br)?;
-    }
-    if scratch.of_rle.is_none() {
-        of_dec.init_state(br)?;
-    }
-    if scratch.ml_rle.is_none() {
-        ml_dec.init_state(br)?;
-    }
-
-    target.clear();
-    target.reserve(section.num_sequences as usize);
-
-    for _seq_idx in 0..section.num_sequences {
-        //get the codes from either the RLE byte or from the decoder
-        let ll_code = if let Some(ll_rle) = scratch.ll_rle {
-            ll_rle
-        } else {
-            ll_dec.decode_symbol()
-        };
-        let ml_code = if let Some(ml_rle) = scratch.ml_rle {
-            ml_rle
-        } else {
-            ml_dec.decode_symbol()
-        };
-        let of_code = if let Some(of_rle) = scratch.of_rle {
-            of_rle
-        } else {
-            of_dec.decode_symbol()
-        };
-
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
-
-        //println!("Sequence: {}", i);
-        //println!("of stat: {}", of_dec.state);
-        //println!("of Code: {}", of_code);
-        //println!("ll stat: {}", ll_dec.state);
-        //println!("ll bits: {}", ll_num_bits);
-        //println!("ll Code: {}", ll_value);
-        //println!("ml stat: {}", ml_dec.state);
-        //println!("ml bits: {}", ml_num_bits);
-        //println!("ml Code: {}", ml_value);
-        //println!("");
-
-        if of_code > MAX_OFFSET_CODE {
-            return Err(DecodeSequenceError::UnsupportedOffset {
-                offset_code: of_code,
-            });
-        }
-
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
-
-        if offset == 0 {
-            return Err(DecodeSequenceError::ZeroOffset);
-        }
-
-        target.push(Sequence {
-            ll: ll_value + ll_add as u32,
-            ml: ml_value + ml_add as u32,
-            of: offset,
-        });
-
-        if target.len() < section.num_sequences as usize {
-            //println!(
-            //    "Bits left: {} ({} bytes)",
-            //    br.bits_remaining(),
-            //    br.bits_remaining() / 8,
-            //);
-            if scratch.ll_rle.is_none() {
-                ll_dec.update_state(br);
-            }
-            if scratch.ml_rle.is_none() {
-                ml_dec.update_state(br);
-            }
-            if scratch.of_rle.is_none() {
-                of_dec.update_state(br);
-            }
-        }
-
-        if br.bits_remaining() < 0 {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
-        }
-    }
-
-    if br.bits_remaining() > 0 {
-        Err(DecodeSequenceError::ExtraBits {
-            bits_remaining: br.bits_remaining(),
-        })
-    } else {
-        Ok(())
-    }
-}
-
-fn decode_sequences_without_rle(
-    section: &SequencesHeader,
-    br: &mut BitReaderReversed<'_>,
-    scratch: &FSEScratch,
-    target: &mut Vec<Sequence>,
-) -> Result<(), DecodeSequenceError> {
-    let mut ll_dec = FSEDecoder::new(&scratch.literal_lengths);
-    let mut ml_dec = FSEDecoder::new(&scratch.match_lengths);
-    let mut of_dec = FSEDecoder::new(&scratch.offsets);
-
-    ll_dec.init_state(br)?;
-    of_dec.init_state(br)?;
-    ml_dec.init_state(br)?;
-
-    target.clear();
-    target.reserve(section.num_sequences as usize);
-
-    for _seq_idx in 0..section.num_sequences {
-        let ll_code = ll_dec.decode_symbol();
-        let ml_code = ml_dec.decode_symbol();
-        let of_code = of_dec.decode_symbol();
-
-        let (ll_value, ll_num_bits) = lookup_ll_code(ll_code);
-        let (ml_value, ml_num_bits) = lookup_ml_code(ml_code);
-
-        if of_code > MAX_OFFSET_CODE {
-            return Err(DecodeSequenceError::UnsupportedOffset {
-                offset_code: of_code,
-            });
-        }
-
-        let (obits, ml_add, ll_add) = br.get_bits_triple(of_code, ml_num_bits, ll_num_bits);
-        let offset = obits as u32 + (1u32 << of_code);
-
-        if offset == 0 {
-            return Err(DecodeSequenceError::ZeroOffset);
-        }
-
-        target.push(Sequence {
-            ll: ll_value + ll_add as u32,
-            ml: ml_value + ml_add as u32,
-            of: offset,
-        });
-
-        if target.len() < section.num_sequences as usize {
-            //println!(
-            //    "Bits left: {} ({} bytes)",
-            //    br.bits_remaining(),
-            //    br.bits_remaining() / 8,
-            //);
-            ll_dec.update_state(br);
-            ml_dec.update_state(br);
-            of_dec.update_state(br);
-        }
-
-        if br.bits_remaining() < 0 {
-            return Err(DecodeSequenceError::NotEnoughBytesForNumSequences);
-        }
-    }
-
-    if br.bits_remaining() > 0 {
-        Err(DecodeSequenceError::ExtraBits {
-            bits_remaining: br.bits_remaining(),
-        })
-    } else {
-        Ok(())
-    }
-}
 
 /// Look up the provided state value from a literal length table predefined
 /// by the Zstandard reference document. Returns a tuple of (value, number of bits).
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
-fn lookup_ll_code(code: u8) -> (u32, u8) {
-    match code {
-        0..=15 => (u32::from(code), 0),
-        16 => (16, 1),
-        17 => (18, 1),
-        18 => (20, 1),
-        19 => (22, 1),
-        20 => (24, 2),
-        21 => (28, 2),
-        22 => (32, 3),
-        23 => (40, 3),
-        24 => (48, 4),
-        25 => (64, 6),
-        26 => (128, 7),
-        27 => (256, 8),
-        28 => (512, 9),
-        29 => (1024, 10),
-        30 => (2048, 11),
-        31 => (4096, 12),
-        32 => (8192, 13),
-        33 => (16384, 14),
-        34 => (32768, 15),
-        35 => (65536, 16),
-        _ => unreachable!("Illegal literal length code was: {}", code),
-    }
+const LL_LOOKUP: [(u32, u8); 36] = [
+    (0, 0),
+    (1, 0),
+    (2, 0),
+    (3, 0),
+    (4, 0),
+    (5, 0),
+    (6, 0),
+    (7, 0),
+    (8, 0),
+    (9, 0),
+    (10, 0),
+    (11, 0),
+    (12, 0),
+    (13, 0),
+    (14, 0),
+    (15, 0),
+    (16, 1),
+    (18, 1),
+    (20, 1),
+    (22, 1),
+    (24, 2),
+    (28, 2),
+    (32, 3),
+    (40, 3),
+    (48, 4),
+    (64, 6),
+    (128, 7),
+    (256, 8),
+    (512, 9),
+    (1024, 10),
+    (2048, 11),
+    (4096, 12),
+    (8192, 13),
+    (16384, 14),
+    (32768, 15),
+    (65536, 16),
+];
+#[inline(always)]
+pub fn lookup_ll_code(code: u8) -> (u32, u8) {
+    LL_LOOKUP[code as usize]
 }
 
 /// Look up the provided state value from a match length table predefined
 /// by the Zstandard reference document. Returns a tuple of (value, number of bits).
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#appendix-a---decoding-tables-for-predefined-codes>
-fn lookup_ml_code(code: u8) -> (u32, u8) {
-    match code {
-        0..=31 => (u32::from(code) + 3, 0),
-        32 => (35, 1),
-        33 => (37, 1),
-        34 => (39, 1),
-        35 => (41, 1),
-        36 => (43, 2),
-        37 => (47, 2),
-        38 => (51, 3),
-        39 => (59, 3),
-        40 => (67, 4),
-        41 => (83, 4),
-        42 => (99, 5),
-        43 => (131, 7),
-        44 => (259, 8),
-        45 => (515, 9),
-        46 => (1027, 10),
-        47 => (2051, 11),
-        48 => (4099, 12),
-        49 => (8195, 13),
-        50 => (16387, 14),
-        51 => (32771, 15),
-        52 => (65539, 16),
-        _ => unreachable!("Illegal match length code was: {}", code),
-    }
+const ML_LOOKUP: [(u32, u8); 53] = [
+    (3, 0),
+    (4, 0),
+    (5, 0),
+    (6, 0),
+    (7, 0),
+    (8, 0),
+    (9, 0),
+    (10, 0),
+    (11, 0),
+    (12, 0),
+    (13, 0),
+    (14, 0),
+    (15, 0),
+    (16, 0),
+    (17, 0),
+    (18, 0),
+    (19, 0),
+    (20, 0),
+    (21, 0),
+    (22, 0),
+    (23, 0),
+    (24, 0),
+    (25, 0),
+    (26, 0),
+    (27, 0),
+    (28, 0),
+    (29, 0),
+    (30, 0),
+    (31, 0),
+    (32, 0),
+    (33, 0),
+    (34, 0),
+    (35, 1),
+    (37, 1),
+    (39, 1),
+    (41, 1),
+    (43, 2),
+    (47, 2),
+    (51, 3),
+    (59, 3),
+    (67, 4),
+    (83, 4),
+    (99, 5),
+    (131, 7),
+    (259, 8),
+    (515, 9),
+    (1027, 10),
+    (2051, 11),
+    (4099, 12),
+    (8195, 13),
+    (16387, 14),
+    (32771, 15),
+    (65539, 16),
+];
+#[inline(always)]
+pub fn lookup_ml_code(code: u8) -> (u32, u8) {
+    ML_LOOKUP[code as usize]
 }
 
 // This info is buried in the symbol compression mode table
@@ -291,7 +126,7 @@ pub const ML_MAX_LOG: u8 = 9;
 /// "The maximum accuracy log for the offset table is 8."
 pub const OF_MAX_LOG: u8 = 8;
 
-fn maybe_update_fse_tables(
+pub fn maybe_update_fse_tables(
     section: &SequencesHeader,
     source: &[u8],
     scratch: &mut FSEScratch,

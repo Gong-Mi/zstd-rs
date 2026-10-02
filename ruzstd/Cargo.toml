@@ -34,6 +34,7 @@ dict_builder = ["std", "dep:fastrand"]
 hash = ["dep:twox-hash"]
 fuzz_exports = []
 std = []
+encstats = []
 
 # Internal feature, only used when building as part of libstd, not part of the
 # stable interface of this crate.
@@ -42,3 +43,7 @@ rustc-dep-of-std = ["dep:core", "dep:alloc"]
 [[bench]]
 name = "decode_all"
 harness = false
+
+[[example]]
+name = "enccounts"
+required-features = ["encstats"]
