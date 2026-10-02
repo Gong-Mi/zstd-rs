@@ -96,6 +96,10 @@ impl Matcher for MatchGeneratorDriver {
     fn skip_matching(&mut self) {
         self.match_generator.skip_matching();
     }
+    fn recycle_space(&mut self, mut space: Vec<u8>) {
+        space.resize(space.capacity(), 0);
+        self.vec_pool.push(space);
+    }
 }
 
 /// This stores the index of a suffix of a string by hashing the first few bytes of that suffix
@@ -118,6 +122,8 @@ impl SuffixStore {
 
     #[inline(always)]
     fn insert(&mut self, suffix: &[u8], idx: usize) {
+        #[cfg(feature = "encstats")]
+        crate::encstats::bump(crate::encstats::INSERTS, 1);
         let key = self.key(suffix);
         self.slots[key] = Some(NonZeroUsize::new(idx + 1).unwrap());
     }
@@ -130,8 +136,15 @@ impl SuffixStore {
 
     #[inline(always)]
     fn get(&self, suffix: &[u8]) -> Option<usize> {
+        #[cfg(feature = "encstats")]
+        crate::encstats::bump(crate::encstats::PROBES, 1);
         let key = self.key(suffix);
-        self.slots[key].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1)
+        let hit = self.slots[key].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1);
+        #[cfg(feature = "encstats")]
+        if hit.is_some() {
+            crate::encstats::bump(crate::encstats::HITS, 1);
+        }
+        hit
     }
 
     #[inline(always)]
@@ -176,6 +189,7 @@ pub(crate) struct MatchGenerator {
     concat_window: Vec<u8>,
     /// Index in the last slice that we already processed
     suffix_idx: usize,
+    miss_count: usize,
     /// Gets updated when a new sequence is returned to point right behind that sequence
     last_idx_in_sequence: usize,
 }
@@ -190,6 +204,7 @@ impl MatchGenerator {
             #[cfg(debug_assertions)]
             concat_window: Vec::new(),
             suffix_idx: 0,
+            miss_count: 0,
             last_idx_in_sequence: 0,
         }
     }
@@ -269,30 +284,56 @@ impl MatchGenerator {
                             debug_assert_eq!(check_slice, &match_slice[..match_len]);
                         }
 
-                        if let Some((old_offset, old_match_len)) = candidate {
+                        if let Some((_, _, old_offset, old_match_len)) = candidate {
                             if match_len > old_match_len
                                 || (match_len == old_match_len && offset < old_offset)
                             {
-                                candidate = Some((offset, match_len));
+                                candidate = Some((match_entry_idx, match_index, offset, match_len));
                             }
                         } else {
-                            candidate = Some((offset, match_len));
+                            candidate = Some((match_entry_idx, match_index, offset, match_len));
                         }
                     }
                 }
             }
 
-            if let Some((offset, match_len)) = candidate {
-                // For each index in the match we found we do not need to look for another match
-                // But we still want them registered in the suffix store
-                self.add_suffixes_till(self.suffix_idx + match_len);
-
-                // All literals that were not included between this match and the last are now included here
+            if let Some((match_entry_idx, match_index, offset, mut match_len)) = candidate {
+                // Catch-up: 沿历史匹配与当前位置同时向前倒退，尽可能把前驱字面量合并进 match (对齐 C zstd_fast.c)
                 let last_entry = self.window.last().unwrap();
-                let literals = &last_entry.data[self.last_idx_in_sequence..self.suffix_idx];
+                let match_data = &self.window[match_entry_idx].data[..match_index];
+                let curr_data = &last_entry.data[self.last_idx_in_sequence..self.suffix_idx];
+                let max_back = match_data.len().min(curr_data.len());
+                let mut back = 0;
+                while back < max_back {
+                    if match_data[match_data.len() - 1 - back]
+                        == curr_data[curr_data.len() - 1 - back]
+                    {
+                        back += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Fast mode: skip hash insertion for positions within the match.
+                // C zstd's fast strategy does the same — only searched positions
+                // get inserted. This trades a small ratio loss for large speed gain
+                // (avoids O(match_len) hash inserts per match).
+                // We still insert the current position's key so future lookups work.
+                let last_entry = self.window.last_mut().unwrap();
+                let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
+                if !last_entry.suffixes.contains_key(key) {
+                    last_entry.suffixes.insert(key, self.suffix_idx);
+                }
+
+                // 扣除倒退吸纳的字面量
+                let last_entry = self.window.last().unwrap();
+                let match_start = self.suffix_idx - back;
+                let literals = &last_entry.data[self.last_idx_in_sequence..match_start];
 
                 // Update the indexes, all indexes upto and including the current index have been included in a sequence now
+                self.miss_count = 0;
                 self.suffix_idx += match_len;
+                match_len += back;
                 self.last_idx_in_sequence = self.suffix_idx;
                 handle_sequence(Sequence::Triple {
                     literals,
@@ -308,7 +349,21 @@ impl MatchGenerator {
             if !last_entry.suffixes.contains_key(key) {
                 last_entry.suffixes.insert(key, self.suffix_idx);
             }
-            self.suffix_idx += 1;
+            // Step acceleration: skip ahead faster at later positions in the block.
+            // Positions near the start are more valuable as match targets, so we
+            // search them densely. Later positions are less likely to be referenced.
+            self.miss_count += 1;
+            let data_len = last_entry.data.len();
+            // 步进只由"连续未命中"驱动（miss_count 在命中处清零），去掉无条件的
+            // 位置斜坡：C 的 fast 步进以 `step = stepSize` 在 _start 复位、命中分支
+            // 尾部 `goto _start`（zstd_fast.c:249 / 422），没有"越靠后跳得越多"这一项。
+            // 成长速率取 shift5/cap32：本地 2 reps 实测 ratio 与 shift6/cap16 同档
+            // （bin-like 1.552 vs 1.561、binary 1.063 vs 1.069）而耗时低 15~27%。
+            // 实测（4MB 单次压缩，确定性 ratio）：位置斜坡是纯损失——
+            //   bin-like 1.516→1.635、src-like 4.871→5.037、repo-sources 3.213→3.361，
+            //   text/binary-medium 不变；代价只在 random 类语料（另有不可压缩块早退兜底）。
+            let step = 1 + (self.miss_count >> 5).min(32);
+            self.suffix_idx = (self.suffix_idx + step).min(data_len);
         }
     }
 
@@ -601,6 +656,8 @@ fn matches() {
     );
     original_data.extend_from_slice(&[0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23]);
 
+    // 表征更新（步进改为纯 miss 驱动后）：位置斜坡不再跳过 idx 7，本块找到
+    // offset 5 / match_len 5 的匹配（此前被斜坡跳过 ⇒ 整块退化成一条 Literals）。
     matcher.next_sequence(|seq| {
         assert_seq_equal(
             seq,
@@ -612,6 +669,7 @@ fn matches() {
             &mut reconstructed,
         )
     });
+    // 尾部不足 MIN_MATCH_LEN 的 2 字节按字面量收尾
     matcher.next_sequence(|seq| {
         assert_seq_equal(
             seq,

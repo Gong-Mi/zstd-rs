@@ -36,8 +36,8 @@ impl<'t> HuffmanDecoder<'t> {
         num_bits
     }
 
-    /// Advance the internal cursor to the next symbol. After this, you can call `decode_symbol`
-    /// to read from the new position.
+    /// Advance the internal cursor to the next symbol. After this, you can call
+    /// `decode_symbol` to read from the new position.
     pub fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
         // telling you how many bits identify the current symbol.
@@ -50,6 +50,48 @@ impl<'t> HuffmanDecoder<'t> {
         // The new bits are appended at the end of the current state.
         self.state |= new_bits;
         num_bits
+    }
+
+    /// Decode four symbols in one pass, from a single refill of the bit window,
+    /// writing them to `dst` and returning the number of bits consumed.
+    ///
+    /// This is bit-exact with four rounds of `decode_symbol`/`next_state` as
+    /// long as the caller has established that at least 48 real bits are still
+    /// unread (`br.bits_remaining() >= 48`): four symbols consume at most
+    /// `4 * max_num_bits <= 44` bits, and with that many real bits left the
+    /// refill inside `unread_window` never has to zero-fill past the end of the
+    /// stream, so the bits read are the same ones the serial path would read.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must be valid for four byte writes.
+    #[inline(always)]
+    pub unsafe fn decode_batch4(&mut self, br: &mut BitReaderReversed<'_>, dst: *mut u8) -> u8 {
+        let table = &self.table.decode;
+        let mask = table.len() as u64 - 1;
+        let mut window = br.unread_window();
+        let mut state = self.state;
+        let mut total = 0u8;
+
+        for i in 0..4 {
+            // SAFETY: `state` is masked to `table.len() - 1` after every update
+            // and `init_state` reads exactly `max_num_bits` bits, which is the
+            // index space of the table.
+            let entry = unsafe { *table.get_unchecked(state as usize) };
+            // SAFETY: caller guarantees room for four writes.
+            unsafe { dst.add(i).write(entry.symbol) };
+            let nb = entry.num_bits;
+            // `window >> (63 - nb) >> 1` is `window >> (64 - nb)` without the
+            // shift overflow at `nb == 0`; with `nb == 0` both terms are zero and
+            // the state is unchanged, matching the serial path.
+            state = ((state << nb) | (window >> (63 - nb as u32) >> 1)) & mask;
+            window <<= nb;
+            total += nb;
+        }
+
+        self.state = state;
+        br.consume(total);
+        total
     }
 }
 
