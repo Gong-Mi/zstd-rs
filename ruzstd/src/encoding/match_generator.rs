@@ -180,6 +180,8 @@ impl SuffixStore {
         hit
     }
 
+    /// 仅供单测与 API 对称性使用；库内热路径走 `get_hashed`（key 已算好）
+    #[allow(dead_code)]
     #[inline(always)]
     fn get(&self, suffix: &[u8]) -> Option<usize> {
         self.get_hashed(self.key_hash(suffix))
