@@ -325,12 +325,21 @@ jobs:
         continue-on-error: true
         working-directory: head
         run: |
-          cargo run -p ruzstd --release --quiet --features prof --example perf_ab -- \
-            --profile --reps 0 --iters 1 --size-mb ${{ steps.refs.outputs.size_mb }} \
-            > "$GITHUB_WORKSPACE/profile.jsonl" 2> "$GITHUB_WORKSPACE/profile.log" || true
+          # prof feature 目前只在 ci-prof-harness 分支存在；head 检出若不包含
+          # 该 feature，跳过打点而不是让 cargo 报错产出 0 行归因（continue-on-error
+          # 会把这个失败吞成空白表，此前造成"归因腿静默全哑"）。
+          if ! grep -qE '^prof\s*=' ruzstd/Cargo.toml; then
+            echo "head 检出无 prof feature（${{ steps.refs.outputs.head }}），跳过相位归因"
+            : > "$GITHUB_WORKSPACE/profile.jsonl"
+            : > "$GITHUB_WORKSPACE/profile.log"
+          else
+            cargo run -p ruzstd --release --quiet --features prof --example perf_ab -- \
+              --profile --reps 0 --iters 1 --size-mb ${{ steps.refs.outputs.size_mb }} \
+              > "$GITHUB_WORKSPACE/profile.jsonl" 2> "$GITHUB_WORKSPACE/profile.log" || true
+          fi
           echo "== profile.log 尾部（诊断用）=="
           tail -5 "$GITHUB_WORKSPACE/profile.log" || true
-          echo "== profile.jsonl 行数: $(wc -l < "$GITHUB_WORKSPACE/profile.jsonl" 2>/dev/null || echo 0) ==" 
+          echo "== profile.jsonl 行数: $(wc -l < "$GITHUB_WORKSPACE/profile.jsonl" 2>/dev/null || echo 0) =="
           python3 - <<'PY'
           import json, os
           rows = ['| corpus | literals % | seq loop % | raw/rle/huf MB | huf 段 4/1-stream | seqs | in-loop FSE / litcopy / matchcopy % |',
