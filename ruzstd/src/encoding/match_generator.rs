@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
+use core::convert::TryInto;
 
 const MIN_MATCH_LEN: usize = 5;
 
@@ -127,11 +128,11 @@ impl SuffixStore {
         }
     }
 
+    /// 与 `insert` 等价，但 key 由调用方算好（同一位置探针+插入只算一次哈希）
     #[inline(always)]
-    fn insert(&mut self, suffix: &[u8], idx: usize) {
+    fn insert_hashed(&mut self, key: usize, idx: usize) {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::INSERTS, 1);
-        let key = self.key(suffix);
         // 链：同 key 已有上一个位置才写 links（random 类无重复 key 的语料
         // 因此零链簿记，插入路径与单槽基线同成本）；候选切片止于当前位置
         // ⇒ 只有"足够远"的位置才给得出合法匹配，链把更老的位置留住。
@@ -156,10 +157,16 @@ impl SuffixStore {
     }
 
     #[inline(always)]
-    fn get(&self, suffix: &[u8]) -> Option<usize> {
+    fn insert(&mut self, suffix: &[u8], idx: usize) {
+        let key = self.key_hash(suffix);
+        self.insert_hashed(key, idx);
+    }
+
+    /// 与 `get` 等价，但 key 由调用方算好
+    #[inline(always)]
+    fn get_hashed(&self, key: usize) -> Option<usize> {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::PROBES, 1);
-        let key = self.key(suffix);
         let raw = self.slots[key];
         let hit = if raw == 0 {
             None
@@ -173,8 +180,15 @@ impl SuffixStore {
         hit
     }
 
+    /// 仅供单测与 API 对称性使用；库内热路径走 `get_hashed`（key 已算好）
+    #[allow(dead_code)]
     #[inline(always)]
-    fn key(&self, suffix: &[u8]) -> usize {
+    fn get(&self, suffix: &[u8]) -> Option<usize> {
+        self.get_hashed(self.key_hash(suffix))
+    }
+
+    #[inline(always)]
+    fn key_hash(&self, suffix: &[u8]) -> usize {
         let s0 = suffix[0] as u64;
         let s1 = suffix[1] as u64;
         let s2 = suffix[2] as u64;
@@ -280,7 +294,13 @@ impl MatchGenerator {
             }
 
             // This is the key we are looking to find a match for
-            let key = &data_slice[..MIN_MATCH_LEN];
+            // 每个位置只算一次哈希，探针与插入共用（原先 get/insert 各算一次，各 5 次乘法）
+            let key_hash = self
+                .window
+                .last()
+                .unwrap()
+                .suffixes
+                .key_hash(&data_slice[..MIN_MATCH_LEN]);
 
             // Look in each window entry
             let mut candidate = None;
@@ -310,7 +330,7 @@ impl MatchGenerator {
                 let mut cmps = 0usize;
                 // 首次比较命中长度：条件预算用它决定要不要花第二次比较
                 let mut last_hit_len = 0usize;
-                let mut cur = match_entry.suffixes.get(key);
+                let mut cur = match_entry.suffixes.get_hashed(key_hash);
                 while let Some(match_index) = cur {
                     let match_slice = if is_last {
                         &match_entry.data[match_index..self.suffix_idx]
@@ -392,8 +412,7 @@ impl MatchGenerator {
                 // (avoids O(match_len) hash inserts per match).
                 // We still insert the current position's key so future lookups work.
                 let last_entry = self.window.last_mut().unwrap();
-                let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-                last_entry.suffixes.insert(key, self.suffix_idx);
+                last_entry.suffixes.insert_hashed(key_hash, self.suffix_idx);
 
                 // 扣除倒退吸纳的字面量
                 let last_entry = self.window.last().unwrap();
@@ -415,8 +434,7 @@ impl MatchGenerator {
             }
 
             let last_entry = self.window.last_mut().unwrap();
-            let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-            last_entry.suffixes.insert(key, self.suffix_idx);
+            last_entry.suffixes.insert_hashed(key_hash, self.suffix_idx);
             // Step acceleration: skip ahead faster at later positions in the block.
             // Positions near the start are more valuable as match targets, so we
             // search them densely. Later positions are less likely to be referenced.
@@ -443,14 +461,49 @@ impl MatchGenerator {
 
     /// Find the common prefix length between two byte slices with a configurable chunk length
     /// This enables vectorization optimizations
+    ///
+    /// 实现说明：原实现用 `chunks_exact(N)` + 迭代器 `take_while` 逐块比较，编译器
+    /// 生成的是逐字节循环；这里改成**字对字**比较（读 N 字节 → XOR → trailing_zeros），
+    /// 与 C 的 `ZSTD_count`（MEM_readST + XOR + ctz）同路数。语义与截断口径完全不变
+    /// （返回 min(xs.len(), ys.len()) 内的公共前缀长度），故 ratio 必须逐字节相同。
     fn mismatch_chunks<const N: usize>(xs: &[u8], ys: &[u8]) -> usize {
-        let off = core::iter::zip(xs.chunks_exact(N), ys.chunks_exact(N))
-            .take_while(|(x, y)| x == y)
-            .count()
-            * N;
-        off + core::iter::zip(&xs[off..], &ys[off..])
-            .take_while(|(x, y)| x == y)
-            .count()
+        debug_assert!(N == 8 || N == 4 || N == 2 || N == 1);
+        let n = xs.len().min(ys.len());
+        let mut i = 0;
+        // 整块：一次读 N 字节做 XOR，非零即用 trailing_zeros 定位首个不同字节
+        if N == 8 {
+            while i + 8 <= n {
+                let a = u64::from_le_bytes(xs[i..i + 8].try_into().unwrap());
+                let b = u64::from_le_bytes(ys[i..i + 8].try_into().unwrap());
+                let x = a ^ b;
+                if x != 0 {
+                    return i + (x.trailing_zeros() as usize >> 3);
+                }
+                i += 8;
+            }
+        } else if N == 4 {
+            while i + 4 <= n {
+                let a = u32::from_le_bytes(xs[i..i + 4].try_into().unwrap());
+                let b = u32::from_le_bytes(ys[i..i + 4].try_into().unwrap());
+                let x = a ^ b;
+                if x != 0 {
+                    return i + (x.trailing_zeros() as usize >> 3);
+                }
+                i += 4;
+            }
+        } else {
+            while i + N <= n {
+                if xs[i..i + N] != ys[i..i + N] {
+                    break;
+                }
+                i += N;
+            }
+        }
+        // 尾部不足一块
+        while i < n && xs[i] == ys[i] {
+            i += 1;
+        }
+        i
     }
 
     /// Process bytes and add the suffixes to the suffix store up to a specific index
