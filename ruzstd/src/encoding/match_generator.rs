@@ -417,12 +417,15 @@ impl MatchGenerator {
             // search them densely. Later positions are less likely to be referenced.
             self.miss_count += 1;
             let data_len = last_entry.data.len();
-            let pos_step = (self.suffix_idx * 4 / data_len.max(1)).min(3);
-            let step = if self.miss_count >= 256 {
-                1 + (pos_step + (self.miss_count >> 8)).min(16)
-            } else {
-                1 + pos_step
-            };
+            // 步进只由"连续未命中"驱动（miss_count 在命中处清零），去掉无条件的
+            // 位置斜坡：C 的 fast 步进以 `step = stepSize` 在 _start 复位、命中分支
+            // 尾部 `goto _start`（zstd_fast.c:249 / 422），没有"越靠后跳得越多"这一项。
+            // 成长速率取 shift5/cap32：本地 2 reps 实测 ratio 与 shift6/cap16 同档
+            // （bin-like 1.552 vs 1.561、binary 1.063 vs 1.069）而耗时低 15~27%。
+            // 实测（4MB 单次压缩，确定性 ratio）：位置斜坡是纯损失——
+            //   bin-like 1.516→1.635、src-like 4.871→5.037、repo-sources 3.213→3.361，
+            //   text/binary-medium 不变；代价只在 random 类语料（另有不可压缩块早退兜底）。
+            let step = 1 + (self.miss_count >> 5).min(32);
             self.suffix_idx = (self.suffix_idx + step).min(data_len);
         }
     }
@@ -720,15 +723,25 @@ fn matches() {
     );
     original_data.extend_from_slice(&[0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23]);
 
-    // Characterization (base 511c945): the position-based step acceleration
-    // skips idx 7 of this block, so no match is found and the whole block
-    // comes out as one Literals sequence. Matches CI evidence (62 passed /
-    // 1 failed with exactly this left-right pair before this fix).
+    // 表征更新（步进改为纯 miss 驱动后）：位置斜坡不再跳过 idx 7，本块找到
+    // offset 5 / match_len 5 的匹配（此前被斜坡跳过 ⇒ 整块退化成一条 Literals）。
+    matcher.next_sequence(|seq| {
+        assert_seq_equal(
+            seq,
+            Sequence::Triple {
+                literals: &[0, 0, 11, 13, 15, 17, 20],
+                offset: 5,
+                match_len: 5,
+            },
+            &mut reconstructed,
+        )
+    });
+    // 尾部不足 MIN_MATCH_LEN 的 2 字节按字面量收尾
     matcher.next_sequence(|seq| {
         assert_seq_equal(
             seq,
             Sequence::Literals {
-                literals: &[0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23],
+                literals: &[21, 23],
             },
             &mut reconstructed,
         )
