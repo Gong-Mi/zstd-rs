@@ -176,7 +176,12 @@ mod entropy_tests {
 
     fn fse_tables_bytes(state: &CompressState<MatchGeneratorDriver>) -> [Vec<u8>; 3] {
         let tables = &state.fse_tables;
-        [&tables.ll_previous, &tables.ml_previous, &tables.of_previous].map(|table| {
+        [
+            &tables.ll_previous,
+            &tables.ml_previous,
+            &tables.of_previous,
+        ]
+        .map(|table| {
             let mut writer = crate::bit_io::BitWriter::new();
             table.as_ref().unwrap().write_table(&mut writer);
             writer.flush();
@@ -211,7 +216,12 @@ mod entropy_tests {
         }
         .serialize(&mut output);
         let text = b"the quick brown fox jumps over the lazy dog 0123456789 ".repeat(900);
-        let inputs = [text.clone(), b"abcdefabcdef".to_vec(), alloc::vec![7; 40], text];
+        let inputs = [
+            text.clone(),
+            b"abcdefabcdef".to_vec(),
+            alloc::vec![7; 40],
+            text,
+        ];
         let mut original = Vec::new();
         let mut previous = None;
         for (index, input) in IntoIterator::into_iter(inputs).enumerate() {
