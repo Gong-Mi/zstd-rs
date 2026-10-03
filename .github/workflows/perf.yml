@@ -176,11 +176,12 @@ jobs:
           ENCODE: ${{ steps.refs.outputs.encode }}
         run: |
           set -euo pipefail
-          EXTRA=()
+          CORPUS_EXTRA=()
           for file in "$GITHUB_WORKSPACE"/corpus-cache/*.bin "$GITHUB_WORKSPACE"/policy-corpus/*.bin; do
             [ -f "$file" ] || continue
-            EXTRA+=(--corpus-file "$file")
+            CORPUS_EXTRA+=(--corpus-file "$file")
           done
+          EXTRA=("${CORPUS_EXTRA[@]}")
           if [ -x bins/head_tuned ]; then
             EXTRA+=(--tuned-bin "$GITHUB_WORKSPACE/bins/head_tuned")
           elif [ "$(< build-records/config.status)" = FAILED ]; then
@@ -192,6 +193,12 @@ jobs:
             --harness-dir "$GITHUB_WORKSPACE/tooling/tools/perf/harness" --repo-dir "$GITHUB_WORKSPACE/head" \
             --output-dir "$GITHUB_WORKSPACE/perf-results" --rounds "$REPS" --iters "$ITERS" \
             --size-mb "$SIZE" --encode-mb "$ENCODE" "${EXTRA[@]}"
+          python3 tooling/tools/perf/run_ab.py \
+            --base-bin "$GITHUB_WORKSPACE/bins/base" --head-bin "$GITHUB_WORKSPACE/bins/head" \
+            --base-source "$(git -C base rev-parse HEAD)" --head-source "$(git -C head rev-parse HEAD)" \
+            --harness-dir "$GITHUB_WORKSPACE/tooling/tools/perf/harness" --repo-dir "$GITHUB_WORKSPACE/head" \
+            --output-dir "$GITHUB_WORKSPACE/decode-only-results" --rounds "$REPS" --iters "$ITERS" \
+            --size-mb "$SIZE" --encode-mb "$ENCODE" --decode-only "${CORPUS_EXTRA[@]}"
       - name: Compare required data and explicitly requested performance gate
         if: always()
         env:
@@ -216,6 +223,10 @@ jobs:
               out.write('\nReal corpus acquisition status:\n' + (corpus.read_text() if corpus.exists() else 'NOT_RUN: acquisition step did not execute') + '\n')
           PY
           exit "$status"
+      - name: Compare isolated decode data (diagnostic, never replaces mixed gate)
+        if: always()
+        run: |
+          python3 tooling/tools/perf/analyze_decode_only.py --manifest "$GITHUB_WORKSPACE/decode-only-results/manifest.json" --mixed-manifest "$GITHUB_WORKSPACE/perf-results/manifest.json" --data-dir "$GITHUB_WORKSPACE/decode-only-results" --output "$GITHUB_WORKSPACE/decode-only-results/report.json"
       - name: Upload complete evidence even after failure
         if: always()
         uses: actions/upload-artifact@v4
@@ -224,6 +235,7 @@ jobs:
           if-no-files-found: error
           path: |
             perf-results/
+            decode-only-results/
             build-records/
             corpus-cache/status.json
             policy-corpus/policy-manifest.json

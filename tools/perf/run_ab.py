@@ -59,6 +59,8 @@ def positive(value):
 def argv(args):
     result = ["--iters", str(args.iters), "--size-mb", str(args.size_mb),
               "--encode-mb", str(args.encode_mb), "--repo-dir", str(args.repo_dir)]
+    if getattr(args, "decode_only", False):
+        result.append("--decode-only")
     for path in args.corpus_file:
         result += ["--corpus-file", path]
     return result
@@ -152,6 +154,7 @@ def main():
     parser.add_argument("--encode-mb", type=positive, default=1)
     parser.add_argument("--timeout", type=positive, default=90)
     parser.add_argument("--corpus-file", action="append", default=[])
+    parser.add_argument("--decode-only", action="store_true")
     parser.add_argument("--tuned-bin", type=Path)
     parser.add_argument("--config-failed", default="")
     args = parser.parse_args()

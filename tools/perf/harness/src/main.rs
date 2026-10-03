@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::hint::black_box;
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 struct Args {
@@ -20,6 +21,7 @@ struct Args {
     repo_dir: String,
     corpus_files: Vec<(String, String)>,
     plan: bool,
+    decode_only: bool,
 }
 
 fn positive(value: Option<String>, name: &str) -> usize {
@@ -41,6 +43,7 @@ fn args() -> Args {
         repo_dir: ".".into(),
         corpus_files: Vec::new(),
         plan: false,
+        decode_only: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(name) = args.next() {
@@ -52,6 +55,7 @@ fn args() -> Args {
             "--side" => out.side = args.next().expect("missing --side"),
             "--repo-dir" => out.repo_dir = args.next().expect("missing --repo-dir"),
             "--plan" => out.plan = true,
+            "--decode-only" => out.decode_only = true,
             "--corpus-file" => {
                 let path = args.next().expect("missing --corpus-file");
                 let (path, label) = match path.rsplit_once(':') {
@@ -158,6 +162,11 @@ fn params(kind: &str, leg: &str, args: &Args) -> Value {
         "features": ["hash", "std"], "iters": args.iters,
         "generator": "fixed-seed-corpus-v1",
     });
+    params["experiment_context"] = json!(if args.decode_only {
+        "decode-only/no-rust-encoding"
+    } else {
+        "mixed/decode-encode"
+    });
     if kind == "encode" {
         params["impl_level"] = json!("Fastest");
     }
@@ -167,6 +176,13 @@ fn params(kind: &str, leg: &str, args: &Args) -> Value {
 fn descriptor(kind: &str, leg: &str, name: &str, data: &[u8], args: &Args) -> Value {
     json!({"kind": kind, "leg": leg, "corpus": name, "bytes": data.len(),
            "sha256": sha256(data), "params": params(kind, leg, args)})
+}
+
+static RUST_ENCODE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn compress_subject(data: &[u8]) -> Vec<u8> {
+    RUST_ENCODE_CALLS.fetch_add(1, Ordering::Relaxed);
+    ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
 }
 
 fn decode_stream(data: &[u8]) -> Vec<u8> {
@@ -271,6 +287,10 @@ fn best(samples: &[Value]) -> &Value {
 fn output(mut row: Value, args: &Args, reference: Vec<Value>, subject: Vec<Value>) {
     let ref_best = best(&reference);
     let impl_best = best(&subject);
+    row["rust_encode_calls_so_far"] = json!(RUST_ENCODE_CALLS.load(Ordering::Relaxed));
+    if args.decode_only {
+        assert_eq!(RUST_ENCODE_CALLS.load(Ordering::Relaxed), 0);
+    }
     row["schema"] = json!(1);
     row["diagnostic_mode"] = json!(ruzstd::diagnostic_huffman_bound_mode());
     row["side"] = json!(args.side);
@@ -349,6 +369,9 @@ fn main() {
             }
             output(row, &args, reference, subject);
         }
+        if args.decode_only {
+            continue;
+        }
         let data = &data[..data.len().min(args.encode_mb * 1024 * 1024)];
         let mut row = descriptor("encode", "fastest", &name, data, &args);
         if args.plan {
@@ -356,8 +379,7 @@ fn main() {
             continue;
         }
         let c_compressed = zstd::encode_all(data, 1).unwrap();
-        let rs_compressed =
-            ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest);
+        let rs_compressed = compress_subject(data);
         verify(&c_compressed, data);
         verify(&rs_compressed, data);
         row["c_bytes"] = json!(c_compressed.len());
@@ -370,10 +392,7 @@ fn main() {
                 black_box(zstd::encode_all(data, 1).unwrap());
             },
             || {
-                black_box(ruzstd::encoding::compress_to_vec(
-                    data,
-                    ruzstd::encoding::CompressionLevel::Fastest,
-                ));
+                black_box(compress_subject(data));
             },
         );
         output(row, &args, reference, subject);
