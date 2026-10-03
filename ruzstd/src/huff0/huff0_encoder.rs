@@ -89,10 +89,28 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         writer: &mut BitWriter<VV>,
         data: &[u8],
     ) {
-        for symbol in data.iter().rev() {
-            let (code, num_bits) = table.codes[*symbol as usize];
-            debug_assert!(num_bits > 0);
-            writer.write_bits(code, num_bits as usize);
+        if table.codes.iter().all(|(code, bits)| *bits == 8 && *code <= u32::from(u8::MAX))
+        {
+            // Exactly the same reversed symbol order and low-bit-first stream.
+            // Four symbols use 32 bits, avoiding the writer's 64-bit shift edge.
+            let chunks = data.rchunks_exact(4);
+            let remainder = chunks.remainder();
+            for chunk in chunks {
+                let packed = table.codes[chunk[3] as usize].0
+                    | (table.codes[chunk[2] as usize].0 << 8)
+                    | (table.codes[chunk[1] as usize].0 << 16)
+                    | (table.codes[chunk[0] as usize].0 << 24);
+                writer.write_bits(packed, 32);
+            }
+            for symbol in remainder.iter().rev() {
+                writer.write_bits(table.codes[*symbol as usize].0, 8);
+            }
+        } else {
+            for symbol in data.iter().rev() {
+                let (code, num_bits) = table.codes[*symbol as usize];
+                debug_assert!(num_bits > 0);
+                writer.write_bits(code, num_bits as usize);
+            }
         }
 
         let bits_to_fill = writer.misaligned();
@@ -271,6 +289,37 @@ impl HuffmanTable {
 fn highest_bit_set(x: usize) -> usize {
     assert!(x > 0);
     usize::BITS as usize - x.leading_zeros() as usize
+}
+
+#[test]
+fn packed_octet_symbols_match_scalar_bits_and_capacity() {
+    let mut table_data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+    table_data.extend(core::iter::repeat_n(0, 512));
+    let table = HuffmanTable::build_from_data(&table_data);
+    assert!(table.codes.iter().all(|(_, bits)| *bits == 8));
+    for size in [1, 2, 3, 4, 5, 7, 8, 9, 255, 256, 257, 1025, 4097, 65536, 131072] {
+        let data: Vec<u8> = (0u8..=255).cycle().take(size).collect();
+        for prefix_bits in 0..64 {
+            let mut expected = Vec::with_capacity(33);
+            expected.extend_from_slice(b"prefix");
+            let mut scalar = BitWriter::from(&mut expected);
+            scalar.write_bits(if prefix_bits == 0 { 0u8 } else { 1u8 }, prefix_bits);
+            for symbol in data.iter().rev() {
+                scalar.write_bits(table.codes[*symbol as usize].0, 8);
+            }
+            let padding = scalar.misaligned();
+            scalar.write_bits(1u8, if padding == 0 { 8 } else { padding });
+            scalar.flush();
+            let mut actual = Vec::with_capacity(33);
+            actual.extend_from_slice(b"prefix");
+            let mut packed = BitWriter::from(&mut actual);
+            packed.write_bits(if prefix_bits == 0 { 0u8 } else { 1u8 }, prefix_bits);
+            HuffmanEncoder::new(&table, &mut packed).encode(&data, false);
+            packed.flush();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.capacity(), expected.capacity());
+        }
+    }
 }
 
 #[test]
