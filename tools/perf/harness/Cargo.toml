@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 ruzstd = { path = "../../../ruzstd", default-features = false, features = ["hash", "std"] }
 rand = { version = "=0.8.8", features = ["small_rng"] }
-zstd = "=0.13.3"
+zstd = { version = "=0.13.3", features = ["no_asm"] }  # C 参照剥掉 huf_decompress_amd64.S：x86 解码参照=纯 C
 sha2 = "=0.10.9"
 serde_json = "=1.0.151"
 
