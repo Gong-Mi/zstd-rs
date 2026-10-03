@@ -49,9 +49,26 @@ class WorkflowTests(unittest.TestCase):
                         'cargo hack clippy --workspace --feature-powerset',
                         'cargo hack test --workspace --feature-powerset',
                         'cargo msrv verify --path cli/', 'cargo msrv verify --path ruzstd/',
-                        'cargo +nightly miri test ringbuffer', 'cargo +nightly miri test short_Writer',
+                        'cargo +nightly miri test ringbuffer',
+                        'miri test -p ruzstd --lib decoding::decode_buffer::tests::short_writer -- --exact',
                         'miri test -p ruzstd --test direct_output_miri'):
             self.assertIn(command, scripts)
+        self.assertNotIn('miri test short_Writer', scripts)
+        self.assertIn('test result: ok. 1 passed;', scripts)
+
+    def test_miri_count_gate_rejects_zero_discoveries(self):
+        steps = workflow('ci.yml')['jobs']['nightly-stuff']['steps']
+        for title, filename, expected in (
+                ('Miri short writer exact test (zero discoveries fail)', 'short-writer-miri.log', 1),
+                ('Miri direct output API (real buffers, no C FFI)', 'direct-output-miri.log', 10)):
+            script = next(s['run'] for s in steps if s.get('name') == title)
+            guard = re.search(r'python3 -c "([^\n]*)"', script).group(1)
+            for count in (0, expected):
+                with self.subTest(title=title, count=count), tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
+                    Path(tmp, filename).write_text(f'test result: ok. {count} passed; 0 failed;\n')
+                    result = subprocess.run([sys.executable, '-c', guard], cwd=tmp,
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 0 if count == expected else 1)
 
     def test_contract_ci_executes_python_and_real_rust_tests(self):
         data = workflow('perf-contract.yml')

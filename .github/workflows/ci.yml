@@ -45,6 +45,13 @@ jobs:
       - run: cargo +nightly clippy --workspace --no-default-features -- -D warnings
       - run: cargo +nightly clippy --workspace -- -D warnings
       - run: cargo +nightly miri test ringbuffer
-      - run: cargo +nightly miri test short_Writer
+      - name: Miri short writer exact test (zero discoveries fail)
+        run: |
+          set -euo pipefail
+          cargo +nightly miri test -p ruzstd --lib decoding::decode_buffer::tests::short_writer -- --exact | tee short-writer-miri.log
+          python3 -c "from pathlib import Path; assert 'test result: ok. 1 passed;' in Path('short-writer-miri.log').read_text(), 'short writer oracle did not execute exactly one passing test'"
       - name: Miri direct output API (real buffers, no C FFI)
-        run: cargo +nightly miri test -p ruzstd --test direct_output_miri -- --test-threads=1
+        run: |
+          set -euo pipefail
+          cargo +nightly miri test -p ruzstd --test direct_output_miri -- --test-threads=1 | tee direct-output-miri.log
+          python3 -c "from pathlib import Path; assert 'test result: ok. 10 passed;' in Path('direct-output-miri.log').read_text(), 'direct output oracle did not execute all ten tests'"
