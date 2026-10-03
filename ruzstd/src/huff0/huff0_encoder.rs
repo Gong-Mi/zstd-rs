@@ -89,7 +89,10 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         writer: &mut BitWriter<VV>,
         data: &[u8],
     ) {
-        if table.codes.iter().all(|(code, bits)| *bits == 8 && *code <= u32::from(u8::MAX))
+        if table
+            .codes
+            .iter()
+            .all(|(code, bits)| *bits == 8 && *code <= u32::from(u8::MAX))
         {
             // Exactly the same reversed symbol order and low-bit-first stream.
             // Four symbols use 32 bits, avoiding the writer's 64-bit shift edge.
@@ -297,7 +300,9 @@ fn packed_octet_symbols_match_scalar_bits_and_capacity() {
     table_data.extend(core::iter::repeat_n(0, 512));
     let table = HuffmanTable::build_from_data(&table_data);
     assert!(table.codes.iter().all(|(_, bits)| *bits == 8));
-    for size in [1, 2, 3, 4, 5, 7, 8, 9, 255, 256, 257, 1025, 4097, 65536, 131072] {
+    for size in [
+        1, 2, 3, 4, 5, 7, 8, 9, 255, 256, 257, 1025, 4097, 65536, 131072,
+    ] {
         let data: Vec<u8> = (0u8..=255).cycle().take(size).collect();
         for prefix_bits in 0..64 {
             let mut expected = Vec::with_capacity(33);
