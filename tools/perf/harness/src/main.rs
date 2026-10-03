@@ -1,4 +1,4 @@
-//! One locked measurement program, compiled against each subject ref.
+//! Diagnostic-only harness: both subjects are one source/image with OFF/ON data.
 //! Local runs prove correctness/schema only; performance acceptance belongs to CI.
 mod corpus;
 
@@ -97,6 +97,12 @@ fn args() -> Args {
         assert!(
             hex_identity(&out.binary_sha256, 64),
             "missing/invalid binary identity"
+        );
+        let expected_mode = u8::from(matches!(out.side.as_str(), "head" | "head_tuned"));
+        assert_eq!(
+            ruzstd::diagnostic_huffman_bound_mode(),
+            expected_mode,
+            "diagnostic image mode does not match OFF/ON role"
         );
     }
     out
@@ -266,6 +272,7 @@ fn output(mut row: Value, args: &Args, reference: Vec<Value>, subject: Vec<Value
     let ref_best = best(&reference);
     let impl_best = best(&subject);
     row["schema"] = json!(1);
+    row["diagnostic_mode"] = json!(ruzstd::diagnostic_huffman_bound_mode());
     row["side"] = json!(args.side);
     row["round"] = json!(args.round);
     row["source_sha"] = json!(args.source_sha);
@@ -282,7 +289,8 @@ fn output(mut row: Value, args: &Args, reference: Vec<Value>, subject: Vec<Value
 fn build_identity() -> Value {
     json!({"source_sha": env!("PERF_BUILD_SOURCE_SHA"),
            "harness_sha256": env!("PERF_BUILD_HARNESS_SHA256"),
-           "lock_sha256": env!("PERF_BUILD_LOCK_SHA256")})
+           "lock_sha256": env!("PERF_BUILD_LOCK_SHA256"),
+           "diagnostic_mode": ruzstd::diagnostic_huffman_bound_mode()})
 }
 
 fn main() {

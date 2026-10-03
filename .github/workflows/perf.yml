@@ -134,6 +134,16 @@ jobs:
           cp targets/base/release/ruzstd-perf-harness bins/base
           cp targets/head/release/ruzstd-perf-harness bins/head
           sha256sum bins/base bins/head > build-records/binaries.sha256
+      - name: Diagnostic only - same linked image, one-byte OFF/ON control
+        run: |
+          set -euo pipefail
+          python3 -B tooling/tools/tests/test_perf_mode_control.py -v > build-records/mode-tests.log 2>&1
+          python3 -c "from pathlib import Path; s=Path('build-records/mode-tests.log').read_text(); assert 'Ran 7 tests' in s and 'skipped' not in s and 'OK' in s, 'diagnostic test coverage incomplete'"
+          python3 tooling/tools/perf/prepare_mode_control.py --base bins/base --head bins/head --records build-records
+          bins/base --identity > build-records/off-identity.json
+          bins/head --identity > build-records/on-identity.json
+          python3 -c "import json; a=json.load(open('build-records/off-identity.json')); b=json.load(open('build-records/on-identity.json')); assert a['diagnostic_mode']==0 and b['diagnostic_mode']==1, 'runtime mode mismatch'"
+          sha256sum bins/base bins/head > build-records/binaries.sha256
       - name: Optional tuned binary, with explicit build status
         env:
           CONFIG: ${{ inputs.config_leg && 'true' || 'false' }}
