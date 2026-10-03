@@ -266,8 +266,7 @@ fn truncated_block_and_skip_errors_do_not_poison_decoder() {
     // RFC-style raw literals + one RLE-coded sequence: ll=1, ml=3,
     // offset=(1<<3)-3=5, but only one byte of history and no dictionary.
     let invalid_offset = [
-        0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x04, 0x45, 0, 0, 0x08, b'a', 1, 0x54, 1, 3, 0,
-        0x08,
+        0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x04, 0x45, 0, 0, 0x08, b'a', 1, 0x54, 1, 3, 0, 0x08,
     ];
     for (frame, is_extra_bits) in [(&extra_bits[..], true), (&invalid_offset[..], false)] {
         for capacity in [0, OVERLAP_PLAIN.len()] {
