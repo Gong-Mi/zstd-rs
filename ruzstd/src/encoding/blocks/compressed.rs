@@ -429,7 +429,16 @@ fn compress_literals(
 ) -> Option<huff0_encoder::HuffmanTable> {
     let reset_idx = writer.index();
 
-    let new_encoder_table = huff0_encoder::HuffmanTable::build_from_data(literals);
+    // Same histogram and table construction as build_from_data, retained so
+    // the chosen table's payload size can be checked without encoding it.
+    let mut counts = [0usize; 256];
+    let mut max_symbol = 0u8;
+    for &symbol in literals {
+        counts[symbol as usize] += 1;
+        max_symbol = max_symbol.max(symbol);
+    }
+    let counts = &counts[..=max_symbol as usize];
+    let new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts(counts);
 
     let (encoder_table, new_table) = if let Some(_table) = last_table {
         if let Some(diff) = _table.can_encode(&new_encoder_table) {
@@ -445,6 +454,14 @@ fn compress_literals(
     } else {
         (&new_encoder_table, true)
     };
+
+    // Headers, a new table, jump-table bytes and stream end markers can only
+    // increase this payload bound. The existing fallback compares the entire
+    // encoded section with literals.len(), so this case must produce raw.
+    if encoder_table.payload_bit_len(counts) >= literals.len() * 8 {
+        raw_literals(literals, writer);
+        return None;
+    }
 
     if new_table {
         writer.write_bits(2u8, 2); // compressed literals type
@@ -484,6 +501,86 @@ fn compress_literals(
         Some(new_encoder_table)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod literal_size_tests {
+    use super::{compress_literals, raw_literals};
+    use crate::bit_io::BitWriter;
+    use crate::huff0::huff0_encoder::HuffmanTable;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn previous_table_missing_symbol_uses_new_table() {
+        let previous = HuffmanTable::build_from_weights(&[2, 2, 0, 2, 2]);
+        let literals: Vec<u8> = (0u8..=4).cycle().take(4097).collect();
+        let current = HuffmanTable::build_from_data(&literals);
+        assert!(previous.can_encode(&current).is_none());
+        let mut expected = Vec::new();
+        let mut writer = BitWriter::from(&mut expected);
+        assert!(compress_literals(&literals, None, &mut writer).is_some());
+        writer.flush();
+        let mut output = Vec::new();
+        let mut writer = BitWriter::from(&mut output);
+        assert!(compress_literals(&literals, Some(&previous), &mut writer).is_some());
+        writer.flush();
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn payload_bound_uses_selected_previous_table_and_preserves_prefix() {
+        let mut weights = [2usize; 256];
+        weights[0] = 3;
+        weights[1] = 1;
+        weights[2] = 1;
+        let previous = HuffmanTable::build_from_weights(&weights);
+        let literals: Vec<u8> = (0usize..65536)
+            .map(|i| if i < 4096 { i as u8 } else { 0 })
+            .collect();
+        let current = HuffmanTable::build_from_data(&literals);
+        assert_eq!(previous.can_encode(&current), Some(3));
+        let mut counts = [0usize; 256];
+        for &symbol in &literals {
+            counts[symbol as usize] += 1;
+        }
+        assert_eq!(current.payload_bit_len(&counts), literals.len() * 8);
+        assert!(previous.payload_bit_len(&counts) < literals.len() * 8);
+        let mut output = Vec::new();
+        let mut writer = BitWriter::from(&mut output);
+        writer.write_bits(0x5Au8, 8);
+        assert!(compress_literals(&literals, Some(&previous), &mut writer).is_none());
+        writer.flush();
+        assert_eq!(output[0], 0x5A);
+        assert_eq!(output[1] & 3, 3); // Treeless: the previous table remains active.
+        assert!(output.len() < literals.len());
+        let mut output = Vec::new();
+        let mut writer = BitWriter::from(&mut output);
+        writer.write_bits(0x5Au8, 8);
+        assert!(compress_literals(&literals, None, &mut writer).is_none());
+        writer.flush();
+        assert_eq!(output[0], 0x5A);
+        assert_eq!(output[1] & 3, 0); // Fresh full-alphabet table must fall back raw.
+    }
+
+    #[test]
+    fn full_alphabet_literals_preserve_raw_bytes_and_previous_table() {
+        let previous_data: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let previous = HuffmanTable::build_from_data(&previous_data);
+        for size in [1025, 4097, 65536, 131071] {
+            let literals: Vec<u8> = (0u8..=255).cycle().take(size).collect();
+            for table in [None, Some(&previous)] {
+                let mut output = Vec::new();
+                let mut writer = BitWriter::from(&mut output);
+                assert!(compress_literals(&literals, table, &mut writer).is_none());
+                writer.flush();
+                let mut expected = Vec::new();
+                let mut writer = BitWriter::from(&mut expected);
+                raw_literals(&literals, &mut writer);
+                writer.flush();
+                assert_eq!(output, expected);
+            }
+        }
     }
 }
 
