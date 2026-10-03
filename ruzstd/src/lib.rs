@@ -40,6 +40,11 @@ pub mod decoding;
 pub mod dictionary;
 pub mod encoding;
 
+/// Diagnostic branch only: reports the embedded one-byte runtime switch.
+pub fn diagnostic_huffman_bound_mode() -> u8 {
+    encoding::blocks::diagnostic_huffman_bound_mode()
+}
+
 pub(crate) mod blocks;
 
 #[cfg(feature = "fuzz_exports")]

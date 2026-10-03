@@ -422,6 +422,29 @@ fn raw_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
     writer.append_bytes(literals);
 }
 
+#[repr(C)]
+pub(crate) struct HuffmanBoundDiagnosticControl {
+    prefix: [u8; 16],
+    mode: core::sync::atomic::AtomicU8,
+    suffix: [u8; 16],
+}
+
+// Diagnostic branch only: never merge this switch into the production PR.
+#[used]
+#[no_mangle]
+pub(crate) static RUZSTD_HUFF_BOUND_DIAGNOSTIC: HuffmanBoundDiagnosticControl =
+    HuffmanBoundDiagnosticControl {
+        prefix: *b"RUZSTD_HUFFBOUND",
+        mode: core::sync::atomic::AtomicU8::new(1),
+        suffix: *b"_MODE_CONTROL_AB",
+    };
+
+pub(crate) fn diagnostic_huffman_bound_mode() -> u8 {
+    RUZSTD_HUFF_BOUND_DIAGNOSTIC
+        .mode
+        .load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
@@ -458,7 +481,8 @@ fn compress_literals(
     // Headers, a new table, jump-table bytes and stream end markers can only
     // increase this payload bound. The existing fallback compares the entire
     // encoded section with literals.len(), so this case must produce raw.
-    if encoder_table.payload_bit_len(counts) >= literals.len() * 8 {
+    let payload_bits = core::hint::black_box(encoder_table.payload_bit_len(counts));
+    if diagnostic_huffman_bound_mode() != 0 && payload_bits >= literals.len() * 8 {
         raw_literals(literals, writer);
         return None;
     }
