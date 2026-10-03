@@ -46,3 +46,5 @@ jobs:
       - run: cargo +nightly clippy --workspace -- -D warnings
       - run: cargo +nightly miri test ringbuffer
       - run: cargo +nightly miri test short_Writer
+      - name: Miri direct output API (real buffers, no C FFI)
+        run: cargo +nightly miri test -p ruzstd --test direct_output_miri -- --test-threads=1
