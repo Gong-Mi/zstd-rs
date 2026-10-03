@@ -445,6 +445,15 @@ pub(crate) fn diagnostic_huffman_bound_mode() -> u8 {
         .load(core::sync::atomic::Ordering::Relaxed)
 }
 
+pub(crate) fn diagnostic_literal_buffer(size: usize) -> (usize, usize) {
+    let literals: Vec<u8> = (0u8..=255).cycle().take(size).collect();
+    let mut output = Vec::new();
+    let mut writer = BitWriter::from(&mut output);
+    assert!(compress_literals(&literals, None, &mut writer).is_none());
+    writer.flush();
+    (output.len(), output.capacity())
+}
+
 fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
@@ -481,11 +490,9 @@ fn compress_literals(
     // Headers, a new table, jump-table bytes and stream end markers can only
     // increase this payload bound. The existing fallback compares the entire
     // encoded section with literals.len(), so this case must produce raw.
-    let payload_bits = core::hint::black_box(encoder_table.payload_bit_len(counts));
-    if diagnostic_huffman_bound_mode() != 0 && payload_bits >= literals.len() * 8 {
-        raw_literals(literals, writer);
-        return None;
-    }
+    // Diagnostic replacement: preserve the original trial and its allocation
+    // shape. The runtime switch now controls only 8-bit symbol batching.
+    let _payload_bits = core::hint::black_box(encoder_table.payload_bit_len(counts));
 
     if new_table {
         writer.write_bits(2u8, 2); // compressed literals type

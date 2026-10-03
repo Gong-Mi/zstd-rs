@@ -5,6 +5,6 @@
 //! in this module.
 mod compressed;
 
-pub(crate) use compressed::diagnostic_huffman_bound_mode;
+pub(crate) use compressed::{diagnostic_huffman_bound_mode, diagnostic_literal_buffer};
 
 pub(super) use compressed::*;

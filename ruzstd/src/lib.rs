@@ -40,7 +40,12 @@ pub mod decoding;
 pub mod dictionary;
 pub mod encoding;
 
-/// Diagnostic branch only: reports the embedded one-byte runtime switch.
+/// Diagnostic probe: raw literal length and trial-buffer capacity.
+pub fn diagnostic_literal_buffer(size: usize) -> (usize, usize) {
+    encoding::blocks::diagnostic_literal_buffer(size)
+}
+
+/// Diagnostic branch only: scalar mode 0, packed octet mode 1.
 pub fn diagnostic_huffman_bound_mode() -> u8 {
     encoding::blocks::diagnostic_huffman_bound_mode()
 }
