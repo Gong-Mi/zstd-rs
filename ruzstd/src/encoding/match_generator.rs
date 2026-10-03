@@ -332,7 +332,15 @@ impl MatchGenerator {
                 let mut cmps = 0usize;
                 // 首次比较命中长度：条件预算用它决定要不要花第二次比较
                 let mut last_hit_len = 0usize;
-                let mut cur = match_entry.suffixes.get_hashed(key_hash);
+                // A slot index is reusable only for the same table geometry.
+                let candidate_hash = if match_entry.suffixes.len_log == last_entry.suffixes.len_log
+                    && match_entry.suffixes.slots.len() == last_entry.suffixes.slots.len()
+                {
+                    key_hash
+                } else {
+                    match_entry.suffixes.key_hash(&data_slice[..MIN_MATCH_LEN])
+                };
+                let mut cur = match_entry.suffixes.get_hashed(candidate_hash);
                 while let Some(match_index) = cur {
                     let match_slice = if is_last {
                         &match_entry.data[match_index..self.suffix_idx]
@@ -824,4 +832,31 @@ fn chain_reaches_old_positions() {
         cur = store.link_of(p);
     }
     assert_eq!(seen, alloc::vec![4, 3, 2, 1, 0], "链走查应能回到最老位置");
+}
+
+#[test]
+fn mixed_block_sizes_use_each_windows_hash_width() {
+    let blocks = [b"abcdefabcdef".to_vec(), b"ghijkl".repeat(6000)];
+    let mut driver = MatchGeneratorDriver::new(128 * 1024, 1);
+    let mut original = Vec::new();
+    let mut reconstructed = Vec::new();
+    for block in blocks {
+        original.extend_from_slice(&block);
+        driver.commit_space(block);
+        driver.start_matching(|sequence| match sequence {
+            Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                reconstructed.extend_from_slice(literals);
+                for _ in 0..match_len {
+                    let byte = reconstructed[reconstructed.len() - offset];
+                    reconstructed.push(byte);
+                }
+            }
+        });
+    }
+    assert_eq!(reconstructed, original);
 }
