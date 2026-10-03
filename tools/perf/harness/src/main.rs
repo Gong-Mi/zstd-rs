@@ -149,6 +149,8 @@ fn params(kind: &str, leg: &str, args: &Args) -> Value {
     let mut params = json!({
         "impl_api": impl_api, "ref_api": ref_api, "ref_level": 1,
         "ref_version": zstd::zstd_safe::version_string(),
+        // 编 C 参照的编译器（同后端前提的自证：应与 rustc 的 LLVM 同代）
+        "ref_cc": env!("PERF_REF_CC"),
         "features": ["hash", "std"], "iters": args.iters,
         "generator": "fixed-seed-corpus-v1",
     });

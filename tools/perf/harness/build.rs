@@ -36,6 +36,12 @@ fn main() {
     );
     let source = git(&root, &["rev-parse", "HEAD"]);
     println!("cargo:rustc-env=PERF_BUILD_SOURCE_SHA={source}");
+    // 记录实际编 C 参照的编译器，让 artifact 自证"同后端"这一前提
+    println!(
+        "cargo:rustc-env=PERF_REF_CC={}",
+        std::env::var("CC").unwrap_or_else(|_| "unset".to_owned())
+    );
+    println!("cargo:rerun-if-env-changed=CC");
     // Track both detached HEAD and a symbolic branch ref, including worktrees.
     for token in [
         "HEAD".to_owned(),

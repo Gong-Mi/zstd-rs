@@ -127,17 +127,12 @@ jobs:
           have() { command -v "$1" >/dev/null 2>&1; }
           want_major=$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')
           echo "rustc bundled LLVM major: ${want_major:-unknown}"
-          # 1) 已在镜像里：优先与 rustc 同代的 clang
+          # 1) 已经在镜像里的同代 clang
           CC_PICK=""
-          if [ -n "${want_major:-}" ]; then
-            have "clang-$want_major" && CC_PICK="clang-$want_major"
+          if [ -n "${want_major:-}" ] && have "clang-$want_major"; then
+            CC_PICK="clang-$want_major"
           fi
-          if [ -z "$CC_PICK" ]; then
-            for c in clang-23 clang-22 clang-21 clang; do
-              if have "$c"; then CC_PICK="$c"; break; fi
-            done
-          fi
-          # 2) 没有就装与 rustc 同代的（apt.llvm.org），失败再退系统 clang
+          # 2) 没装到同代的就装（apt.llvm.org）；这一步失败才允许退回系统 clang
           if [ -z "$CC_PICK" ] && [ -n "${want_major:-}" ]; then
             codename=$(. /etc/os-release 2>/dev/null && echo "$VERSION_CODENAME")
             if curl -fsSL --max-time 60 https://apt.llvm.org/llvm-snapshot.gpg.key \
@@ -149,23 +144,31 @@ jobs:
               have "clang-${want_major}" && CC_PICK="clang-${want_major}"
             fi
           fi
-          # 3) 最后退回系统 clang / cc（要在记录里如实登记）
-          [ -n "$CC_PICK" ] || { have clang && CC_PICK=clang; }
+          # 3) 退路：系统 clang / cc，并把"不匹配"如实写进记录
+          MISMATCH=""
+          if [ -z "$CC_PICK" ]; then
+            have clang && CC_PICK=clang
+            MISMATCH="yes"
+          fi
           : "${CC_PICK:=cc}"
           CXX_PICK="${CC_PICK/clang/clang++}"
           have "$CXX_PICK" || CXX_PICK="$CC_PICK"
+          if [ -z "$CC_PICK" ] || [ "${CC_PICK#clang-}" = "$CC_PICK" ] || [ "${CC_PICK#clang-}" != "${want_major:-}" ]; then
+            MISMATCH="yes"
+          fi
           {
             echo "CC=$CC_PICK"
             echo "CXX=$CXX_PICK"
           } >> "$GITHUB_ENV"
           echo "cc=$CC_PICK" >> "$GITHUB_OUTPUT"
+          echo "cc_mismatch=$MISMATCH" >> "$GITHUB_OUTPUT"
           {
-            echo "=== compiler for C reference: $CC_PICK ==="
+            echo "=== compiler for C reference: $CC_PICK (llvm-major-match=${MISMATCH:-no}want=${want_major:-?}) ==="
             "$CC_PICK" --version | head -2 || true
             echo "=== rustc ==="
             rustc -vV
           } > build-records/cc.txt
-          echo "C reference compiler: $CC_PICK"
+          echo "C reference compiler: $CC_PICK (mismatch=${MISMATCH:-no})"
       - name: Cache measurement dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -197,9 +200,12 @@ jobs:
               status=1
               continue
             fi
-            hits=$(nm "$lib" 2>/dev/null | grep -c "fast_asm_loop")
-            echo "$side: $(basename "$lib") asm_symbols=$hits" | tee -a build-records/c-asm.txt
-            [ "$hits" = "0" ] || status=1
+            count=$(nm "$lib" 2>/dev/null | { grep -c "fast_asm_loop" || true; })
+            hits=${count:-0}
+            if [ "$hits" != "0" ]; then
+              echo "$side: hand-written assembly present in C reference" | tee -a build-records/c-asm.txt
+              status=1
+            fi
           done
           if [ "$status" = "0" ]; then
             echo "PASS: C reference contains no huf_decompress*_fast_asm_loop" | tee -a build-records/c-asm.txt
