@@ -193,20 +193,26 @@ pub fn decode_and_execute_sequences(
         seq_sum += rest_literals.len() as u32;
     }
 
-    let diff = buffer.len() - old_buffer_size;
-    assert!(
-        seq_sum as usize == diff,
-        "Seq_sum: {} is different from the difference in buffersize: {}",
-        seq_sum,
-        diff
-    );
+    // An exhausted direct target retains only its physical prefix. All
+    // sequence/literal/bitstream validation above must still run; decode_all
+    // maps the latched overflow to TargetTooSmall and unbinds the target.
+    // Keep the integrity assertion for streaming and sufficient-capacity output.
+    if !buffer.direct_overflowed() {
+        let diff = buffer.len() - old_buffer_size;
+        assert!(
+            seq_sum as usize == diff,
+            "Seq_sum: {} is different from the difference in buffersize: {}",
+            seq_sum,
+            diff
+        );
+    }
     Ok(())
 }
 
 /// Update the most recently used offsets to reflect the provided offset value, and return the
 /// "actual" offset needed because offsets are not stored in a raw way, some transformations are needed
 /// before you get a functional number.
-fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
+pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     let actual_offset = if lit_len > 0 {
         match offset_value {
             1..=3 => scratch[offset_value as usize - 1],

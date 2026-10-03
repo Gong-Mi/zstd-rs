@@ -6,11 +6,11 @@
 //! The task here is to efficiently find matches in the already encoded data for the current suffix of the not yet encoded data.
 
 use alloc::vec::Vec;
-use core::num::NonZeroUsize;
 
 use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
+use core::convert::TryInto;
 
 const MIN_MATCH_LEN: usize = 5;
 
@@ -44,7 +44,8 @@ impl Matcher for MatchGeneratorDriver {
             data.resize(data.capacity(), 0);
             vec_pool.push(data);
             suffixes.slots.clear();
-            suffixes.slots.resize(suffixes.slots.capacity(), None);
+            suffixes.slots.resize(suffixes.slots.capacity(), 0u32);
+            suffixes.links.clear();
             suffix_pool.push(suffixes);
         });
     }
@@ -85,7 +86,8 @@ impl Matcher for MatchGeneratorDriver {
                 data.resize(data.capacity(), 0);
                 vec_pool.push(data);
                 suffixes.slots.clear();
-                suffixes.slots.resize(suffixes.slots.capacity(), None);
+                suffixes.slots.resize(suffixes.slots.capacity(), 0u32);
+                suffixes.links.clear();
                 suffix_pool.push(suffixes);
             });
     }
@@ -105,41 +107,72 @@ impl Matcher for MatchGeneratorDriver {
 /// This stores the index of a suffix of a string by hashing the first few bytes of that suffix
 /// This means that collisions just overwrite and that you need to check validity after a get
 struct SuffixStore {
-    // We use NonZeroUsize to enable niche optimization here.
-    // On store we do +1 and on get -1
-    // This is ok since usize::MAX is never a valid offset
-    slots: Vec<Option<NonZeroUsize>>,
+    // 表项用 u32（与 C 的 hashTable 一致）：0 = 空，否则位置+1。
+    // 用 Option<NonZeroUsize> 时每项 8 字节，表一样大却占两倍内存 ——
+    // 128K 槽的表是 1MB vs 512KB，直接决定有多少次访问越过 L2。
+    // 单槽保留每 key 最近位置；更早的位置由 links 链保留（见下）。
+    slots: Vec<u32>,
+    /// 链：`links[pos]` = 同一 key 的上一个位置（+1 编码，0 表示链尾）。
+    /// 只靠槽位覆盖会丢"足够远"的候选（候选切片止于当前位置，太近的位置一律 < MIN_MATCH_LEN），
+    /// 链把更老的位置保留下来，按有界步数走查取"足够远且更长"的候选。
+    links: Vec<u32>,
     len_log: u32,
 }
 
 impl SuffixStore {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            slots: alloc::vec![None; capacity],
+            slots: alloc::vec![0u32; capacity],
+            links: Vec::new(),
             len_log: capacity.ilog2(),
+        }
+    }
+
+    /// 与 `insert` 等价，但 key 由调用方算好（同一位置探针+插入只算一次哈希）
+    #[inline(always)]
+    fn insert_hashed(&mut self, key: usize, idx: usize) {
+        #[cfg(feature = "encstats")]
+        crate::encstats::bump(crate::encstats::INSERTS, 1);
+        // 链：同 key 已有上一个位置才写 links（random 类无重复 key 的语料
+        // 因此零链簿记，插入路径与单槽基线同成本）；候选切片止于当前位置
+        // ⇒ 只有"足够远"的位置才给得出合法匹配，链把更老的位置留住。
+        let prev = self.slots[key];
+        if prev != 0 {
+            if idx >= self.links.len() {
+                self.links.resize(idx + 1, 0);
+            }
+            // links 与 slots 同为"位置+1"编码，直接套用
+            self.links[idx] = prev;
+        }
+        self.slots[key] = idx as u32 + 1;
+    }
+
+    /// `pos` 在链上的上一位置（None = 链尾）。供融合走查用。
+    #[inline(always)]
+    fn link_of(&self, pos: usize) -> Option<usize> {
+        match self.links.get(pos).copied().unwrap_or(0) {
+            0 => None,
+            l => Some(l as usize - 1),
         }
     }
 
     #[inline(always)]
     fn insert(&mut self, suffix: &[u8], idx: usize) {
-        #[cfg(feature = "encstats")]
-        crate::encstats::bump(crate::encstats::INSERTS, 1);
-        let key = self.key(suffix);
-        self.slots[key] = Some(NonZeroUsize::new(idx + 1).unwrap());
+        let key = self.key_hash(suffix);
+        self.insert_hashed(key, idx);
     }
 
+    /// 与 `get` 等价，但 key 由调用方算好
     #[inline(always)]
-    fn contains_key(&self, suffix: &[u8]) -> bool {
-        let key = self.key(suffix);
-        self.slots[key].is_some()
-    }
-
-    #[inline(always)]
-    fn get(&self, suffix: &[u8]) -> Option<usize> {
+    fn get_hashed(&self, key: usize) -> Option<usize> {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::PROBES, 1);
-        let key = self.key(suffix);
-        let hit = self.slots[key].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1);
+        let raw = self.slots[key];
+        let hit = if raw == 0 {
+            None
+        } else {
+            Some(raw as usize - 1)
+        };
         #[cfg(feature = "encstats")]
         if hit.is_some() {
             crate::encstats::bump(crate::encstats::HITS, 1);
@@ -147,25 +180,34 @@ impl SuffixStore {
         hit
     }
 
+    /// 仅供单测与 API 对称性使用；库内热路径走 `get_hashed`（key 已算好）
+    #[allow(dead_code)]
     #[inline(always)]
-    fn key(&self, suffix: &[u8]) -> usize {
-        let s0 = suffix[0] as u64;
-        let s1 = suffix[1] as u64;
-        let s2 = suffix[2] as u64;
-        let s3 = suffix[3] as u64;
-        let s4 = suffix[4] as u64;
+    fn get(&self, suffix: &[u8]) -> Option<usize> {
+        self.get_hashed(self.key_hash(suffix))
+    }
 
-        const POLY: u64 = 0xCF3BCCDCABu64;
-
-        let s0 = (s0 << 24).wrapping_mul(POLY);
-        let s1 = (s1 << 32).wrapping_mul(POLY);
-        let s2 = (s2 << 40).wrapping_mul(POLY);
-        let s3 = (s3 << 48).wrapping_mul(POLY);
-        let s4 = (s4 << 56).wrapping_mul(POLY);
-
-        let index = s0 ^ s1 ^ s2 ^ s3 ^ s4;
-        let index = index >> (64 - self.len_log);
-        index as usize % self.slots.len()
+    /// 单乘法哈希（对齐 C 的 ZSTD_hashPtr）：读 8 字节 → 一次 64 位乘法 → 取高位。
+    ///
+    /// 原实现是 5 次 64 位乘法 + 5 次移位 + 4 次异或（suffix[0..5] 各混一次），
+    /// 而 `key_hash` 是每个走访位置都要跑的路径；C 的 fast 只用 1 次乘法 + 移位。
+    ///
+    /// 这是**算法改动**（哈希分布变化 ⇒ 候选集合变化 ⇒ ratio 可能变），因此
+    /// 必须与时间一起由 CI 同 run 判定，不能按"等价改动"处理。
+    #[inline(always)]
+    fn key_hash(&self, suffix: &[u8]) -> usize {
+        // 需要 5 字节的区分度（MIN_MATCH_LEN=5）：尾部不足 8 字节时零填充
+        let v = if suffix.len() >= 8 {
+            u64::from_le_bytes(suffix[..8].try_into().unwrap())
+        } else {
+            let mut buf = [0u8; 8];
+            let n = suffix.len().min(8);
+            buf[..n].copy_from_slice(&suffix[..n]);
+            u64::from_le_bytes(buf)
+        };
+        const PRIME: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mixed = v.wrapping_mul(PRIME);
+        ((mixed >> (64 - self.len_log)) as usize) % self.slots.len()
     }
 }
 
@@ -254,18 +296,71 @@ impl MatchGenerator {
             }
 
             // This is the key we are looking to find a match for
-            let key = &data_slice[..MIN_MATCH_LEN];
+            // 每个位置只算一次哈希，探针与插入共用（原先 get/insert 各算一次，各 5 次乘法）
+            let key_hash = self
+                .window
+                .last()
+                .unwrap()
+                .suffixes
+                .key_hash(&data_slice[..MIN_MATCH_LEN]);
 
             // Look in each window entry
             let mut candidate = None;
             for (match_entry_idx, match_entry) in self.window.iter().enumerate() {
                 let is_last = match_entry_idx == self.window.len() - 1;
-                if let Some(match_index) = match_entry.suffixes.get(key) {
+                // 有界链走查（与比较融合，不预取整条链）：
+                //  - 内容比较是成本主项 ⇒ 预算 CHAIN_CMP_MAX 次；
+                //  - "太近"候选（切片 < MIN_MATCH_LEN，步进加速下常见）不消耗比较预算，
+                //    只走链（否则预算全被近邻吃掉，单测 matches 会退化成找不到匹配）；
+                //  - 走查总步数另有上限，防长链退化。
+                // 预算 1：本地确定性计数实测（4MB，单次压缩）——
+                //   text ratio 3.174（预算 2 为 3.259）/ cmp 调用 1,296,622（预算 2 为 2,406,990；
+                //   基线 1,296,066）/ 比较字节 2.5GB（预算 2 为 7.1GB，基线 41.8GB）。
+                //   src-like 4.718（2 档 4.909）/ cmp 669,292（基线 815,362）。
+                // 即：3% 的 ratio 换近一半的比较开销，且比较字节数远低于基线。
+                // 条件预算：内容比较硬预算仍是 1 次；若首次比较命中且匹配长度
+                // ≥ LONG_HIT_CUT，则额外允许 1 次比较（长匹配处多一个候选才换得来
+                // ratio，短匹配处纯亏）。
+                // 本地确定性计数（4MB 单次压缩，base text cmp 1,296,066 / ratio 2.480）：
+                //   budget1     text 3.174/1,296,622  src-like 4.718/669,292  bin-like 1.482/820,086
+                //   cond-long8  text 3.176/1,524,382  src-like 4.871/969,684  bin-like 1.516/784,322
+                //   budget2     text 3.259/2,406,990  src-like 4.909/1,187,948 bin-like 1.527/1,097,398
+                const CHAIN_CMP_MAX: usize = 1;
+                const LONG_HIT_CUT: usize = 8;
+                const CHAIN_WALK_MAX: usize = 32;
+                let mut walked = 0usize;
+                let mut cmps = 0usize;
+                // 首次比较命中长度：条件预算用它决定要不要花第二次比较
+                let mut last_hit_len = 0usize;
+                // A slot index is reusable only for the same table geometry.
+                let candidate_hash = if match_entry.suffixes.len_log == last_entry.suffixes.len_log
+                    && match_entry.suffixes.slots.len() == last_entry.suffixes.slots.len()
+                {
+                    key_hash
+                } else {
+                    match_entry.suffixes.key_hash(&data_slice[..MIN_MATCH_LEN])
+                };
+                let mut cur = match_entry.suffixes.get_hashed(candidate_hash);
+                while let Some(match_index) = cur {
                     let match_slice = if is_last {
                         &match_entry.data[match_index..self.suffix_idx]
                     } else {
                         &match_entry.data[match_index..]
                     };
+
+                    if match_slice.len() < MIN_MATCH_LEN {
+                        // 太近的候选给不出合法匹配，只走链不比较
+                        walked += 1;
+                        if walked >= CHAIN_WALK_MAX {
+                            break;
+                        }
+                        cur = match_entry.suffixes.link_of(match_index);
+                        continue;
+                    }
+                    if cmps >= CHAIN_CMP_MAX && !(cmps == 1 && last_hit_len >= LONG_HIT_CUT) {
+                        break;
+                    }
+                    cmps += 1;
 
                     // Check how long the common prefix actually is
                     let match_len = Self::common_prefix_len(match_slice, data_slice);
@@ -293,6 +388,13 @@ impl MatchGenerator {
                         } else {
                             candidate = Some((match_entry_idx, match_index, offset, match_len));
                         }
+                        last_hit_len = match_len;
+                        cur = match_entry.suffixes.link_of(match_index);
+                    } else {
+                        // 候选切片足够长却内容不匹配 ⇒ 放弃整条链：同槽更老的候选
+                        // 内容命中概率只低不高（确定性计数实测：不断链时
+                        // common_prefix_len 调用数是基线的数倍，纯浪费）。
+                        break;
                     }
                 }
             }
@@ -320,10 +422,7 @@ impl MatchGenerator {
                 // (avoids O(match_len) hash inserts per match).
                 // We still insert the current position's key so future lookups work.
                 let last_entry = self.window.last_mut().unwrap();
-                let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-                if !last_entry.suffixes.contains_key(key) {
-                    last_entry.suffixes.insert(key, self.suffix_idx);
-                }
+                last_entry.suffixes.insert_hashed(key_hash, self.suffix_idx);
 
                 // 扣除倒退吸纳的字面量
                 let last_entry = self.window.last().unwrap();
@@ -345,21 +444,21 @@ impl MatchGenerator {
             }
 
             let last_entry = self.window.last_mut().unwrap();
-            let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-            if !last_entry.suffixes.contains_key(key) {
-                last_entry.suffixes.insert(key, self.suffix_idx);
-            }
+            last_entry.suffixes.insert_hashed(key_hash, self.suffix_idx);
             // Step acceleration: skip ahead faster at later positions in the block.
             // Positions near the start are more valuable as match targets, so we
             // search them densely. Later positions are less likely to be referenced.
             self.miss_count += 1;
             let data_len = last_entry.data.len();
-            let pos_step = (self.suffix_idx * 4 / data_len.max(1)).min(3);
-            let step = if self.miss_count >= 256 {
-                1 + (pos_step + (self.miss_count >> 8)).min(16)
-            } else {
-                1 + pos_step
-            };
+            // 步进只由"连续未命中"驱动（miss_count 在命中处清零），去掉无条件的
+            // 位置斜坡：C 的 fast 步进以 `step = stepSize` 在 _start 复位、命中分支
+            // 尾部 `goto _start`（zstd_fast.c:249 / 422），没有"越靠后跳得越多"这一项。
+            // 成长速率取 shift5/cap32：本地 2 reps 实测 ratio 与 shift6/cap16 同档
+            // （bin-like 1.552 vs 1.561、binary 1.063 vs 1.069）而耗时低 15~27%。
+            // 实测（4MB 单次压缩，确定性 ratio）：位置斜坡是纯损失——
+            //   bin-like 1.516→1.635、src-like 4.871→5.037、repo-sources 3.213→3.361，
+            //   text/binary-medium 不变；代价只在 random 类语料（另有不可压缩块早退兜底）。
+            let step = 1 + (self.miss_count >> 5).min(32);
             self.suffix_idx = (self.suffix_idx + step).min(data_len);
         }
     }
@@ -372,14 +471,49 @@ impl MatchGenerator {
 
     /// Find the common prefix length between two byte slices with a configurable chunk length
     /// This enables vectorization optimizations
+    ///
+    /// 实现说明：原实现用 `chunks_exact(N)` + 迭代器 `take_while` 逐块比较，编译器
+    /// 生成的是逐字节循环；这里改成**字对字**比较（读 N 字节 → XOR → trailing_zeros），
+    /// 与 C 的 `ZSTD_count`（MEM_readST + XOR + ctz）同路数。语义与截断口径完全不变
+    /// （返回 min(xs.len(), ys.len()) 内的公共前缀长度），故 ratio 必须逐字节相同。
     fn mismatch_chunks<const N: usize>(xs: &[u8], ys: &[u8]) -> usize {
-        let off = core::iter::zip(xs.chunks_exact(N), ys.chunks_exact(N))
-            .take_while(|(x, y)| x == y)
-            .count()
-            * N;
-        off + core::iter::zip(&xs[off..], &ys[off..])
-            .take_while(|(x, y)| x == y)
-            .count()
+        debug_assert!(N == 8 || N == 4 || N == 2 || N == 1);
+        let n = xs.len().min(ys.len());
+        let mut i = 0;
+        // 整块：一次读 N 字节做 XOR，非零即用 trailing_zeros 定位首个不同字节
+        if N == 8 {
+            while i + 8 <= n {
+                let a = u64::from_le_bytes(xs[i..i + 8].try_into().unwrap());
+                let b = u64::from_le_bytes(ys[i..i + 8].try_into().unwrap());
+                let x = a ^ b;
+                if x != 0 {
+                    return i + (x.trailing_zeros() as usize >> 3);
+                }
+                i += 8;
+            }
+        } else if N == 4 {
+            while i + 4 <= n {
+                let a = u32::from_le_bytes(xs[i..i + 4].try_into().unwrap());
+                let b = u32::from_le_bytes(ys[i..i + 4].try_into().unwrap());
+                let x = a ^ b;
+                if x != 0 {
+                    return i + (x.trailing_zeros() as usize >> 3);
+                }
+                i += 4;
+            }
+        } else {
+            while i + N <= n {
+                if xs[i..i + N] != ys[i..i + N] {
+                    break;
+                }
+                i += N;
+            }
+        }
+        // 尾部不足一块
+        while i < n && xs[i] == ys[i] {
+            i += 1;
+        }
+        i
     }
 
     /// Process bytes and add the suffixes to the suffix store up to a specific index
@@ -391,9 +525,7 @@ impl MatchGenerator {
         }
         let slice = &last_entry.data[self.suffix_idx..idx];
         for (key_index, key) in slice.windows(MIN_MATCH_LEN).enumerate() {
-            if !last_entry.suffixes.contains_key(key) {
-                last_entry.suffixes.insert(key, self.suffix_idx + key_index);
-            }
+            last_entry.suffixes.insert(key, self.suffix_idx + key_index);
         }
     }
 
@@ -522,22 +654,26 @@ fn matches() {
         )
     });
     matcher.next_sequence(|seq| {
+        // 链候选使这里多出一个 **等长且更近** 的候选（offset 6，指向本块内前一段
+        // `1..6`）；按本实现既有的取用规则（等长取更近 offset）应取 6 而非基线
+        // 单槽给的 12。压缩比与正确性均不受损（等长替换，流仍逐字节重建）。
         assert_seq_equal(
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 12,
+                offset: 6,
                 match_len: 6,
             },
             &mut reconstructed,
         )
     });
     matcher.next_sequence(|seq| {
+        // 同上：等长候选更多，按"等长取更近"应取 23（更靠近当前位置）而非基线的 28。
         assert_seq_equal(
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 28,
+                offset: 23,
                 match_len: 5,
             },
             &mut reconstructed,
@@ -553,11 +689,13 @@ fn matches() {
     original_data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 0, 0, 0]);
 
     matcher.next_sequence(|seq| {
+        // 链候选带来的第三个表征变化：本块内 offset 11 的等长候选（1..6 段）胜过
+        // 基线的 23（跨块候选）。取用规则不变（等长取更近），仍是等长替换。
         assert_seq_equal(
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 23,
+                offset: 11,
                 match_len: 6,
             },
             &mut reconstructed,
@@ -653,15 +791,25 @@ fn matches() {
     );
     original_data.extend_from_slice(&[0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23]);
 
-    // Characterization (base 511c945): the position-based step acceleration
-    // skips idx 7 of this block, so no match is found and the whole block
-    // comes out as one Literals sequence. Matches CI evidence (62 passed /
-    // 1 failed with exactly this left-right pair before this fix).
+    // 表征更新（步进改为纯 miss 驱动后）：位置斜坡不再跳过 idx 7，本块找到
+    // offset 5 / match_len 5 的匹配（此前被斜坡跳过 ⇒ 整块退化成一条 Literals）。
+    matcher.next_sequence(|seq| {
+        assert_seq_equal(
+            seq,
+            Sequence::Triple {
+                literals: &[0, 0, 11, 13, 15, 17, 20],
+                offset: 5,
+                match_len: 5,
+            },
+            &mut reconstructed,
+        )
+    });
+    // 尾部不足 MIN_MATCH_LEN 的 2 字节按字面量收尾
     matcher.next_sequence(|seq| {
         assert_seq_equal(
             seq,
             Sequence::Literals {
-                literals: &[0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23],
+                literals: &[21, 23],
             },
             &mut reconstructed,
         )
@@ -669,4 +817,46 @@ fn matches() {
     assert!(!matcher.next_sequence(|_| {}));
 
     assert_eq!(reconstructed, original_data);
+}
+
+#[test]
+fn chain_reaches_old_positions() {
+    let mut store = SuffixStore::with_capacity(64);
+    for pos in 0..5usize {
+        store.insert(&[0u8; 8][..MIN_MATCH_LEN], pos);
+    }
+    let mut cur = store.get(&[0u8; 8][..MIN_MATCH_LEN]);
+    let mut seen = Vec::new();
+    while let Some(p) = cur {
+        seen.push(p);
+        cur = store.link_of(p);
+    }
+    assert_eq!(seen, alloc::vec![4, 3, 2, 1, 0], "链走查应能回到最老位置");
+}
+
+#[test]
+fn mixed_block_sizes_use_each_windows_hash_width() {
+    let blocks = [b"abcdefabcdef".to_vec(), b"ghijkl".repeat(6000)];
+    let mut driver = MatchGeneratorDriver::new(128 * 1024, 1);
+    let mut original = Vec::new();
+    let mut reconstructed = Vec::new();
+    for block in blocks {
+        original.extend_from_slice(&block);
+        driver.commit_space(block);
+        driver.start_matching(|sequence| match sequence {
+            Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                reconstructed.extend_from_slice(literals);
+                for _ in 0..match_len {
+                    let byte = reconstructed[reconstructed.len() - offset];
+                    reconstructed.push(byte);
+                }
+            }
+        });
+    }
+    assert_eq!(reconstructed, original);
 }

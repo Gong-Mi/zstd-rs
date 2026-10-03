@@ -8,27 +8,60 @@ use crate::{
     huff0::huff0_encoder,
 };
 
-/// A block of [`crate::common::BlockType::Compressed`]
-pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
+/// Entropy tables built by a trial block, committed only when it is emitted.
+#[must_use = "commit updates only when the compressed block is emitted"]
+#[derive(Default)]
+pub(crate) struct EntropyUpdates {
+    huffman: Option<huff0_encoder::HuffmanTable>,
+    ll: Option<FSETable>,
+    ml: Option<FSETable>,
+    of: Option<FSETable>,
+}
+
+impl EntropyUpdates {
+    pub(crate) fn commit<M: Matcher>(self, state: &mut CompressState<M>) {
+        if let Some(table) = self.huffman {
+            state.last_huff_table = Some(table);
+        }
+        if let Some(table) = self.ll {
+            state.fse_tables.ll_previous = Some(table);
+        }
+        if let Some(table) = self.ml {
+            state.fse_tables.ml_previous = Some(table);
+        }
+        if let Some(table) = self.of {
+            state.fse_tables.of_previous = Some(table);
+        }
+    }
+}
+
+/// A block of [`crate::common::BlockType::Compressed`].
+/// The returned table updates must be discarded if the caller emits raw instead.
+pub(crate) fn compress_block<M: Matcher>(
+    state: &mut CompressState<M>,
+    output: &mut Vec<u8>,
+) -> EntropyUpdates {
+    let mut updates = EntropyUpdates::default();
     let mut literals_vec = Vec::new();
     let mut sequences = Vec::new();
-    state.matcher.start_matching(|seq| {
-        match seq {
-            Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
-            Sequence::Triple {
-                literals,
-                offset,
-                match_len,
-            } => {
-                literals_vec.extend_from_slice(literals);
-                sequences.push(crate::blocks::sequence_section::Sequence {
-                    ll: literals.len() as u32,
-                    ml: match_len as u32,
-                    of: (offset + 3) as u32, // TODO make use of the offset history
-                });
-            }
+    // 取出偏移历史到局部，避免与 `state.matcher` 的可变借用冲突（块尾写回）
+    let mut offset_hist = state.offset_hist;
+    state.matcher.start_matching(|seq| match seq {
+        Sequence::Literals { literals } => literals_vec.extend_from_slice(literals),
+        Sequence::Triple {
+            literals,
+            offset,
+            match_len,
+        } => {
+            literals_vec.extend_from_slice(literals);
+            sequences.push(crate::blocks::sequence_section::Sequence {
+                ll: literals.len() as u32,
+                ml: match_len as u32,
+                of: encode_offset_value(offset as u32, literals.len() as u32, &mut offset_hist),
+            });
         }
     });
+    state.offset_hist = offset_hist;
 
     // literals section
 
@@ -37,7 +70,7 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         if let Some(table) =
             compress_literals(&literals_vec, state.last_huff_table.as_ref(), &mut writer)
         {
-            state.last_huff_table.replace(table);
+            updates.huffman = Some(table);
         }
     } else {
         raw_literals(&literals_vec, &mut writer);
@@ -50,25 +83,41 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
     } else {
         encode_seqnum(sequences.len(), &mut writer);
 
-        // Choose the tables
-        // TODO store previously used tables
+        // 复用判定用的"本块符号存在位图"（ll/ml/of 码值都 < 64，一趟算完）
+        let (mut ll_present, mut ml_present, mut of_present) = (0u64, 0u64, 0u64);
+        for seq in &sequences {
+            let (ll_c, ml_c, of_c) = (
+                encode_literal_length(seq.ll).0,
+                encode_match_len(seq.ml).0,
+                encode_offset(seq.of).0,
+            );
+            debug_assert!(ll_c < 64 && ml_c < 64 && of_c < 64);
+            ll_present |= 1u64 << ll_c;
+            ml_present |= 1u64 << ml_c;
+            of_present |= 1u64 << of_c;
+        }
+
+        // Choose the tables：上一张覆盖本块全部符号就复用（RepeateLast），否则重建
         let ll_mode = choose_table(
             state.fse_tables.ll_previous.as_ref(),
             &state.fse_tables.ll_default,
             sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
             9,
+            ll_present,
         );
         let ml_mode = choose_table(
             state.fse_tables.ml_previous.as_ref(),
             &state.fse_tables.ml_default,
             sequences.iter().map(|seq| encode_match_len(seq.ml).0),
             9,
+            ml_present,
         );
         let of_mode = choose_table(
             state.fse_tables.of_previous.as_ref(),
             &state.fse_tables.of_default,
             sequences.iter().map(|seq| encode_offset(seq.of).0),
             8,
+            of_present,
         );
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
@@ -86,21 +135,25 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         );
 
         if let FseTableMode::Encoded(table) = ll_mode {
-            state.fse_tables.ll_previous = Some(table)
+            updates.ll = Some(table)
         }
         if let FseTableMode::Encoded(table) = ml_mode {
-            state.fse_tables.ml_previous = Some(table)
+            updates.ml = Some(table)
         }
         if let FseTableMode::Encoded(table) = of_mode {
-            state.fse_tables.of_previous = Some(table)
+            updates.of = Some(table)
         }
     }
     writer.flush();
+    updates
 }
 
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
 enum FseTableMode<'a> {
+    /// 格式里还有"预定义表"这一种模式；本实现始终走 新表/复用上一张 两条路，
+    /// 保留该变体以对应格式定义。
+    #[allow(dead_code)]
     Predefined(&'a FSETable),
     Encoded(FSETable),
     RepeateLast(&'a FSETable),
@@ -118,20 +171,20 @@ impl FseTableMode<'_> {
 
 fn choose_table<'a>(
     previous: Option<&'a FSETable>,
-    default_table: &'a FSETable,
+    _default_table: &'a FSETable,
     data: impl Iterator<Item = u8>,
     max_log: u8,
+    present: u64,
 ) -> FseTableMode<'a> {
-    // TODO check if the new table is better than the predefined and previous table
-    let use_new_table = true;
-    let use_previous_table = false;
-    if use_previous_table {
-        FseTableMode::RepeateLast(previous.unwrap())
-    } else if use_new_table {
-        FseTableMode::Encoded(build_table_from_data(data, max_log, true))
-    } else {
-        FseTableMode::Predefined(default_table)
+    // 参考实现每块做一次 "新表 vs 复用上一张" 的判定；这里同样：上一张表存在且
+    // **覆盖本块全部符号**才复用（覆盖性是正确性门，不是性能门——解码端遇到未覆盖
+    // 符号会取到空状态表）。
+    if let Some(prev) = previous {
+        if prev.covers_present(present) {
+            return FseTableMode::RepeateLast(prev);
+        }
     }
+    FseTableMode::Encoded(build_table_from_data(data, max_log, true))
 }
 
 fn encode_table(mode: &FseTableMode<'_>, writer: &mut BitWriter<&mut Vec<u8>>) {
@@ -298,6 +351,64 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
     }
 }
 
+/// 为 (实际偏移, 字面量长度) 选出最小的 Offset_Value，并按解码端 `do_offset_history`
+/// 的规则更新偏移历史（1..=3 为重复偏移码，≥4 表示新偏移 = 值 - 3）。
+///
+/// 与解码端逐分支镜像：ll>0 时 1/2/3 → hist[0]/hist[1]/hist[2]；ll==0 时
+/// 1/2/3 → hist[1]/hist[2]/hist[0]-1。历史更新也必须一致，否则后续序列的
+/// 重复偏移码会解成别的偏移（cross_validate 的 "ruzstd 编码 → C 解码" 是验证门）。
+fn encode_offset_value(actual_offset: u32, lit_len: u32, hist: &mut [u32; 3]) -> u32 {
+    let value = if lit_len > 0 {
+        if actual_offset == hist[0] {
+            1
+        } else if actual_offset == hist[1] {
+            2
+        } else if actual_offset == hist[2] {
+            3
+        } else {
+            actual_offset + 3
+        }
+    } else if actual_offset == hist[1] {
+        1
+    } else if actual_offset == hist[2] {
+        2
+    } else if hist[0] > 0 && actual_offset == hist[0] - 1 {
+        3
+    } else {
+        actual_offset + 3
+    };
+
+    if lit_len > 0 {
+        match value {
+            // 复用最近偏移：历史不变
+            1 => {}
+            2 => {
+                hist[1] = hist[0];
+                hist[0] = actual_offset;
+            }
+            _ => {
+                hist[2] = hist[1];
+                hist[1] = hist[0];
+                hist[0] = actual_offset;
+            }
+        }
+    } else {
+        match value {
+            // ll==0：解码端把 hist[1]/hist[2] 当作最近偏移；码 1 只做部分后移
+            1 => {
+                hist[1] = hist[0];
+                hist[0] = actual_offset;
+            }
+            _ => {
+                hist[2] = hist[1];
+                hist[1] = hist[0];
+                hist[0] = actual_offset;
+            }
+        }
+    }
+    value
+}
+
 fn encode_offset(len: u32) -> (u8, u32, usize) {
     let log = len.ilog2();
     let lower = len & ((1 << log) - 1);
@@ -373,5 +484,39 @@ fn compress_literals(
         Some(new_encoder_table)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod offset_value_tests {
+    use super::encode_offset_value;
+    use crate::decoding::sequence_execution::do_offset_history;
+
+    /// 编码侧选的码必须被解码端规则还原成同一个偏移，且两侧历史演进一致。
+    /// 覆盖 ll>0 与 ll==0（后者的码→历史映射不同）以及新偏移路径。
+    #[test]
+    fn round_trip_against_decoder_rule() {
+        let offsets = [1u32, 2, 3, 4, 5, 8, 16, 63, 64, 1000];
+        for &start in &[[1u32, 4, 8], [4, 8, 1], [7, 7, 7], [2, 3, 5]] {
+            for &ll in &[1u32, 5, 100] {
+                for &ll0 in &[0u32] {
+                    for &lit in &[ll, ll0] {
+                        let mut eh = start;
+                        let mut dh = start;
+                        for (i, &off) in offsets.iter().enumerate() {
+                            // 每 3 步插一个新偏移，保证历史被推动
+                            let actual = if i % 3 == 2 { 17 + i as u32 } else { off };
+                            let value = encode_offset_value(actual, lit, &mut eh);
+                            let decoded = do_offset_history(value, lit, &mut dh);
+                            assert_eq!(
+                                decoded, actual,
+                                "start={start:?} ll={lit} value={value} 应还原 {actual}"
+                            );
+                            assert_eq!(eh, dh, "历史演进必须一致 (start={start:?}, ll={lit})");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

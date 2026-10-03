@@ -125,7 +125,7 @@ impl DecodeBuffer {
         let Some(d) = self.direct.as_mut() else {
             return false;
         };
-        if d.written + data.len() > d.cap {
+        if d.overflow || data.len() > d.cap - d.written {
             d.overflow = true;
             return true;
         }
@@ -149,31 +149,37 @@ impl DecodeBuffer {
             Some(d) => (d.ptr, d.written, d.cap, d.overflow),
             None => return Ok(()),
         };
-        let _ = overflow;
-        if written + match_length > cap {
-            if let Some(d) = self.direct.as_mut() {
-                d.overflow = true;
-            }
-            return Ok(());
-        }
-        if offset > written {
-            // 冷路径：字典 / 跨帧——先把需要的那段字典字节落进 dst，再以"现有总长"
-            // 为周期继续（与 RingBuffer 版的 repeat_from_dict 同义：此时 offset 指到
-            // 缓冲区起点，即字典与输出开头相接的位置）。
+        // After exhaustion, written is only the physical prefix. Validate
+        // offsets against all logically produced bytes, including skipped
+        // literals/matches, before deciding whether this match can be written.
+        if offset as u64 > self.total_output_counter {
             if self.total_output_counter > self.window_size as u64 {
                 return Err(DecodeBufferError::OffsetTooBig {
                     offset,
                     buf_len: written,
                 });
             }
-            let bytes_from_dict = offset - written;
-            let dlen = self.dict_content.len();
-            if bytes_from_dict > dlen {
+            let bytes_from_dict = (offset as u64 - self.total_output_counter) as usize;
+            if bytes_from_dict > self.dict_content.len() {
                 return Err(DecodeBufferError::NotEnoughBytesInDictionary {
-                    got: dlen,
+                    got: self.dict_content.len(),
                     need: bytes_from_dict,
                 });
             }
+        }
+        if overflow || match_length > cap - written {
+            if let Some(d) = self.direct.as_mut() {
+                d.overflow = true;
+            }
+            self.total_output_counter += match_length as u64;
+            return Ok(());
+        }
+        if offset > written {
+            // 冷路径：字典 / 跨帧——先把需要的那段字典字节落进 dst，再以"现有总长"
+            // 为周期继续（与 RingBuffer 版的 repeat_from_dict 同义：此时 offset 指到
+            // 缓冲区起点，即字典与输出开头相接的位置）。
+            let bytes_from_dict = offset - written;
+            let dlen = self.dict_content.len();
             let take = bytes_from_dict.min(match_length);
             let low = dlen - bytes_from_dict;
             let new_written = {
@@ -252,8 +258,9 @@ impl DecodeBuffer {
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
         if let Some(d) = self.direct.as_mut() {
             // 直写：RLE 块直接填调用方缓冲。
-            if d.written + fill_length > d.cap {
+            if d.overflow || fill_length > d.cap - d.written {
                 d.overflow = true;
+                self.total_output_counter += fill_length as u64;
                 return;
             }
             unsafe {
@@ -278,10 +285,11 @@ impl DecodeBuffer {
                 Some(d) => (d.ptr, d.cap, d.written),
                 None => return Ok(()),
             };
-            if written + fill_length > cap {
+            if self.direct_overflowed() || fill_length > cap - written {
                 if let Some(d) = self.direct.as_mut() {
                     d.overflow = true;
                 }
+                self.total_output_counter += fill_length as u64;
                 return Ok(());
             }
             let target = unsafe {
@@ -591,6 +599,36 @@ mod tests {
     extern crate std;
     use alloc::vec;
     use alloc::vec::Vec;
+
+    #[test]
+    fn direct_overflow_keeps_logical_history_and_rejects_invalid_offsets() {
+        use crate::decoding::errors::DecodeBufferError;
+
+        let mut output = [0xa5; 4];
+        let mut buffer = DecodeBuffer::new(16);
+        // SAFETY: output stays alive and exclusively borrowed until unbound.
+        unsafe { buffer.set_direct_output(&mut output) };
+        buffer.push(b"abcde"); // No physical write, but five logical bytes.
+        assert!(buffer.direct_overflowed());
+        buffer.repeat(5, 3).unwrap();
+        buffer.repeat(8, 3).unwrap();
+        assert!(matches!(
+            buffer.repeat(12, 3),
+            Err(DecodeBufferError::NotEnoughBytesInDictionary { got: 0, need: 1 })
+        ));
+        buffer.push(b"z"); // Overflow is latched: no writes after a lost prefix.
+        assert_eq!(buffer.clear_direct_output(), 0);
+        assert_eq!(output, [0xa5; 4]);
+
+        buffer.reset(16);
+        unsafe { buffer.set_direct_output(&mut output) };
+        // Invalid history must not be hidden by the capacity check.
+        assert!(matches!(
+            buffer.repeat(1, 5),
+            Err(DecodeBufferError::NotEnoughBytesInDictionary { got: 0, need: 1 })
+        ));
+        buffer.clear_direct_output();
+    }
 
     #[test]
     fn short_writer() {

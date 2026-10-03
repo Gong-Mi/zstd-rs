@@ -1,0 +1,19 @@
+[package]
+name = "ruzstd-perf-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# An isolated measurement dependency graph is copied unchanged into both refs.
+# Production workspace feature-powerset/MSRV gates remain independent.
+[workspace]
+
+[dependencies]
+ruzstd = { path = "../../../ruzstd", default-features = false, features = ["hash", "std"] }
+rand = { version = "=0.8.8", features = ["small_rng"] }
+zstd = "=0.13.3"
+sha2 = "=0.10.9"
+serde_json = "=1.0.151"
+
+[build-dependencies]
+sha2 = "=0.10.9"
