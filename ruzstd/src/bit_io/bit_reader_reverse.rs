@@ -39,7 +39,11 @@ impl<'s> BitReaderReversed<'s> {
     }
 
     /// We refill the container in full bytes, shifting the still unread portion to the left, and filling the lower bits with new data
-    #[cold]
+    ///
+    /// 注意：这里**不能**标 `#[cold]`。字面量解码（Huffman）每个比特窗口耗尽就要
+    /// refill 一次（约每 64 bit / 每 16 个符号），是热路径的一部分；标冷会让 LLVM
+    /// 把它排除出内联并把分支权重/块布局按"几乎不发生"处理，直接伤害每符号成本。
+    #[inline]
     fn refill(&mut self) {
         let bytes_consumed = self.bits_consumed as usize / 8;
         if bytes_consumed == 0 {
