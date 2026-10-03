@@ -27,7 +27,7 @@ impl<'t> HuffmanDecoder<'t> {
     /// 不标就跨不过模块边界，尾部串行路径会退化成真实调用。
     #[inline]
     pub fn decode_symbol(&mut self) -> u8 {
-        self.table.decode[self.state as usize].symbol
+        self.table.decode[self.state as usize].symbol()
     }
 
     /// Initialize internal state and prepare to decode data. Then, `decode_symbol` can be called
@@ -47,7 +47,7 @@ impl<'t> HuffmanDecoder<'t> {
     pub fn next_state(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
         // telling you how many bits identify the current symbol.
-        let num_bits = self.table.decode[self.state as usize].num_bits;
+        let num_bits = self.table.decode[self.state as usize].num_bits();
         // New bits are read from the stream
         let new_bits = br.get_bits(num_bits);
         // Shift and mask out the bits that identify the current symbol
@@ -85,8 +85,8 @@ impl<'t> HuffmanDecoder<'t> {
             // index space of the table.
             let entry = unsafe { *table.get_unchecked(state as usize) };
             // SAFETY: caller guarantees room for four writes.
-            unsafe { dst.add(i).write(entry.symbol) };
-            let nb = entry.num_bits;
+            unsafe { dst.add(i).write(entry.symbol()) };
+            let nb = entry.num_bits();
             // `window >> (63 - nb) >> 1` is `window >> (64 - nb)` without the
             // shift overflow at `nb == 0`; with `nb == 0` both terms are zero and
             // the state is unchanged, matching the serial path.
@@ -380,13 +380,8 @@ impl HuffmanTable {
         }
 
         //fill with dummy symbols
-        self.decode.resize(
-            1 << self.max_num_bits,
-            Entry {
-                symbol: 0,
-                num_bits: 0,
-            },
-        );
+        self.decode
+            .resize(1 << self.max_num_bits, Entry::new(0, 0));
 
         //starting codes for each rank
         self.rank_indexes.clear();
@@ -415,8 +410,7 @@ impl HuffmanTable {
                 let len = 1 << (max_bits - bits_for_symbol);
                 self.rank_indexes[bits_for_symbol as usize] += len;
                 for idx in 0..len {
-                    self.decode[base_idx + idx].symbol = symbol as u8;
-                    self.decode[base_idx + idx].num_bits = bits_for_symbol;
+                    self.decode[base_idx + idx] = Entry::new(symbol as u8, bits_for_symbol);
                 }
             }
         }
@@ -433,12 +427,33 @@ impl Default for HuffmanTable {
 
 /// A single entry in the table contains the decoded symbol/literal and the
 /// size of the prefix code.
+///
+/// Both values are packed into one `u16` (symbol in the low byte, prefix-code
+/// length in the high byte), so a lookup reads them with a single 16-bit load —
+/// the same layout C's `HUF_DEltX1` uses. As a `{ symbol: u8, num_bits: u8 }`
+/// struct this compiled to **two separate 8-bit loads per symbol** on aarch64,
+/// which is a per-symbol cost in the literal decode hot loop.
 #[derive(Copy, Clone, Debug)]
-pub struct Entry {
+pub struct Entry(u16);
+
+impl Entry {
+    /// Pack `symbol` (low byte) and `num_bits` (high byte) into one entry.
+    #[inline(always)]
+    pub const fn new(symbol: u8, num_bits: u8) -> Self {
+        Entry((symbol as u16) | ((num_bits as u16) << 8))
+    }
+
     /// The byte that the prefix code replaces during encoding.
-    symbol: u8,
+    #[inline(always)]
+    pub const fn symbol(self) -> u8 {
+        self.0 as u8
+    }
+
     /// The number of bits the prefix code occupies.
-    num_bits: u8,
+    #[inline(always)]
+    pub const fn num_bits(self) -> u8 {
+        (self.0 >> 8) as u8
+    }
 }
 
 /// Assert that the provided value is greater than zero, and returns the
