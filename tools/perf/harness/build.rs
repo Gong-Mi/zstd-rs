@@ -4,7 +4,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git").args(args).current_dir(root).output().unwrap();
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
     assert!(output.status.success(), "git identity discovery failed");
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
@@ -26,11 +30,17 @@ fn main() {
     let codec_paths = ["ruzstd/src", "ruzstd/Cargo.toml", "Cargo.toml"];
     let mut status_args = vec!["status", "--porcelain", "--untracked-files=all", "--"];
     status_args.extend(codec_paths);
-    assert!(git(&root, &status_args).is_empty(), "dirty production codec cannot claim a commit identity");
+    assert!(
+        git(&root, &status_args).is_empty(),
+        "dirty production codec cannot claim a commit identity"
+    );
     let source = git(&root, &["rev-parse", "HEAD"]);
     println!("cargo:rustc-env=PERF_BUILD_SOURCE_SHA={source}");
     // Track both detached HEAD and a symbolic branch ref, including worktrees.
-    for token in ["HEAD".to_owned(), git(&root, &["rev-parse", "--symbolic-full-name", "HEAD"])] {
+    for token in [
+        "HEAD".to_owned(),
+        git(&root, &["rev-parse", "--symbolic-full-name", "HEAD"]),
+    ] {
         if !token.is_empty() {
             let path = git(&root, &["rev-parse", "--git-path", &token]);
             println!("cargo:rerun-if-changed={}", root.join(path).display());
@@ -47,13 +57,25 @@ fn main() {
     let mut digest = Sha256::new();
     for path in files {
         println!("cargo:rerun-if-changed={}", path.display());
-        digest.update(path.strip_prefix(&harness).unwrap().to_str().unwrap().as_bytes());
+        digest.update(
+            path.strip_prefix(&harness)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .as_bytes(),
+        );
         digest.update(b"\0");
         digest.update(std::fs::read(path).unwrap());
         digest.update(b"\0");
     }
-    println!("cargo:rustc-env=PERF_BUILD_HARNESS_SHA256={:x}", digest.finalize());
+    println!(
+        "cargo:rustc-env=PERF_BUILD_HARNESS_SHA256={:x}",
+        digest.finalize()
+    );
     let lock = harness.join("Cargo.lock");
     println!("cargo:rerun-if-changed={}", lock.display());
-    println!("cargo:rustc-env=PERF_BUILD_LOCK_SHA256={:x}", Sha256::digest(std::fs::read(lock).unwrap()));
+    println!(
+        "cargo:rustc-env=PERF_BUILD_LOCK_SHA256={:x}",
+        Sha256::digest(std::fs::read(lock).unwrap())
+    );
 }

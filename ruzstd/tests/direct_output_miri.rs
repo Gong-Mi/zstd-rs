@@ -22,9 +22,7 @@ const RLE: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x11, 0x8b, 0x00, 0x00, 7];
 const RLE_PLAIN: &[u8] = &[7; 17];
 const EMPTY: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00];
 // The payload deliberately resembles a frame header but must remain opaque.
-const SKIP: &[u8] = &[
-    0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 0x28, 0xb5, 0x2f, 0xfd,
-];
+const SKIP: &[u8] = &[0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 0x28, 0xb5, 0x2f, 0xfd];
 
 // Generated with libzstd 1.5.7 ZSTD_compress(..., level=1) from b"abcd" * 16.
 // The full 19-byte frame was checked byte-for-byte against that encoder and
@@ -34,8 +32,8 @@ const SKIP: &[u8] = &[
 // not a raw/RLE block. Frame SHA-256:
 // 7f66e84192e26a8bcf824ce5bbfbf715a9d4e606f849404f377d17963f22efbf
 const OVERLAP: &[u8] = &[
-    0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x40, 0x55, 0x00, 0x00, 0x20, 0x61, 0x62, 0x63,
-    0x64, 0x01, 0x00, 0x59, 0x72, 0x44,
+    0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x40, 0x55, 0x00, 0x00, 0x20, 0x61, 0x62, 0x63, 0x64, 0x01, 0x00,
+    0x59, 0x72, 0x44,
 ];
 const OVERLAP_PLAIN: &[u8] = b"abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd";
 
@@ -46,11 +44,10 @@ const OVERLAP_PLAIN: &[u8] = b"abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcda
 // was checked byte-for-byte against the encoder. Frame SHA-256:
 // 96c50ad05f1df8461225557ac10b466f9d63388a916a2b31c66d79b6dd41f720
 const NONOVERLAP: &[u8] = &[
-    0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x36, 0x75, 0x01, 0x00, 0x64, 0x02, 0x30, 0x31,
-    0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65,
-    0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72,
-    0x73, 0x74, 0x75, 0x76, 0x57, 0x58, 0x59, 0x5a, 0x2d, 0x2d, 0x01, 0x00, 0x4e,
-    0x88, 0x7a, 0x02,
+    0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x36, 0x75, 0x01, 0x00, 0x64, 0x02, 0x30, 0x31, 0x32, 0x33, 0x34,
+    0x35, 0x36, 0x37, 0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b,
+    0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x57, 0x58, 0x59, 0x5a, 0x2d,
+    0x2d, 0x01, 0x00, 0x4e, 0x88, 0x7a, 0x02,
 ];
 const NONOVERLAP_PLAIN: &[u8] = b"0123456789abcdefghijklmnopqrstuvWXYZ--0123456789abcdef";
 
@@ -107,7 +104,11 @@ fn check_success(decoder: &mut FrameDecoder, frame: &[u8], expected: &[u8]) {
     assert_eq!(&out[PREFIX.len()..], expected);
     assert_eq!(out.len(), PREFIX.len() + expected.len());
     assert_eq!(out.capacity(), capacity);
-    assert_eq!(out.as_ptr(), allocation, "decode_all_to_vec must not reallocate");
+    assert_eq!(
+        out.as_ptr(),
+        allocation,
+        "decode_all_to_vec must not reallocate"
+    );
 }
 
 #[test]
@@ -209,9 +210,16 @@ fn known_limitation_compressed_short_output_panics_without_overwriting_guards() 
 
     fn assert_known_panic(result: std::thread::Result<Result<usize, FrameDecoderError>>) {
         let panic = result.expect_err("compressed short output currently panics");
-        let message = panic.downcast_ref::<String>().map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("");
-        assert!(message.starts_with("Seq_sum:"), "unexpected panic: {}", message);
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.starts_with("Seq_sum:"),
+            "unexpected panic: {}",
+            message
+        );
     }
 
     let mut decoder = FrameDecoder::new();
@@ -229,7 +237,9 @@ fn known_limitation_compressed_short_output_panics_without_overwriting_guards() 
             let mut out = output_vec(capacity);
             let allocation = out.as_ptr();
             let result = catch_unwind(AssertUnwindSafe(|| {
-                decoder.decode_all_to_vec(frame, &mut out).map(|()| out.len())
+                decoder
+                    .decode_all_to_vec(frame, &mut out)
+                    .map(|()| out.len())
             }));
             assert_known_panic(result);
             // Panics do not promise Result-error length rollback: the decoder
@@ -288,7 +298,10 @@ fn truncated_block_and_skip_errors_do_not_poison_decoder() {
         "{:?}",
         result
     );
-    assert_eq!(out, PREFIX, "even a later-frame error must restore vector length");
+    assert_eq!(
+        out, PREFIX,
+        "even a later-frame error must restore vector length"
+    );
     drop(out);
     check_success(&mut decoder, OVERLAP, OVERLAP_PLAIN);
 }

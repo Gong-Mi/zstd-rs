@@ -72,13 +72,32 @@ fn args() -> Args {
             _ => panic!("unknown argument {name}"),
         }
     }
-    assert!(out.size_mb <= 64 && out.encode_mb <= 64, "64 MiB per-corpus limit");
-    assert!(out.iters <= 100 && out.round <= 100, "bounded experiment required");
+    assert!(
+        out.size_mb <= 64 && out.encode_mb <= 64,
+        "64 MiB per-corpus limit"
+    );
+    assert!(
+        out.iters <= 100 && out.round <= 100,
+        "bounded experiment required"
+    );
     if !out.plan {
-        assert!(matches!(out.side.as_str(), "base" | "head" | "base2" | "head_tuned"));
-        assert!(hex_identity(&out.source_sha, 40), "missing/invalid source identity");
-        assert_eq!(out.source_sha, env!("PERF_BUILD_SOURCE_SHA"), "runtime source identity differs from actual build");
-        assert!(hex_identity(&out.binary_sha256, 64), "missing/invalid binary identity");
+        assert!(matches!(
+            out.side.as_str(),
+            "base" | "head" | "base2" | "head_tuned"
+        ));
+        assert!(
+            hex_identity(&out.source_sha, 40),
+            "missing/invalid source identity"
+        );
+        assert_eq!(
+            out.source_sha,
+            env!("PERF_BUILD_SOURCE_SHA"),
+            "runtime source identity differs from actual build"
+        );
+        assert!(
+            hex_identity(&out.binary_sha256, 64),
+            "missing/invalid binary identity"
+        );
     }
     out
 }
@@ -99,7 +118,10 @@ fn load_corpora(args: &Args) -> Vec<(String, Vec<u8>)> {
         ("binary-medium".into(), corpus::gen_medium(size)),
         ("src-like".into(), corpus::gen_src_like(size)),
         ("bin-like".into(), corpus::gen_bin_like(size)),
-        ("repo-sources".into(), corpus::gen_repo_sources(&args.repo_dir, size)),
+        (
+            "repo-sources".into(),
+            corpus::gen_repo_sources(&args.repo_dir, size),
+        ),
     ];
     for (path, name) in &args.corpus_files {
         let mut data = std::fs::read(path).expect("required corpus file unreadable");
@@ -108,7 +130,10 @@ fn load_corpora(args: &Args) -> Vec<(String, Vec<u8>)> {
     }
     let mut names = BTreeSet::new();
     for (name, data) in &corpora {
-        assert!(!name.is_empty() && names.insert(name.clone()), "duplicate/empty corpus name");
+        assert!(
+            !name.is_empty() && names.insert(name.clone()),
+            "duplicate/empty corpus name"
+        );
         assert!(!data.is_empty(), "required corpus {name} is empty");
     }
     corpora
@@ -153,7 +178,9 @@ fn decode_stream(data: &[u8]) -> Vec<u8> {
 }
 
 fn decode_known(data: &[u8], output: &mut [u8]) -> usize {
-    ruzstd::decoding::FrameDecoder::new().decode_all(data, output).unwrap()
+    ruzstd::decoding::FrameDecoder::new()
+        .decode_all(data, output)
+        .unwrap()
 }
 
 fn verify(encoded: &[u8], original: &[u8]) {
@@ -162,7 +189,11 @@ fn verify(encoded: &[u8], original: &[u8]) {
     let n = decode_known(encoded, &mut output);
     assert_eq!(n, original.len());
     assert_eq!(output, original, "known byte mismatch");
-    assert_eq!(zstd::decode_all(encoded).unwrap(), original, "C byte mismatch");
+    assert_eq!(
+        zstd::decode_all(encoded).unwrap(),
+        original,
+        "C byte mismatch"
+    );
 }
 
 fn cpu_seconds() -> f64 {
@@ -174,9 +205,16 @@ fn cpu_seconds() -> f64 {
     extern "C" {
         fn clock_gettime(clock: i32, result: *mut Timespec) -> i32;
     }
-    let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     // Linux/Android 64-bit CI only. A clock failure is fatal, never a zero sample.
-    assert_eq!(unsafe { clock_gettime(2, &mut ts) }, 0, "process CPU clock failed");
+    assert_eq!(
+        unsafe { clock_gettime(2, &mut ts) },
+        0,
+        "process CPU clock failed"
+    );
     ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
@@ -190,7 +228,11 @@ fn timed(action: &mut impl FnMut()) -> Value {
     json!({"wall_ms": wall_ms, "cpu_ms": cpu_ms})
 }
 
-fn measure_pair(iters: usize, mut reference: impl FnMut(), mut subject: impl FnMut()) -> (Vec<Value>, Vec<Value>) {
+fn measure_pair(
+    iters: usize,
+    mut reference: impl FnMut(),
+    mut subject: impl FnMut(),
+) -> (Vec<Value>, Vec<Value>) {
     reference();
     subject();
     let mut ref_samples = Vec::with_capacity(iters);
@@ -209,9 +251,15 @@ fn measure_pair(iters: usize, mut reference: impl FnMut(), mut subject: impl FnM
 }
 
 fn best(samples: &[Value]) -> &Value {
-    samples.iter().min_by(|a, b| {
-        a["wall_ms"].as_f64().unwrap().total_cmp(&b["wall_ms"].as_f64().unwrap())
-    }).unwrap()
+    samples
+        .iter()
+        .min_by(|a, b| {
+            a["wall_ms"]
+                .as_f64()
+                .unwrap()
+                .total_cmp(&b["wall_ms"].as_f64().unwrap())
+        })
+        .unwrap()
 }
 
 fn output(mut row: Value, args: &Args, reference: Vec<Value>, subject: Vec<Value>) {
@@ -257,23 +305,39 @@ fn main() {
             }
             verify(&compressed, &data);
             let (reference, subject) = if leg == "stream" {
-                measure_pair(args.iters,
-                    || { black_box(zstd::decode_all(&compressed[..]).unwrap()); },
-                    || { black_box(decode_stream(&compressed)); })
+                measure_pair(
+                    args.iters,
+                    || {
+                        black_box(zstd::decode_all(&compressed[..]).unwrap());
+                    },
+                    || {
+                        black_box(decode_stream(&compressed));
+                    },
+                )
             } else {
                 // Both consumers supply and reuse equal-capacity buffers; neither
                 // result Vec allocation is charged to only one implementation.
                 let mut ref_output = vec![0u8; data.len()];
                 let mut impl_output = vec![0u8; data.len()];
-                let result = measure_pair(args.iters,
-                    || { black_box(zstd::bulk::decompress_to_buffer(&compressed, &mut ref_output).unwrap()); },
-                    || { black_box(decode_known(&compressed, &mut impl_output)); });
+                let result = measure_pair(
+                    args.iters,
+                    || {
+                        black_box(
+                            zstd::bulk::decompress_to_buffer(&compressed, &mut ref_output).unwrap(),
+                        );
+                    },
+                    || {
+                        black_box(decode_known(&compressed, &mut impl_output));
+                    },
+                );
                 assert_eq!(ref_output, data);
                 assert_eq!(impl_output, data);
                 result
             };
             if data.len() as f64 / (compressed.len() as f64) < 1.05 {
-                eprintln!("WARNING: {name}/{leg} reference ratio near 1; entropy path may not dominate");
+                eprintln!(
+                    "WARNING: {name}/{leg} reference ratio near 1; entropy path may not dominate"
+                );
             }
             output(row, &args, reference, subject);
         }
@@ -284,16 +348,26 @@ fn main() {
             continue;
         }
         let c_compressed = zstd::encode_all(data, 1).unwrap();
-        let rs_compressed = ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest);
+        let rs_compressed =
+            ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest);
         verify(&c_compressed, data);
         verify(&rs_compressed, data);
         row["c_bytes"] = json!(c_compressed.len());
         row["ruzstd_bytes"] = json!(rs_compressed.len());
         row["c_ratio"] = json!(data.len() as f64 / c_compressed.len() as f64);
         row["ruzstd_ratio"] = json!(data.len() as f64 / rs_compressed.len() as f64);
-        let (reference, subject) = measure_pair(args.iters,
-            || { black_box(zstd::encode_all(data, 1).unwrap()); },
-            || { black_box(ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)); });
+        let (reference, subject) = measure_pair(
+            args.iters,
+            || {
+                black_box(zstd::encode_all(data, 1).unwrap());
+            },
+            || {
+                black_box(ruzstd::encoding::compress_to_vec(
+                    data,
+                    ruzstd::encoding::CompressionLevel::Fastest,
+                ));
+            },
+        );
         output(row, &args, reference, subject);
     }
     if args.plan {
@@ -307,24 +381,41 @@ mod tests {
 
     #[test]
     fn sha256_matches_public_vectors() {
-        assert_eq!(sha256(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(sha256(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
     fn encode_measurement_honors_each_iteration_and_one_warmup() {
         let mut reference_calls = 0;
         let mut subject_calls = 0;
-        let (reference, subject) = measure_pair(3,
-            || { reference_calls += 1; black_box(vec![0u8; 4096]); },
-            || { subject_calls += 1; black_box(vec![1u8; 4096]); });
+        let (reference, subject) = measure_pair(
+            3,
+            || {
+                reference_calls += 1;
+                black_box(vec![0u8; 4096]);
+            },
+            || {
+                subject_calls += 1;
+                black_box(vec![1u8; 4096]);
+            },
+        );
         assert_eq!((reference_calls, subject_calls), (4, 4));
         assert_eq!((reference.len(), subject.len()), (3, 3));
     }
 
     #[test]
     fn cpu_metric_belongs_to_wall_selected_iteration() {
-        let values = vec![json!({"wall_ms": 2.0, "cpu_ms": 1.9}), json!({"wall_ms": 3.0, "cpu_ms": 1.0})];
+        let values = vec![
+            json!({"wall_ms": 2.0, "cpu_ms": 1.9}),
+            json!({"wall_ms": 3.0, "cpu_ms": 1.0}),
+        ];
         assert_eq!(best(&values)["cpu_ms"], json!(1.9));
     }
 }

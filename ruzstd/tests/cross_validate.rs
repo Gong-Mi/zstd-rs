@@ -107,7 +107,9 @@ fn check_known(name: &str, compressed: &[u8], original: &[u8]) -> Result<(), Str
         .decode_all(compressed, &mut out)
         .map_err(|e| format!("{name}: known decode_all failed: {e:?}"))?;
     if written != original.len() || out != original {
-        return Err(format!("{name}: known decode_all mismatch ({written} bytes)"));
+        return Err(format!(
+            "{name}: known decode_all mismatch ({written} bytes)"
+        ));
     }
     Ok(())
 }
@@ -120,7 +122,9 @@ fn check_single_stream(name: &str, compressed: &[u8], original: &[u8]) -> Result
     dec.read_to_end(&mut out)
         .map_err(|e| format!("{name}: streaming read failed: {e:?}"))?;
     if out != original || !dec.into_inner().is_empty() {
-        return Err(format!("{name}: single-frame streaming mismatch or trailing input"));
+        return Err(format!(
+            "{name}: single-frame streaming mismatch or trailing input"
+        ));
     }
     Ok(())
 }
@@ -317,9 +321,15 @@ fn cross_c_dict() {
         "C encoder must emit the trained dictionary ID",
     );
     let without_dict = zstd::bulk::compress(payload, 1).unwrap();
-    assert!(compressed.len() < without_dict.len(), "dictionary must actually help");
+    assert!(
+        compressed.len() < without_dict.len(),
+        "dictionary must actually help"
+    );
     let mut c_decoder = zstd::bulk::Decompressor::with_dictionary(&dict_bytes).unwrap();
-    assert_eq!(c_decoder.decompress(&compressed, payload.len()).unwrap(), *payload);
+    assert_eq!(
+        c_decoder.decompress(&compressed, payload.len()).unwrap(),
+        *payload
+    );
     assert!(zstd::bulk::decompress(&compressed, payload.len()).is_err());
 
     let mut out = vec![0u8; payload.len()];
@@ -330,7 +340,8 @@ fn cross_c_dict() {
 
     let make_decoder = || {
         let mut dec = FrameDecoder::new();
-        dec.add_dict(Dictionary::decode_dict(&dict_bytes).unwrap()).unwrap();
+        dec.add_dict(Dictionary::decode_dict(&dict_bytes).unwrap())
+            .unwrap();
         dec
     };
     let mut known = make_decoder();
