@@ -460,8 +460,13 @@ mod normalization_tests {
         let table = build_table_from_data(core::iter::repeat(0).take(64), 9, true);
         assert_eq!(table.states[0].states.len(), table.table_size / 2);
         assert_eq!(table.states[1].states.len(), table.table_size / 2);
-        assert!(table.states[2..].iter().all(|symbol| symbol.states.is_empty()));
-        assert!(table.states[0].states.iter().all(|state| state.num_bits > 0));
+        assert!(table.states[2..]
+            .iter()
+            .all(|symbol| symbol.states.is_empty()));
+        assert!(table.states[0]
+            .states
+            .iter()
+            .all(|state| state.num_bits > 0));
         assert_eq!(
             table
                 .states
