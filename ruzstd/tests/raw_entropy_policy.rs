@@ -34,7 +34,10 @@ fn full_byte_alphabet_period_is_not_incompressible() {
     let original: Vec<u8> = (0u8..=255).cycle().take(128 * 1024).collect();
     let compressed = compress_to_vec(original.as_slice(), CompressionLevel::Fastest);
     check_decode(&compressed, &original);
-    assert!(compressed.len() < original.len() / 4, "periodic input stored raw");
+    assert!(
+        compressed.len() < original.len() / 4,
+        "periodic input stored raw"
+    );
 }
 
 #[test]
@@ -47,7 +50,10 @@ fn high_entropy_prefix_does_not_hide_repeated_tail() {
     original.truncate(128 * 1024);
     let compressed = compress_to_vec(original.as_slice(), CompressionLevel::Fastest);
     check_decode(&compressed, &original);
-    assert!(compressed.len() < original.len() / 4, "repeated tail skipped");
+    assert!(
+        compressed.len() < original.len() / 4,
+        "repeated tail skipped"
+    );
 }
 
 #[test]
@@ -56,7 +62,11 @@ fn random_blocks_still_fall_back_without_expansion() {
         let original = random_bytes(size);
         let compressed = compress_to_vec(original.as_slice(), CompressionLevel::Fastest);
         check_decode(&compressed, &original);
-        assert_eq!(first_block_type(&compressed), 0, "random fixture must use raw");
+        assert_eq!(
+            first_block_type(&compressed),
+            0,
+            "random fixture must use raw"
+        );
         assert!(compressed.len() <= original.len() + 32);
     }
 }
