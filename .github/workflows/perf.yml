@@ -156,6 +156,8 @@ jobs:
           REAL: ${{ inputs.real_corpus && 'true' || 'false' }}
         run: |
           python3 tooling/tools/perf/fetch_corpus.py --output-dir "$GITHUB_WORKSPACE/corpus-cache" --enabled "$REAL"
+      - name: Prepare deterministic LZ policy counterexamples
+        run: python3 tooling/tools/perf/policy_corpus.py --output-dir "$GITHUB_WORKSPACE/policy-corpus"
       - name: Run immutable-plan interleaved suites
         env:
           REPS: ${{ steps.refs.outputs.reps }}
@@ -165,7 +167,7 @@ jobs:
         run: |
           set -euo pipefail
           EXTRA=()
-          for file in "$GITHUB_WORKSPACE"/corpus-cache/*.bin; do
+          for file in "$GITHUB_WORKSPACE"/corpus-cache/*.bin "$GITHUB_WORKSPACE"/policy-corpus/*.bin; do
             [ -f "$file" ] || continue
             EXTRA+=(--corpus-file "$file")
           done
@@ -214,3 +216,4 @@ jobs:
             perf-results/
             build-records/
             corpus-cache/status.json
+            policy-corpus/policy-manifest.json
