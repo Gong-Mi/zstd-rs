@@ -159,6 +159,8 @@ pub struct HuffmanTable {
 }
 
 impl HuffmanTable {
+    // Tests/fuzz callers retain this convenience wrapper; literals reuse its histogram.
+    #[allow(dead_code)]
     pub fn build_from_data(data: &[u8]) -> Self {
         let mut counts = [0; 256];
         let mut max = 0;
@@ -252,6 +254,16 @@ impl HuffmanTable {
         table
     }
 
+    /// Exact symbol payload bits, excluding tables, stream markers and headers.
+    pub(crate) fn payload_bit_len(&self, counts: &[usize]) -> usize {
+        debug_assert!(counts.len() <= self.codes.len());
+        self.codes
+            .iter()
+            .zip(counts)
+            .map(|((_, bits), count)| usize::from(*bits) * count)
+            .sum()
+    }
+
     pub fn can_encode(&self, other: &Self) -> Option<usize> {
         if other.codes.len() > self.codes.len() {
             return None;
@@ -264,6 +276,45 @@ impl HuffmanTable {
             sum += other_num_bits.abs_diff(*self_num_bits) as usize;
         }
         Some(sum)
+    }
+}
+
+#[test]
+fn payload_bit_len_matches_encoded_streams() {
+    let inputs = [
+        (0u8..=255).cycle().take(4097).collect::<Vec<_>>(),
+        alloc::vec![0, 0, 0, 7, 7, 255, 0, 7, 255],
+        alloc::vec![4, 9, 4, 9, 4, 9, 4, 9],
+    ];
+    for data in inputs {
+        let table = HuffmanTable::build_from_data(&data);
+        let mut counts = alloc::vec![0usize; table.codes.len()];
+        for &symbol in &data {
+            counts[symbol as usize] += 1;
+        }
+        let payload = table.payload_bit_len(&counts);
+        let per_symbol: usize = data
+            .iter()
+            .map(|symbol| usize::from(table.codes[*symbol as usize].1))
+            .sum();
+        assert_eq!(payload, per_symbol);
+        let mut writer = BitWriter::new();
+        HuffmanEncoder::new(&table, &mut writer).encode(&data, false);
+        assert_eq!(writer.index(), (payload + 1).div_ceil(8) * 8);
+        let mut writer = BitWriter::new();
+        HuffmanEncoder::new(&table, &mut writer).encode4x(&data, false);
+        let chunk_len = data.len().div_ceil(4);
+        let mut expected_bits = 48;
+        for stream in 0..4 {
+            let start = (stream * chunk_len).min(data.len());
+            let end = ((stream + 1) * chunk_len).min(data.len());
+            let bits: usize = data[start..end]
+                .iter()
+                .map(|symbol| usize::from(table.codes[*symbol as usize].1))
+                .sum();
+            expected_bits += (bits + 1).div_ceil(8) * 8;
+        }
+        assert_eq!(writer.index(), expected_bits);
     }
 }
 
