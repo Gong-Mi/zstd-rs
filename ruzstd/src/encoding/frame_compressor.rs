@@ -448,10 +448,8 @@ mod tests {
         block.truncate(128 * 1024);
         let mut original = block.clone();
         original.extend_from_slice(&block);
-        let output = crate::encoding::compress_to_vec(
-            original.as_slice(),
-            super::CompressionLevel::Fastest,
-        );
+        let output =
+            crate::encoding::compress_to_vec(original.as_slice(), super::CompressionLevel::Fastest);
         let (_, header_size) = read_frame_header(output.as_slice()).unwrap();
         let mut cursor = header_size as usize;
         for index in 0..2 {
