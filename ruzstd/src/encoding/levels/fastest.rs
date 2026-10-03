@@ -196,12 +196,18 @@ mod tests {
         assert_eq!((output[second_start] >> 1) & 3, 2);
 
         let decoded = zstd::decode_all(output.as_slice()).unwrap();
-        assert!(decoded == original, "C decoder must reconstruct the original");
+        assert!(
+            decoded == original,
+            "C decoder must reconstruct the original"
+        );
         let mut decoded = Vec::with_capacity(original.len());
         crate::decoding::FrameDecoder::new()
             .decode_all_to_vec(&output, &mut decoded)
             .unwrap();
-        assert!(decoded == original, "Rust decoder must reconstruct the original");
+        assert!(
+            decoded == original,
+            "Rust decoder must reconstruct the original"
+        );
     }
 
     #[test]
@@ -225,7 +231,11 @@ mod tests {
         let second_start = output.len();
         compress_fastest(&mut state, true, second.clone(), &mut output);
         assert_eq!((output[second_start] >> 1) & 3, 2);
-        assert_ne!(state.offset_hist, [1, 4, 8], "compressed block must commit offsets");
+        assert_ne!(
+            state.offset_hist,
+            [1, 4, 8],
+            "compressed block must commit offsets"
+        );
 
         let mut original = first;
         original.extend_from_slice(&second);
