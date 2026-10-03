@@ -238,6 +238,11 @@ pub fn build_table_from_data(
             max_symbol = idx;
         }
     }
+    // Avoiding zero-bit states requires a second symbol to receive probability.
+    // A zero-only alphabet otherwise has no slot for the redistributed mass.
+    if avoid_0_numbit {
+        max_symbol = max_symbol.max(1);
+    }
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
 }
 
@@ -442,4 +447,77 @@ pub(crate) fn default_ll_table() -> FSETable {
 
 pub(crate) fn default_of_table() -> FSETable {
     build_table_from_probabilities(OF_DIST, 5)
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::build_table_from_data;
+    use crate::encoding::{CompressionLevel, FrameCompressor, MatchGeneratorDriver};
+    use alloc::vec::Vec;
+
+    #[test]
+    fn repeated_zero_symbol_has_nonzero_bit_states() {
+        let table = build_table_from_data(core::iter::repeat(0).take(64), 9, true);
+        assert_eq!(table.states[0].states.len(), table.table_size / 2);
+        assert_eq!(table.states[1].states.len(), table.table_size / 2);
+        assert!(table.states[2..].iter().all(|symbol| symbol.states.is_empty()));
+        assert!(table.states[0].states.iter().all(|state| state.num_bits > 0));
+        assert_eq!(
+            table
+                .states
+                .iter()
+                .map(|symbol| symbol.states.len())
+                .sum::<usize>(),
+            table.table_size
+        );
+        let mut writer = crate::bit_io::BitWriter::new();
+        table.write_table(&mut writer);
+        writer.flush();
+        let bytes = writer.dump();
+        let mut decoder = crate::fse::FSETable::new(255);
+        decoder.build_decoder(&bytes, table.acc_log()).unwrap();
+        crate::fse::check_tables(&decoder, &table);
+    }
+
+    #[test]
+    fn singleton_alphabets_match_serialized_decoder_tables() {
+        for symbol in 0u8..=255 {
+            for avoid_zero_bits in [false, true] {
+                let data = core::iter::repeat(symbol).take(64);
+                let table = build_table_from_data(data, 9, avoid_zero_bits);
+                let states = &table.states[symbol as usize].states;
+                assert!(!states.is_empty());
+                if avoid_zero_bits {
+                    assert!(states.iter().all(|state| state.num_bits > 0));
+                } else if symbol == 0 {
+                    assert!(table.states[1].states.is_empty());
+                    assert!(states.iter().all(|state| state.num_bits == 0));
+                }
+                let mut writer = crate::bit_io::BitWriter::new();
+                table.write_table(&mut writer);
+                writer.flush();
+                let bytes = writer.dump();
+                let mut decoder = crate::fse::FSETable::new(255);
+                decoder.build_decoder(&bytes, table.acc_log()).unwrap();
+                crate::fse::check_tables(&decoder, &table);
+            }
+        }
+    }
+
+    #[test]
+    fn zero_literal_length_cross_block_frame_roundtrips() {
+        let original = b"abcdefgh".repeat(32768);
+        let matcher = MatchGeneratorDriver::new(128 * 1024, 4);
+        let mut compressor = FrameCompressor::new_with_matcher(matcher, CompressionLevel::Fastest);
+        compressor.set_source(original.as_slice());
+        compressor.set_drain(Vec::new());
+        compressor.compress();
+        let output = compressor.take_drain().unwrap();
+        assert_eq!(zstd::decode_all(output.as_slice()).unwrap(), original);
+        let mut decoded = Vec::with_capacity(original.len());
+        crate::decoding::FrameDecoder::new()
+            .decode_all_to_vec(&output, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, original);
+    }
 }
