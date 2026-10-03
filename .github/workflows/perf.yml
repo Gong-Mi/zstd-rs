@@ -115,25 +115,98 @@ jobs:
           cp -R tooling/tools/perf/harness/. head/tools/perf/harness/
           rustc -vV > build-records/rustc.txt
           cargo -V > build-records/cargo.txt
-          cc --version > build-records/cc.txt
           git -C base rev-parse HEAD > build-records/base-source.txt
           git -C head rev-parse HEAD > build-records/head-source.txt
           git -C tooling rev-parse HEAD > build-records/tooling-source.txt
           diff -r base/tools/perf/harness head/tools/perf/harness
+      - name: Pick a C compiler matching rustc's LLVM for the C reference
+        id: ccpick
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          have() { command -v "$1" >/dev/null 2>&1; }
+          want_major=$(rustc -vV | sed -n 's/^LLVM version: \([0-9]*\).*/\1/p')
+          echo "rustc bundled LLVM major: ${want_major:-unknown}"
+          # 1) 已在镜像里：优先与 rustc 同代的 clang
+          CC_PICK=""
+          if [ -n "${want_major:-}" ]; then
+            have "clang-$want_major" && CC_PICK="clang-$want_major"
+          fi
+          if [ -z "$CC_PICK" ]; then
+            for c in clang-23 clang-22 clang-21 clang; do
+              if have "$c"; then CC_PICK="$c"; break; fi
+            done
+          fi
+          # 2) 没有就装与 rustc 同代的（apt.llvm.org），失败再退系统 clang
+          if [ -z "$CC_PICK" ] && [ -n "${want_major:-}" ]; then
+            codename=$(. /etc/os-release 2>/dev/null && echo "$VERSION_CODENAME")
+            if curl -fsSL --max-time 60 https://apt.llvm.org/llvm-snapshot.gpg.key \
+                 | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg 2>/dev/null \
+               && echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${want_major} main" \
+                 | sudo tee /etc/apt/sources.list.d/llvm${want_major}.list >/dev/null; then
+              sudo apt-get update -qq || true
+              sudo apt-get install -y -qq "clang-${want_major}" || true
+              have "clang-${want_major}" && CC_PICK="clang-${want_major}"
+            fi
+          fi
+          # 3) 最后退回系统 clang / cc（要在记录里如实登记）
+          [ -n "$CC_PICK" ] || { have clang && CC_PICK=clang; }
+          : "${CC_PICK:=cc}"
+          CXX_PICK="${CC_PICK/clang/clang++}"
+          have "$CXX_PICK" || CXX_PICK="$CC_PICK"
+          {
+            echo "CC=$CC_PICK"
+            echo "CXX=$CXX_PICK"
+          } >> "$GITHUB_ENV"
+          echo "cc=$CC_PICK" >> "$GITHUB_OUTPUT"
+          {
+            echo "=== compiler for C reference: $CC_PICK ==="
+            "$CC_PICK" --version | head -2 || true
+            echo "=== rustc ==="
+            rustc -vV
+          } > build-records/cc.txt
+          echo "C reference compiler: $CC_PICK"
       - name: Cache measurement dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             base/tools/perf/harness -> ../../../../targets/base
             head/tools/perf/harness -> ../../../../targets/head
+          # 编译器进 key：换 C 编译器必须让 zstd-sys 重新构建，不能复用旧 .a
+          key: ccompiler-${{ steps.ccpick.outputs.cc }}
       - name: Build both locked release binaries
         run: |
           set -euo pipefail
+          echo "CC=$CC CXX=$CXX" >> build-records/cc.txt
           (cd base/tools/perf/harness && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/targets/base" cargo build --locked --release) > build-records/base.log 2>&1
           (cd head/tools/perf/harness && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/targets/head" cargo build --locked --release) > build-records/head.log 2>&1
           cp targets/base/release/ruzstd-perf-harness bins/base
           cp targets/head/release/ruzstd-perf-harness bins/head
           sha256sum bins/base bins/head > build-records/binaries.sha256
+      - name: Assert the C reference carries no hand-written assembly
+        run: |
+          set -uo pipefail
+          {
+            echo "=== C reference static libs ==="
+          } > build-records/c-asm.txt
+          status=0
+          for side in base head; do
+            lib=$(find "targets/$side" -name "libzstd.a" -path "*zstd-sys*" | head -1)
+            if [ -z "$lib" ]; then
+              echo "$side: libzstd.a NOT FOUND" | tee -a build-records/c-asm.txt
+              status=1
+              continue
+            fi
+            hits=$(nm "$lib" 2>/dev/null | grep -c "fast_asm_loop")
+            echo "$side: $(basename "$lib") asm_symbols=$hits" | tee -a build-records/c-asm.txt
+            [ "$hits" = "0" ] || status=1
+          done
+          if [ "$status" = "0" ]; then
+            echo "PASS: C reference contains no huf_decompress*_fast_asm_loop" | tee -a build-records/c-asm.txt
+          else
+            echo "FAIL: hand-written assembly is present in the C reference" | tee -a build-records/c-asm.txt
+            exit 1
+          fi
       - name: Optional tuned binary, with explicit build status
         env:
           CONFIG: ${{ inputs.config_leg && 'true' || 'false' }}
