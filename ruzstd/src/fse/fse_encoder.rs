@@ -130,6 +130,23 @@ pub struct FSETable {
 }
 
 impl FSETable {
+    /// 本表是否覆盖 `present` 里置位的全部符号（符号值 < 64）。
+    ///
+    /// 复用上一张表的正确性前提：本块出现的每个符号在表里都有一条状态转移，
+    /// 否则解码端会拿到空切片（历史上正是这样 panic 的）。所以复用前必须逐符号
+    /// 验证覆盖性，覆盖不满足就重建。
+    pub(crate) fn covers_present(&self, present: u64) -> bool {
+        let mut bits = present;
+        while bits != 0 {
+            let sym = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            if self.states[sym].states.is_empty() {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(crate) fn next_state(&self, symbol: u8, idx: usize) -> &State {
         let states = &self.states[symbol as usize];
         states.get(idx, self.table_size)
