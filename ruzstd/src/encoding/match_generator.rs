@@ -207,7 +207,11 @@ impl SuffixStore {
         };
         const PRIME: u64 = 0x9E37_79B9_7F4A_7C15;
         let mixed = v.wrapping_mul(PRIME);
-        ((mixed >> (64 - self.len_log)) as usize) % self.slots.len()
+        // `x >> (64 - len_log)` 恒 < 2^len_log <= slots.len()（len_log = capacity.ilog2()），
+        // 所以原先这里的 `% self.slots.len()` 是恒等变换：LLVM 看不到 ilog2 与 len 的关系，
+        // 于是每个位置都生成一次 64 位取模（aarch64: udiv + msub + 除零检查；cortex-x4 静态
+        // 模型里单条 udiv 占 20 个吞吐周期），而结果永远不变。删掉它逐字节等价。
+        (mixed >> (64 - self.len_log)) as usize
     }
 }
 
