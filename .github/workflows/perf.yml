@@ -202,6 +202,7 @@ jobs:
             fi
             count=$(nm "$lib" 2>/dev/null | { grep -c "fast_asm_loop" || true; })
             hits=${count:-0}
+            echo "$side: $(basename "$lib") asm_symbols=$hits" | tee -a build-records/c-asm.txt
             if [ "$hits" != "0" ]; then
               echo "$side: hand-written assembly present in C reference" | tee -a build-records/c-asm.txt
               status=1
