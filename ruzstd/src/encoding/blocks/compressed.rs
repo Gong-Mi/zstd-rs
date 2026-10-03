@@ -8,8 +8,40 @@ use crate::{
     huff0::huff0_encoder,
 };
 
-/// A block of [`crate::common::BlockType::Compressed`]
-pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
+/// Entropy tables built by a trial block, committed only when it is emitted.
+#[must_use = "commit updates only when the compressed block is emitted"]
+#[derive(Default)]
+pub(crate) struct EntropyUpdates {
+    huffman: Option<huff0_encoder::HuffmanTable>,
+    ll: Option<FSETable>,
+    ml: Option<FSETable>,
+    of: Option<FSETable>,
+}
+
+impl EntropyUpdates {
+    pub(crate) fn commit<M: Matcher>(self, state: &mut CompressState<M>) {
+        if let Some(table) = self.huffman {
+            state.last_huff_table = Some(table);
+        }
+        if let Some(table) = self.ll {
+            state.fse_tables.ll_previous = Some(table);
+        }
+        if let Some(table) = self.ml {
+            state.fse_tables.ml_previous = Some(table);
+        }
+        if let Some(table) = self.of {
+            state.fse_tables.of_previous = Some(table);
+        }
+    }
+}
+
+/// A block of [`crate::common::BlockType::Compressed`].
+/// The returned table updates must be discarded if the caller emits raw instead.
+pub(crate) fn compress_block<M: Matcher>(
+    state: &mut CompressState<M>,
+    output: &mut Vec<u8>,
+) -> EntropyUpdates {
+    let mut updates = EntropyUpdates::default();
     let mut literals_vec = Vec::new();
     let mut sequences = Vec::new();
     state.matcher.start_matching(|seq| {
@@ -37,7 +69,7 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         if let Some(table) =
             compress_literals(&literals_vec, state.last_huff_table.as_ref(), &mut writer)
         {
-            state.last_huff_table.replace(table);
+            updates.huffman = Some(table);
         }
     } else {
         raw_literals(&literals_vec, &mut writer);
@@ -102,16 +134,17 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         );
 
         if let FseTableMode::Encoded(table) = ll_mode {
-            state.fse_tables.ll_previous = Some(table)
+            updates.ll = Some(table)
         }
         if let FseTableMode::Encoded(table) = ml_mode {
-            state.fse_tables.ml_previous = Some(table)
+            updates.ml = Some(table)
         }
         if let FseTableMode::Encoded(table) = of_mode {
-            state.fse_tables.of_previous = Some(table)
+            updates.of = Some(table)
         }
     }
     writer.flush();
+    updates
 }
 
 #[derive(Clone)]
