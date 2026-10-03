@@ -132,6 +132,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
         self.state.last_huff_table = None;
+        // Repeat-mode tables belong to a frame, not to the reusable compressor.
+        self.state.fse_tables.ll_previous = None;
+        self.state.fse_tables.ml_previous = None;
+        self.state.fse_tables.of_previous = None;
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
@@ -365,6 +369,125 @@ mod tests {
         let mut decoded = Vec::new();
         zstd::stream::copy_decode(output.as_slice(), &mut decoded).unwrap();
         assert_eq!(mock_data, decoded);
+    }
+
+    fn reused_compressed_frames(mut check: impl FnMut(&[u8], &[u8])) {
+        let first = b"the quick brown fox jumps over the lazy dog 0123456789 ".repeat(900);
+        let changed = b"another payload with different symbols and lengths 9876543210 ".repeat(800);
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        for data in [&first, &first, &changed, &first] {
+            compressor.set_source(data.as_slice());
+            compressor.set_drain(Vec::new());
+            compressor.compress();
+            let output = compressor.take_drain().unwrap();
+            assert!(compressor.state.fse_tables.ll_previous.is_some());
+            assert!(compressor.state.fse_tables.ml_previous.is_some());
+            assert!(compressor.state.fse_tables.of_previous.is_some());
+            check(&output, data);
+        }
+    }
+
+    #[test]
+    fn reused_fastest_frames_decode_independently_c() {
+        reused_compressed_frames(|output, original| {
+            let decoded = zstd::decode_all(output).unwrap();
+            assert_eq!(decoded, original);
+        });
+    }
+
+    #[test]
+    fn reused_fastest_frames_decode_independently_rust() {
+        reused_compressed_frames(|output, original| {
+            let mut decoded = Vec::with_capacity(original.len());
+            FrameDecoder::new()
+                .decode_all_to_vec(output, &mut decoded)
+                .unwrap();
+            assert_eq!(decoded, original);
+        });
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn reused_fastest_frames_decode_independently_stream() {
+        use std::io::Read;
+        reused_compressed_frames(|output, original| {
+            let mut decoder = crate::decoding::StreamingDecoder::new(output).unwrap();
+            let mut decoded = Vec::new();
+            decoder.read_to_end(&mut decoded).unwrap();
+            assert_eq!(decoded, original);
+        });
+    }
+
+    #[test]
+    fn empty_frame_clears_fse_history() {
+        let data = b"the quick brown fox jumps over the lazy dog 0123456789 ".repeat(900);
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor.set_source(data.as_slice());
+        compressor.set_drain(Vec::new());
+        compressor.compress();
+        assert!(compressor.state.fse_tables.ll_previous.is_some());
+        assert!(compressor.state.fse_tables.ml_previous.is_some());
+        assert!(compressor.state.fse_tables.of_previous.is_some());
+        compressor.set_source(&[]);
+        compressor.set_drain(Vec::new());
+        compressor.compress();
+        assert!(compressor.state.fse_tables.ll_previous.is_none());
+        assert!(compressor.state.fse_tables.ml_previous.is_none());
+        assert!(compressor.state.fse_tables.of_previous.is_none());
+        let output = compressor.take_drain().unwrap();
+        assert!(zstd::decode_all(output.as_slice()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fse_repeat_remains_available_inside_one_frame() {
+        use crate::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
+        use crate::blocks::sequence_section::{ModeType, SequencesHeader};
+        use crate::decoding::frame::read_frame_header;
+
+        let mut block = b"the quick brown fox jumps over the lazy dog 0123456789 ".repeat(2500);
+        block.truncate(128 * 1024);
+        let mut original = block.clone();
+        original.extend_from_slice(&block);
+        let output = crate::encoding::compress_to_vec(
+            original.as_slice(),
+            super::CompressionLevel::Fastest,
+        );
+        let (_, header_size) = read_frame_header(output.as_slice()).unwrap();
+        let mut cursor = header_size as usize;
+        for index in 0..2 {
+            let bytes = [output[cursor], output[cursor + 1], output[cursor + 2], 0];
+            let header = u32::from_le_bytes(bytes);
+            assert_eq!((header >> 1) & 3, 2, "fixture must emit compressed blocks");
+            let end = cursor + 3 + (header >> 3) as usize;
+            let content = &output[cursor + 3..end];
+            let mut literals = LiteralsSection::new();
+            let literal_header_size = literals.parse_from_header(content).unwrap() as usize;
+            let literal_size = match literals.ls_type {
+                LiteralsSectionType::Raw => literals.regenerated_size as usize,
+                LiteralsSectionType::RLE => 1,
+                _ => literals.compressed_size.unwrap() as usize,
+            };
+            let mut sequences = SequencesHeader::new();
+            sequences
+                .parse_from_header(&content[literal_header_size + literal_size..])
+                .unwrap();
+            assert!(sequences.num_sequences > 0);
+            let modes = sequences.modes.unwrap();
+            for mode in [modes.ll_mode(), modes.ml_mode(), modes.of_mode()] {
+                if index == 0 {
+                    assert!(matches!(mode, ModeType::FSECompressed));
+                } else {
+                    assert!(matches!(mode, ModeType::Repeat));
+                }
+            }
+            cursor = end;
+        }
+        assert_eq!(zstd::decode_all(output.as_slice()).unwrap(), original);
+        let mut decoded = Vec::with_capacity(original.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(&output, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, original);
     }
 
     #[cfg(feature = "hash")]
