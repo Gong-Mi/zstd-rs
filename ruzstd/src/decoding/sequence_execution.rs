@@ -193,13 +193,19 @@ pub fn decode_and_execute_sequences(
         seq_sum += rest_literals.len() as u32;
     }
 
-    let diff = buffer.len() - old_buffer_size;
-    assert!(
-        seq_sum as usize == diff,
-        "Seq_sum: {} is different from the difference in buffersize: {}",
-        seq_sum,
-        diff
-    );
+    // An exhausted direct target retains only its physical prefix. All
+    // sequence/literal/bitstream validation above must still run; decode_all
+    // maps the latched overflow to TargetTooSmall and unbinds the target.
+    // Keep the integrity assertion for streaming and sufficient-capacity output.
+    if !buffer.direct_overflowed() {
+        let diff = buffer.len() - old_buffer_size;
+        assert!(
+            seq_sum as usize == diff,
+            "Seq_sum: {} is different from the difference in buffersize: {}",
+            seq_sum,
+            diff
+        );
+    }
     Ok(())
 }
 
