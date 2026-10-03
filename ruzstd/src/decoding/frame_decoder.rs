@@ -358,6 +358,13 @@ impl FrameDecoder {
                 break;
             }
 
+            // A direct target cannot make further output progress once full.
+            // Finish validating the current block (and its final checksum
+            // read) before returning to decode_all's TargetTooSmall mapping.
+            if state.decoder_scratch.buffer.direct_overflowed() {
+                break;
+            }
+
             match strat {
                 BlockDecodingStrategy::All => { /* keep going */ }
                 BlockDecodingStrategy::UptoBlocks(n) => {

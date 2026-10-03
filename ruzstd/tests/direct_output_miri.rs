@@ -182,8 +182,7 @@ fn concatenated_frames_skip_before_between_and_after() {
     let mut decoder = FrameDecoder::new();
     check_success(&mut decoder, &input, &expected);
 
-    // Finish on a raw block so the short-output Result contract is exercised,
-    // independently of the compressed-short panic characterized below.
+    // Finish on a raw block to exercise capacity exhaustion in a later frame.
     let short_input = [&input[..], RAW].concat();
     let capacity = expected.len() + RAW_PLAIN.len() - 1;
     let mut storage = vec![SENTINEL; GUARD + capacity + GUARD];
@@ -198,54 +197,52 @@ fn concatenated_frames_skip_before_between_and_after() {
     check_success(&mut decoder, &input, &expected);
 }
 
-/// Characterization of a pre-existing production limitation, NOT an error
-/// contract fix: undersized compressed direct output hits the unconditional
-/// Seq_sum assertion in sequence_execution.rs (debug AND release). Buffer
-/// guards and safe decoder reuse after unwinding are still required under Miri.
-/// This must remain visible in PR acceptance boundaries; it is not evidence
-/// that every compressed short buffer returns TargetTooSmall.
+/// Compressed output exhaustion is a Result error, not a Seq_sum panic.
+/// Exercise every short capacity, including literals that do not fit even
+/// though a later match would fit in the unchanged physical output buffer.
 #[test]
-fn known_limitation_compressed_short_output_panics_without_overwriting_guards() {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-
-    fn assert_known_panic(result: std::thread::Result<Result<usize, FrameDecoderError>>) {
-        let panic = result.expect_err("compressed short output currently panics");
-        let message = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap_or("");
-        assert!(
-            message.starts_with("Seq_sum:"),
-            "unexpected panic: {}",
-            message
-        );
-    }
-
+fn compressed_short_output_preserves_guards_vec_and_decoder_reuse() {
     let mut decoder = FrameDecoder::new();
-    for (frame, expected) in [(OVERLAP, OVERLAP_PLAIN), (NONOVERLAP, NONOVERLAP_PLAIN)] {
-        for capacity in [0, expected.len() - 1] {
+    // A non-final compressed block followed by two raw blocks: exhaustion
+    // must not continue using the physical prefix as output progress/history.
+    let mut multiblock = OVERLAP.to_vec();
+    multiblock[5] += (2 * RAW_PLAIN.len()) as u8;
+    multiblock[6] &= !1;
+    let raw_header = multiblock.len();
+    multiblock.extend_from_slice(&RAW[6..]);
+    multiblock[raw_header] &= !1;
+    multiblock.extend_from_slice(&RAW[6..]);
+    let multiblock_plain = [OVERLAP_PLAIN, RAW_PLAIN, RAW_PLAIN].concat();
+    for (frame, expected) in [
+        (OVERLAP, OVERLAP_PLAIN),
+        (NONOVERLAP, NONOVERLAP_PLAIN),
+        (&multiblock[..], &multiblock_plain[..]),
+    ] {
+        for capacity in 0..expected.len() {
             let mut storage = vec![SENTINEL; GUARD + capacity + GUARD];
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                decoder.decode_all(frame, &mut storage[GUARD..GUARD + capacity])
-            }));
-            assert_known_panic(result);
+            let result = decoder.decode_all(frame, &mut storage[GUARD..GUARD + capacity]);
+            assert!(
+                matches!(result, Err(FrameDecoderError::TargetTooSmall)),
+                "capacity {}: {:?}",
+                capacity,
+                result
+            );
             assert_guards(&storage, capacity);
             drop(storage);
             check_success(&mut decoder, frame, expected);
 
             let mut out = output_vec(capacity);
             let allocation = out.as_ptr();
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                decoder
-                    .decode_all_to_vec(frame, &mut out)
-                    .map(|()| out.len())
-            }));
-            assert_known_panic(result);
-            // Panics do not promise Result-error length rollback: the decoder
-            // may already have zero-initialized/extended the live output.
-            assert_eq!(&out[..PREFIX.len()], PREFIX);
-            assert!(out.len() <= out.capacity());
+            let original_capacity = out.capacity();
+            let result = decoder.decode_all_to_vec(frame, &mut out);
+            assert!(
+                matches!(result, Err(FrameDecoderError::TargetTooSmall)),
+                "capacity {}: {:?}",
+                capacity,
+                result
+            );
+            assert_eq!(out, PREFIX, "length and live prefix must survive error");
+            assert_eq!(out.capacity(), original_capacity);
             assert_eq!(out.as_ptr(), allocation);
             drop(out);
             check_success(&mut decoder, frame, expected);
@@ -255,7 +252,73 @@ fn known_limitation_compressed_short_output_panics_without_overwriting_guards() 
 
 #[test]
 fn truncated_block_and_skip_errors_do_not_poison_decoder() {
+    use ruzstd::decoding::errors::{
+        DecodeBlockContentError, DecodeBufferError, DecodeSequenceError, DecompressBlockError,
+        ExecuteSequencesError,
+    };
+
     let mut decoder = FrameDecoder::new();
+    // Extra sequence bits are detected after literals/matches have attempted
+    // output. Capacity exhaustion must not replace that corruption error.
+    let mut extra_bits = OVERLAP.to_vec();
+    extra_bits[6] += 8; // One additional byte in the compressed block body.
+    extra_bits.insert(16, 0);
+    // RFC-style raw literals + one RLE-coded sequence: ll=1, ml=3,
+    // offset=(1<<3)-3=5, but only one byte of history and no dictionary.
+    let invalid_offset = [
+        0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x04, 0x45, 0, 0, 0x08, b'a', 1, 0x54, 1, 3, 0, 0x08,
+    ];
+    for (frame, is_extra_bits) in [(&extra_bits[..], true), (&invalid_offset[..], false)] {
+        for capacity in [0, OVERLAP_PLAIN.len()] {
+            let assert_error = |result| {
+                let error = match result {
+                    Err(FrameDecoderError::FailedToReadBlockBody(
+                        DecodeBlockContentError::DecompressBlockError(error),
+                    )) => error,
+                    other => panic!("corruption must precede TargetTooSmall: {:?}", other),
+                };
+                if is_extra_bits {
+                    assert!(matches!(
+                        error,
+                        DecompressBlockError::DecodeSequenceError(DecodeSequenceError::ExtraBits {
+                            bits_remaining: 8
+                        })
+                    ));
+                } else {
+                    assert!(matches!(
+                        error,
+                        DecompressBlockError::ExecuteSequencesError(
+                            ExecuteSequencesError::DecodebufferError(
+                                DecodeBufferError::NotEnoughBytesInDictionary { got: 0, need: 4 }
+                            )
+                        )
+                    ));
+                }
+            };
+            let mut storage = vec![SENTINEL; GUARD + capacity + GUARD];
+            assert_error(decoder.decode_all(frame, &mut storage[GUARD..GUARD + capacity]));
+            assert_guards(&storage, capacity);
+            drop(storage);
+            let mut out = output_vec(capacity);
+            let allocation = out.as_ptr();
+            let original_capacity = out.capacity();
+            assert_error(decoder.decode_all_to_vec(frame, &mut out).map(|()| 0));
+            assert_eq!(out, PREFIX);
+            assert_eq!(out.as_ptr(), allocation);
+            assert_eq!(out.capacity(), original_capacity);
+            drop(out);
+            check_success(&mut decoder, OVERLAP, OVERLAP_PLAIN);
+        }
+    }
+
+    // A checksum read error remains visible after compressed output overflow.
+    let mut missing_checksum = OVERLAP.to_vec();
+    missing_checksum[4] |= 4;
+    assert!(matches!(
+        decoder.decode_all(&missing_checksum, &mut []),
+        Err(FrameDecoderError::FailedToReadChecksum(_))
+    ));
+    check_success(&mut decoder, OVERLAP, OVERLAP_PLAIN);
     for (frame, expected) in cases() {
         let truncated = &frame[..frame.len() - 1];
         let capacity = expected.len();
