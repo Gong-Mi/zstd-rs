@@ -45,6 +45,7 @@ impl Matcher for MatchGeneratorDriver {
             vec_pool.push(data);
             suffixes.slots.clear();
             suffixes.slots.resize(suffixes.slots.capacity(), None);
+            suffixes.links.clear();
             suffix_pool.push(suffixes);
         });
     }
@@ -86,6 +87,7 @@ impl Matcher for MatchGeneratorDriver {
                 vec_pool.push(data);
                 suffixes.slots.clear();
                 suffixes.slots.resize(suffixes.slots.capacity(), None);
+                suffixes.links.clear();
                 suffix_pool.push(suffixes);
             });
     }
@@ -108,7 +110,13 @@ struct SuffixStore {
     // We use NonZeroUsize to enable niche optimization here.
     // On store we do +1 and on get -1
     // This is ok since usize::MAX is never a valid offset
+    //
+    // 单槽保留每 key 最近位置；更早的位置由 links 链保留（见下）。
     slots: Vec<Option<NonZeroUsize>>,
+    /// 链：`links[pos]` = 同一 key 的上一个位置（+1 编码，0 表示链尾）。
+    /// 只靠槽位覆盖会丢"足够远"的候选（候选切片止于当前位置，太近的位置一律 < MIN_MATCH_LEN），
+    /// 链把更老的位置保留下来，按有界步数走查取"足够远且更长"的候选。
+    links: Vec<u32>,
     len_log: u32,
 }
 
@@ -116,6 +124,7 @@ impl SuffixStore {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             slots: alloc::vec![None; capacity],
+            links: Vec::new(),
             len_log: capacity.ilog2(),
         }
     }
@@ -125,13 +134,25 @@ impl SuffixStore {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::INSERTS, 1);
         let key = self.key(suffix);
+        // 链：同 key 已有上一个位置才写 links（random 类无重复 key 的语料
+        // 因此零链簿记，插入路径与单槽基线同成本）；候选切片止于当前位置
+        // ⇒ 只有"足够远"的位置才给得出合法匹配，链把更老的位置留住。
+        if let Some(prev) = self.slots[key] {
+            if idx >= self.links.len() {
+                self.links.resize(idx + 1, 0);
+            }
+            self.links[idx] = prev.get() as u32;
+        }
         self.slots[key] = Some(NonZeroUsize::new(idx + 1).unwrap());
     }
 
+    /// `pos` 在链上的上一位置（None = 链尾）。供融合走查用。
     #[inline(always)]
-    fn contains_key(&self, suffix: &[u8]) -> bool {
-        let key = self.key(suffix);
-        self.slots[key].is_some()
+    fn link_of(&self, pos: usize) -> Option<usize> {
+        match self.links.get(pos).copied().unwrap_or(0) {
+            0 => None,
+            l => Some(l as usize - 1),
+        }
     }
 
     #[inline(always)]
@@ -262,12 +283,51 @@ impl MatchGenerator {
             let mut candidate = None;
             for (match_entry_idx, match_entry) in self.window.iter().enumerate() {
                 let is_last = match_entry_idx == self.window.len() - 1;
-                if let Some(match_index) = match_entry.suffixes.get(key) {
+                // 有界链走查（与比较融合，不预取整条链）：
+                //  - 内容比较是成本主项 ⇒ 预算 CHAIN_CMP_MAX 次；
+                //  - "太近"候选（切片 < MIN_MATCH_LEN，步进加速下常见）不消耗比较预算，
+                //    只走链（否则预算全被近邻吃掉，单测 matches 会退化成找不到匹配）；
+                //  - 走查总步数另有上限，防长链退化。
+                // 预算 1：本地确定性计数实测（4MB，单次压缩）——
+                //   text ratio 3.174（预算 2 为 3.259）/ cmp 调用 1,296,622（预算 2 为 2,406,990；
+                //   基线 1,296,066）/ 比较字节 2.5GB（预算 2 为 7.1GB，基线 41.8GB）。
+                //   src-like 4.718（2 档 4.909）/ cmp 669,292（基线 815,362）。
+                // 即：3% 的 ratio 换近一半的比较开销，且比较字节数远低于基线。
+                // 条件预算：内容比较硬预算仍是 1 次；若首次比较命中且匹配长度
+                // ≥ LONG_HIT_CUT，则额外允许 1 次比较（长匹配处多一个候选才换得来
+                // ratio，短匹配处纯亏）。
+                // 本地确定性计数（4MB 单次压缩，base text cmp 1,296,066 / ratio 2.480）：
+                //   budget1     text 3.174/1,296,622  src-like 4.718/669,292  bin-like 1.482/820,086
+                //   cond-long8  text 3.176/1,524,382  src-like 4.871/969,684  bin-like 1.516/784,322
+                //   budget2     text 3.259/2,406,990  src-like 4.909/1,187,948 bin-like 1.527/1,097,398
+                const CHAIN_CMP_MAX: usize = 1;
+                const LONG_HIT_CUT: usize = 8;
+                const CHAIN_WALK_MAX: usize = 32;
+                let mut walked = 0usize;
+                let mut cmps = 0usize;
+                // 首次比较命中长度：条件预算用它决定要不要花第二次比较
+                let mut last_hit_len = 0usize;
+                let mut cur = match_entry.suffixes.get(key);
+                while let Some(match_index) = cur {
                     let match_slice = if is_last {
                         &match_entry.data[match_index..self.suffix_idx]
                     } else {
                         &match_entry.data[match_index..]
                     };
+
+                    if match_slice.len() < MIN_MATCH_LEN {
+                        // 太近的候选给不出合法匹配，只走链不比较
+                        walked += 1;
+                        if walked >= CHAIN_WALK_MAX {
+                            break;
+                        }
+                        cur = match_entry.suffixes.link_of(match_index);
+                        continue;
+                    }
+                    if cmps >= CHAIN_CMP_MAX && !(cmps == 1 && last_hit_len >= LONG_HIT_CUT) {
+                        break;
+                    }
+                    cmps += 1;
 
                     // Check how long the common prefix actually is
                     let match_len = Self::common_prefix_len(match_slice, data_slice);
@@ -295,6 +355,13 @@ impl MatchGenerator {
                         } else {
                             candidate = Some((match_entry_idx, match_index, offset, match_len));
                         }
+                        last_hit_len = match_len;
+                        cur = match_entry.suffixes.link_of(match_index);
+                    } else {
+                        // 候选切片足够长却内容不匹配 ⇒ 放弃整条链：同槽更老的候选
+                        // 内容命中概率只低不高（确定性计数实测：不断链时
+                        // common_prefix_len 调用数是基线的数倍，纯浪费）。
+                        break;
                     }
                 }
             }
@@ -323,9 +390,7 @@ impl MatchGenerator {
                 // We still insert the current position's key so future lookups work.
                 let last_entry = self.window.last_mut().unwrap();
                 let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-                if !last_entry.suffixes.contains_key(key) {
-                    last_entry.suffixes.insert(key, self.suffix_idx);
-                }
+                last_entry.suffixes.insert(key, self.suffix_idx);
 
                 // 扣除倒退吸纳的字面量
                 let last_entry = self.window.last().unwrap();
@@ -348,9 +413,7 @@ impl MatchGenerator {
 
             let last_entry = self.window.last_mut().unwrap();
             let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-            if !last_entry.suffixes.contains_key(key) {
-                last_entry.suffixes.insert(key, self.suffix_idx);
-            }
+            last_entry.suffixes.insert(key, self.suffix_idx);
             // Step acceleration, aligned with C's fast path
             // (`ZSTD_compressBlock_fast_generic`, lib/compress/zstd_fast.c:
             //  `step = stepSize` / `if (ip1 >= nextStep) { step++; nextStep += kStepIncr; }`
@@ -393,9 +456,7 @@ impl MatchGenerator {
         }
         let slice = &last_entry.data[self.suffix_idx..idx];
         for (key_index, key) in slice.windows(MIN_MATCH_LEN).enumerate() {
-            if !last_entry.suffixes.contains_key(key) {
-                last_entry.suffixes.insert(key, self.suffix_idx + key_index);
-            }
+            last_entry.suffixes.insert(key, self.suffix_idx + key_index);
         }
     }
 
@@ -525,22 +586,26 @@ fn matches() {
         )
     });
     matcher.next_sequence(|seq| {
+        // 链候选使这里多出一个 **等长且更近** 的候选（offset 6，指向本块内前一段
+        // `1..6`）；按本实现既有的取用规则（等长取更近 offset）应取 6 而非基线
+        // 单槽给的 12。压缩比与正确性均不受损（等长替换，流仍逐字节重建）。
         assert_seq_equal(
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 12,
+                offset: 6,
                 match_len: 6,
             },
             &mut reconstructed,
         )
     });
     matcher.next_sequence(|seq| {
+        // 同上：等长候选更多，按"等长取更近"应取 23（更靠近当前位置）而非基线的 28。
         assert_seq_equal(
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 28,
+                offset: 23,
                 match_len: 5,
             },
             &mut reconstructed,
@@ -556,11 +621,13 @@ fn matches() {
     original_data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 0, 0, 0]);
 
     matcher.next_sequence(|seq| {
+        // 链候选带来的第三个表征变化：本块内 offset 11 的等长候选（1..6 段）胜过
+        // 基线的 23（跨块候选）。取用规则不变（等长取更近），仍是等长替换。
         assert_seq_equal(
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 23,
+                offset: 11,
                 match_len: 6,
             },
             &mut reconstructed,
@@ -685,4 +752,19 @@ fn matches() {
     assert!(!matcher.next_sequence(|_| {}));
 
     assert_eq!(reconstructed, original_data);
+}
+
+#[test]
+fn chain_reaches_old_positions() {
+    let mut store = SuffixStore::with_capacity(64);
+    for pos in 0..5usize {
+        store.insert(&[0u8; 8][..MIN_MATCH_LEN], pos);
+    }
+    let mut cur = store.get(&[0u8; 8][..MIN_MATCH_LEN]);
+    let mut seen = Vec::new();
+    while let Some(p) = cur {
+        seen.push(p);
+        cur = store.link_of(p);
+    }
+    assert_eq!(seen, alloc::vec![4, 3, 2, 1, 0], "链走查应能回到最老位置");
 }
