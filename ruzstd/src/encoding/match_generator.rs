@@ -300,7 +300,7 @@ impl MatchGenerator {
                 //   budget1     text 3.174/1,296,622  src-like 4.718/669,292  bin-like 1.482/820,086
                 //   cond-long8  text 3.176/1,524,382  src-like 4.871/969,684  bin-like 1.516/784,322
                 //   budget2     text 3.259/2,406,990  src-like 4.909/1,187,948 bin-like 1.527/1,097,398
-                const CHAIN_CMP_MAX: usize = 1;
+                const CHAIN_CMP_MAX: usize = 2;
                 const LONG_HIT_CUT: usize = 8;
                 const CHAIN_WALK_MAX: usize = 32;
                 let mut walked = 0usize;
