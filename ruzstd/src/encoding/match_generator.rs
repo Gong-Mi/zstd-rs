@@ -189,7 +189,8 @@ pub(crate) struct MatchGenerator {
     concat_window: Vec<u8>,
     /// Index in the last slice that we already processed
     suffix_idx: usize,
-    miss_count: usize,
+    /// 距上次命中所搜过的字节数，用于对齐 C 的 step 加速（见 next_sequence）
+    step_dist: usize,
     /// Gets updated when a new sequence is returned to point right behind that sequence
     last_idx_in_sequence: usize,
 }
@@ -204,7 +205,7 @@ impl MatchGenerator {
             #[cfg(debug_assertions)]
             concat_window: Vec::new(),
             suffix_idx: 0,
-            miss_count: 0,
+            step_dist: 0,
             last_idx_in_sequence: 0,
         }
     }
@@ -215,6 +216,7 @@ impl MatchGenerator {
         self.concat_window.clear();
         self.suffix_idx = 0;
         self.last_idx_in_sequence = 0;
+        self.step_dist = 0;
         self.window.drain(..).for_each(|entry| {
             reuse_space(entry.data, entry.suffixes);
         });
@@ -331,7 +333,7 @@ impl MatchGenerator {
                 let literals = &last_entry.data[self.last_idx_in_sequence..match_start];
 
                 // Update the indexes, all indexes upto and including the current index have been included in a sequence now
-                self.miss_count = 0;
+                self.step_dist = 0;
                 self.suffix_idx += match_len;
                 match_len += back;
                 self.last_idx_in_sequence = self.suffix_idx;
@@ -349,17 +351,17 @@ impl MatchGenerator {
             if !last_entry.suffixes.contains_key(key) {
                 last_entry.suffixes.insert(key, self.suffix_idx);
             }
-            // Step acceleration: skip ahead faster at later positions in the block.
-            // Positions near the start are more valuable as match targets, so we
-            // search them densely. Later positions are less likely to be referenced.
-            self.miss_count += 1;
+            // Step acceleration, aligned with C's fast path
+            // (`ZSTD_compressBlock_fast_generic`, lib/compress/zstd_fast.c:
+            //  `step = stepSize` / `if (ip1 >= nextStep) { step++; nextStep += kStepIncr; }`
+            //  with kSearchStrength=8 => kStepIncr=256, and `step` reset on every match).
+            // The step starts at 1 and gains +1 for every 256 bytes searched since the
+            // last match, with no upper bound: right after a match the search stays
+            // dense (ratio), while a match-free run (incompressible data) skips ahead
+            // quadratically, so a whole block costs O(sqrt(n)) probes instead of O(n).
             let data_len = last_entry.data.len();
-            let pos_step = (self.suffix_idx * 4 / data_len.max(1)).min(3);
-            let step = if self.miss_count >= 256 {
-                1 + (pos_step + (self.miss_count >> 8)).min(16)
-            } else {
-                1 + pos_step
-            };
+            let step = 1 + self.step_dist / 256;
+            self.step_dist += step;
             self.suffix_idx = (self.suffix_idx + step).min(data_len);
         }
     }
@@ -435,6 +437,7 @@ impl MatchGenerator {
         self.window_size += len;
         self.suffix_idx = 0;
         self.last_idx_in_sequence = 0;
+        self.step_dist = 0;
     }
 
     /// Reserve space for a new window entry
@@ -653,15 +656,28 @@ fn matches() {
     );
     original_data.extend_from_slice(&[0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23]);
 
-    // Characterization (base 511c945): the position-based step acceleration
-    // skips idx 7 of this block, so no match is found and the whole block
-    // comes out as one Literals sequence. Matches CI evidence (62 passed /
-    // 1 failed with exactly this left-right pair before this fix).
+    // Characterization: with the C-aligned step acceleration (step=1 at the start,
+    // +1 per 256 bytes searched since the last match, reset on match), the search is
+    // dense right after the start, so the repeat at idx 7 IS matched. The previous
+    // position-based acceleration skipped idx 7 and emitted the whole block as one
+    // Literals sequence — i.e. that scheme paid for speed with missed matches.
+    // Sequences: 7 literals + Triple(offset=5, len=5), then the 2-byte tail.
+    matcher.next_sequence(|seq| {
+        assert_seq_equal(
+            seq,
+            Sequence::Triple {
+                literals: &[0, 0, 11, 13, 15, 17, 20],
+                offset: 5,
+                match_len: 5,
+            },
+            &mut reconstructed,
+        )
+    });
     matcher.next_sequence(|seq| {
         assert_seq_equal(
             seq,
             Sequence::Literals {
-                literals: &[0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23],
+                literals: &[21, 23],
             },
             &mut reconstructed,
         )
