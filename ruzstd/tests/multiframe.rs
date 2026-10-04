@@ -75,7 +75,11 @@ fn chunked_multi_frame_roundtrip_and_random_access() {
     }
 
     // 单帧 API 的既有语义（只吃第一帧）不变 —— 记录现状，别静默改变行为
-    assert_eq!(read_all_rs(&stream), chunks[0], "StreamingDecoder 应只解第一帧");
+    assert_eq!(
+        read_all_rs(&stream),
+        chunks[0],
+        "StreamingDecoder 应只解第一帧"
+    );
 }
 
 /// 3：与 C 的双向互操作

@@ -77,9 +77,10 @@ impl<READ: Read> MultiFrameDecoder<READ> {
         loop {
             match self.decoder.reset(&mut self.source) {
                 Ok(()) => return Ok(true),
-                Err(FrameDecoderError::ReadFrameHeaderError(
-                    ReadFrameHeaderError::SkipFrame { length, .. },
-                )) => {
+                Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                    length,
+                    ..
+                })) => {
                     // skippable 帧：跳过载荷后继续找下一帧
                     self.skip_bytes(length as u64)?;
                     match self.source.peek_magic()? {
@@ -202,7 +203,9 @@ impl<READ: Read> PeekReader<READ> {
         self.peeked_len = 0;
         self.pos = 0;
         while (self.peeked_len as usize) < self.peeked.len() {
-            let n = self.inner.read(&mut self.peeked[self.peeked_len as usize..])?;
+            let n = self
+                .inner
+                .read(&mut self.peeked[self.peeked_len as usize..])?;
             if n == 0 {
                 break;
             }

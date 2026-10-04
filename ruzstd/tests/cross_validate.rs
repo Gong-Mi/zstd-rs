@@ -189,9 +189,7 @@ fn cross_edge_shapes() {
 fn cross_concatenated_frames_consumption() {
     use ruzstd::decoding::MultiFrameDecoder;
 
-    let parts: Vec<Vec<u8>> = (0..3)
-        .map(|i| gen_text(70_000 + i * 1_237))
-        .collect();
+    let parts: Vec<Vec<u8>> = (0..3).map(|i| gen_text(70_000 + i * 1_237)).collect();
     let mut expected = Vec::new();
     for p in &parts {
         expected.extend_from_slice(p);
@@ -212,7 +210,11 @@ fn cross_concatenated_frames_consumption() {
     for p in &parts {
         rs_stream.extend_from_slice(&rs_encode(p));
     }
-    assert_eq!(c_decode(&rs_stream), expected, "rs multi-frame -> C mismatch");
+    assert_eq!(
+        c_decode(&rs_stream),
+        expected,
+        "rs multi-frame -> C mismatch"
+    );
 
     // 每一帧仍可单独解（随机访问）
     for p in &parts {
