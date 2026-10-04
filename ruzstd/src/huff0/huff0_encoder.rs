@@ -334,38 +334,61 @@ fn code_lengths_by_frequency(present: &[(usize, u8)]) -> Option<Vec<usize>> {
     Some(lens)
 }
 
-/// 经典 Huffman 深度：每次合并权最小的两棵树，被合并的每个叶子深度 +1。
-/// n ≤ 256 ⇒ O(n²) 的朴素选择足够，且实现可读、无堆结构。
+/// 经典 Huffman 深度（两队列法）：叶子按频率升序、合并出的内部节点权重天然非降，
+/// 因此取最小权节点只需比较两条队列的队首，O(n)。
+/// 深度用父指针上溯求（O(n·depth)），避免旧实现的 O(n²) 成员表拷贝与分配
+/// ——实测那正是小块语料（字面量少但反复建表）上 +77% 耗时的来源。
 fn optimal_huffman_lengths(present: &[(usize, u8)]) -> Vec<usize> {
     let n = present.len();
-    let mut roots: Vec<(u64, Vec<usize>)> = present
-        .iter()
-        .enumerate()
-        .map(|(i, (count, _))| (*count as u64, alloc::vec![i]))
-        .collect();
-    let mut lens = alloc::vec![0usize; n];
-    while roots.len() > 1 {
-        let (mut i1, mut i2) = (0usize, 1usize);
-        if roots[i1].0 > roots[i2].0 {
-            core::mem::swap(&mut i1, &mut i2);
-        }
-        for k in 2..roots.len() {
-            if roots[k].0 < roots[i1].0 {
-                i2 = i1;
-                i1 = k;
-            } else if roots[k].0 < roots[i2].0 {
-                i2 = k;
+    let mut parent: alloc::vec::Vec<usize> = alloc::vec![usize::MAX; 2 * n];
+    let mut weight: alloc::vec::Vec<u64> = alloc::vec![0; 2 * n];
+    for (i, (count, _)) in present.iter().enumerate() {
+        weight[i] = *count as u64;
+    }
+
+    // 叶子队列按 (频率升序, 符号升序) 排序，复现旧实现在并列时的取值，保证 ratio 逐字节不变
+    let mut leaves: alloc::vec::Vec<usize> = (0..n).collect();
+    leaves.sort_by(|a, b| {
+        present[*a]
+            .0
+            .cmp(&present[*b].0)
+            .then(present[*a].1.cmp(&present[*b].1))
+    });
+    let mut merged: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(n);
+    let (mut li, mut mi) = (0usize, 0usize);
+    let mut next = n;
+
+    let pick_min = |leaves: &[usize], li: &mut usize, merged: &[usize], mi: &mut usize, weight: &[u64]| -> usize {
+        let from_leaf = leaves.get(*li).copied();
+        let from_merged = merged.get(*mi).copied();
+        match (from_leaf, from_merged) {
+            (Some(l), Some(m)) => {
+                // 权重相等时优先取叶子，保证确定性
+                if weight[l] <= weight[m] { *li += 1; l } else { *mi += 1; m }
             }
+            (Some(l), None) => { *li += 1; l }
+            (None, Some(m)) => { *mi += 1; m }
+            (None, None) => unreachable!("huffman merge ran out of nodes"),
         }
-        let (hi, lo) = (i1.max(i2), i1.min(i2));
-        let (w_hi, l_hi) = roots.remove(hi);
-        let (w_lo, l_lo) = roots.remove(lo);
-        for leaf in l_lo.iter().chain(l_hi.iter()) {
-            lens[*leaf] += 1;
+    };
+
+    while (leaves.len() - li) + (merged.len() - mi) > 1 {
+        let a = pick_min(&leaves, &mut li, &merged, &mut mi, &weight);
+        let b = pick_min(&leaves, &mut li, &merged, &mut mi, &weight);
+        weight[next] = weight[a] + weight[b];
+        parent[a] = next;
+        parent[b] = next;
+        merged.push(next);
+        next += 1;
+    }
+
+    let mut lens = alloc::vec![0usize; n];
+    for (i, len) in lens.iter_mut().enumerate() {
+        let mut cur = i;
+        while parent[cur] != usize::MAX {
+            *len += 1;
+            cur = parent[cur];
         }
-        let mut merged = l_lo;
-        merged.extend(l_hi);
-        roots.push((w_lo + w_hi, merged));
     }
     lens
 }
