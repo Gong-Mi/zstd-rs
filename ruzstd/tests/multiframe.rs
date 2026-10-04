@@ -9,6 +9,10 @@
 //!
 //! 外加两条边界：skippable 帧被跳过；截断的尾部报错而不是静默丢数据。
 
+// 需要 std（`read_to_end` 来自 std 的 Read）与 hash（编码侧）；无默认特性组合下整文件门掉，
+// 与 cross_validate.rs 同一模式。
+#![cfg(all(feature = "std", feature = "hash"))]
+
 use std::io::Read;
 
 use ruzstd::decoding::{FrameDecoder, MultiFrameDecoder, StreamingDecoder};

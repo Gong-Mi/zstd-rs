@@ -8,12 +8,16 @@
 //! This decoder consumes all of them in one pass, skipping *skippable* frames on the way.
 //!
 //! ```no_run
-//! use std::io::Read;
-//! use ruzstd::decoding::MultiFrameDecoder;
+//! // `read_to_end` is not implemented by the no_std implementation.
+//! #[cfg(feature = "std")]
+//! {
+//!     use std::io::Read;
+//!     use ruzstd::decoding::MultiFrameDecoder;
 //!
-//! let archive: &[u8] = todo!("a concatenation of zstd frames");
-//! let mut out = Vec::new();
-//! MultiFrameDecoder::new(archive).read_to_end(&mut out).unwrap();
+//!     let archive: &[u8] = todo!("a concatenation of zstd frames");
+//!     let mut out = Vec::new();
+//!     MultiFrameDecoder::new(archive).read_to_end(&mut out).unwrap();
+//! }
 //! ```
 
 use crate::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
