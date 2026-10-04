@@ -380,8 +380,7 @@ impl HuffmanTable {
         }
 
         //fill with dummy symbols
-        self.decode
-            .resize(1 << self.max_num_bits, Entry::new(0, 0));
+        self.decode.resize(1 << self.max_num_bits, Entry::new(0, 0));
 
         //starting codes for each rank
         self.rank_indexes.clear();
