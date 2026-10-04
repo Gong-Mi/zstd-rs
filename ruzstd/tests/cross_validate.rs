@@ -183,6 +183,43 @@ fn cross_edge_shapes() {
     }
 }
 
+/// 真正消费拼接多帧流（上面的 multi-frame 用例只是把多帧字节当原文再压一遍，
+/// 走的是单帧路径）。分块/多进程压缩的产物就是这种形状。
+#[test]
+fn cross_concatenated_frames_consumption() {
+    use ruzstd::decoding::MultiFrameDecoder;
+
+    let parts: Vec<Vec<u8>> = (0..3)
+        .map(|i| gen_text(70_000 + i * 1_237))
+        .collect();
+    let mut expected = Vec::new();
+    for p in &parts {
+        expected.extend_from_slice(p);
+    }
+
+    // C 编的多个帧拼接 → ruzstd 一次读完
+    let mut c_stream = Vec::new();
+    for p in &parts {
+        c_stream.extend_from_slice(&c_encode(p));
+    }
+    let mut dec = MultiFrameDecoder::new(&c_stream[..]);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out).unwrap();
+    assert_eq!(out, expected, "C multi-frame -> rs multi-frame mismatch");
+
+    // ruzstd 编的多个帧拼接 → C 解（C 原生支持多帧）
+    let mut rs_stream = Vec::new();
+    for p in &parts {
+        rs_stream.extend_from_slice(&rs_encode(p));
+    }
+    assert_eq!(c_decode(&rs_stream), expected, "rs multi-frame -> C mismatch");
+
+    // 每一帧仍可单独解（随机访问）
+    for p in &parts {
+        assert_eq!(rs_decode(&rs_encode(p)), *p);
+    }
+}
+
 /// Regenerated-size values that straddle the 4-stream literals boundaries:
 /// data lengths chosen so literal sections are not multiples of 4 and hit
 /// the serial-tail path of the batch decoder.
