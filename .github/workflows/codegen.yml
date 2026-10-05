@@ -1,0 +1,91 @@
+name: LLVM codegen and calibration
+
+'on':
+  push:
+    branches: ['test/llvm-codegen-calibration']
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: 'Frozen mainline source SHA (40 lowercase hex)'
+        default: 'e0c7a6acc869ace13216c1e28c665fe7cb5b44ce'
+      candidate_sha:
+        description: 'Frozen PR50 subject SHA; no merge authorization'
+        default: '2220c75368d73e1be2c7780e34d2e8ad15e7b492'
+      rounds:
+        description: 'Rounds in each independent rotating suite'
+        default: '6'
+      iters:
+        description: 'Raw samples per implementation per case per round'
+        default: '7'
+      size_mb:
+        description: 'Decode MiB per generated corpus'
+        default: '16'
+      encode_mb:
+        description: 'Encode MiB cap'
+        default: '4'
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: normal-link x86 codegen and independent calibration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BASE_SHA: ${{ inputs.base_sha || 'e0c7a6acc869ace13216c1e28c665fe7cb5b44ce' }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha || '2220c75368d73e1be2c7780e34d2e8ad15e7b492' }}
+      ROUNDS: ${{ inputs.rounds || '6' }}
+      ITERS: ${{ inputs.iters || '7' }}
+      SIZE_MB: ${{ inputs.size_mb || '16' }}
+      ENCODE_MB: ${{ inputs.encode_mb || '4' }}
+    steps:
+      - name: Checkout frozen measurement tools
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Resolve actual Rust LLVM major
+        id: backend
+        run: |
+          python3 - <<'PY'
+          import os, re, subprocess
+          text = subprocess.check_output(['rustc', '-vV'], text=True)
+          match = re.search(r'^LLVM version: (\d+)\.', text, re.M)
+          if match is None:
+              raise SystemExit('actual rustc LLVM version missing')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('major=' + match.group(1) + '\n')
+          print(text)
+          PY
+      - name: Install matching-major clang and LLVM readers
+        env:
+          LLVM_MAJOR: ${{ steps.backend.outputs.major }}
+        run: |
+          set -euo pipefail
+          if ! command -v "clang-$LLVM_MAJOR" >/dev/null || ! command -v "llvm-dis-$LLVM_MAJOR" >/dev/null; then
+            . /etc/os-release
+            curl -fsSL --max-time 60 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor --yes -o /usr/share/keyrings/llvm-codegen.gpg
+            printf 'deb [signed-by=/usr/share/keyrings/llvm-codegen.gpg] https://apt.llvm.org/%s/ llvm-toolchain-%s-%s main\n' "$VERSION_CODENAME" "$VERSION_CODENAME" "$LLVM_MAJOR" | sudo tee /etc/apt/sources.list.d/llvm-codegen.list
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq "clang-$LLVM_MAJOR" "llvm-$LLVM_MAJOR" "llvm-$LLVM_MAJOR-tools"
+          fi
+          "clang-$LLVM_MAJOR" --version
+          "llvm-dis-$LLVM_MAJOR" --version
+      - name: Build and capture three frozen subjects; run separate suites
+        env:
+          LLVM_MAJOR: ${{ steps.backend.outputs.major }}
+        run: |
+          python3 -B tools/perf/codegen_ci.py \
+            --work "$GITHUB_WORKSPACE/experiment" \
+            --base-sha "$BASE_SHA" --candidate-sha "$CANDIDATE_SHA" \
+            --cc "clang-$LLVM_MAJOR" --llvm-suffix "-$LLVM_MAJOR" \
+            --rounds "$ROUNDS" --iters "$ITERS" --size-mb "$SIZE_MB" --encode-mb "$ENCODE_MB"
+      - name: Upload raw codegen and calibration even after failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-codegen-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: experiment/evidence/
