@@ -19,6 +19,17 @@ fn main() {
         let c = ruzstd::encstats::take();
         let name = path.rsplit('/').next().unwrap_or(&path).to_string();
         let ratio = data.len() as f64 / comp.len() as f64;
+        // 单进程确定性门：同一位置的探针与插入共用一次哈希 ⇒ hashes < probes + inserts。
+        // 注意：encstats 是进程级全局计数器，该不变量只在"本进程内没有并发压缩"时成立，
+        // 所以它放在 example 里（单进程），不进会在同一进程并行跑整套用例的 lib 测试。
+        let (inserts, probes, hashes) = (c[0], c[1], c[3]);
+        assert!(
+            hashes < probes + inserts,
+            "同位置哈希未共用：hashes={} probes={} inserts={}（重构前取等号）",
+            hashes,
+            probes,
+            inserts
+        );
         println!(
             "{:<20} {:>9.2} {:>9.3} {:>9} {:>9} {:>9} {:>9} {:>9.3}",
             name,

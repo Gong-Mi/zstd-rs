@@ -800,7 +800,6 @@ fn chain_reaches_old_positions() {
     assert_eq!(seen, alloc::vec![4, 3, 2, 1, 0], "链走查应能回到最老位置");
 }
 
-
 /// 本片等价性硬门：`key_raw` + `index_of` 必须与重构前的 `key()`（含结尾的
 /// `% slots.len()`）给出**完全相同**的下标，否则压缩输出就不再逐字节相同。
 #[test]
@@ -835,7 +834,11 @@ fn key_raw_and_index_of_match_legacy_hash() {
             let store = SuffixStore::with_capacity(capacity);
             let got = store.index_of(SuffixStore::key_raw(&key));
             let want = legacy_key(&key, capacity.ilog2(), store.slots.len());
-            assert_eq!(got, want, "round {} capacity {} key {:?}", round, capacity, key);
+            assert_eq!(
+                got, want,
+                "round {} capacity {} key {:?}",
+                round, capacity, key
+            );
         }
     }
 }
@@ -893,34 +896,8 @@ fn hashed_variants_agree_with_wrappers() {
     }
 }
 
-/// 行为门（确定性计数，不是计时）：同一位置的探针与插入共用一次哈希，
-/// 所以哈希次数必须严格小于 探针数 + 插入数。重构前 `get`/`insert` 各算一遍，
-/// 该不等式取等号即失败。
-#[cfg(feature = "encstats")]
-#[test]
-fn hash_computed_once_per_position() {
-    let mut data = alloc::vec::Vec::new();
-    let phrase = b"fn main() { let x = systemd_journald_after_log_socket_0001; }\n";
-    while data.len() < 256 * 1024 {
-        data.extend_from_slice(phrase);
-    }
-    let _ = crate::encstats::take();
-    let _ = crate::encoding::compress_to_vec(&data[..], crate::encoding::CompressionLevel::Fastest);
-    let c = crate::encstats::take();
-    let (inserts, probes, hits, hashes) = (
-        c[crate::encstats::INSERTS],
-        c[crate::encstats::PROBES],
-        c[crate::encstats::HITS],
-        c[crate::encstats::HASHES],
-    );
-    assert!(probes > 0, "语料没产生探针，测试无效");
-    assert!(inserts > 0, "语料没产生插入，测试无效");
-    vprintln!("inserts={inserts} probes={probes} hits={hits} hashes={hashes}");
-    assert!(
-        hashes < probes + inserts,
-        "每位置应共用一次哈希：hashes={} 应为 probes={} 量级，而不是 probes+inserts={}",
-        hashes,
-        probes,
-        probes + inserts
-    );
-}
+// 说明：同一位置只算一次哈希"的行为门（`hashes < probes + inserts`）不放在这里。
+// `encstats` 是进程级全局计数器，而 `cargo hack test` 会在同一个进程里并行跑整套
+// 用例：别人的压缩会 bump 同一组计数器，`take()` 逐项 swap 又会把并发者上半段计数
+// 切在中间，于是窗口内会出现 `hashes > probes + inserts` 的假失败。
+// 该门放在单进程的 `examples/enccounts.rs` 里（那里 take() 前后没有别的压缩）。
