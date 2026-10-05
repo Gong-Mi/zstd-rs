@@ -29,6 +29,7 @@ class WorkflowTests(unittest.TestCase):
         scripts = '\n'.join(s.get('run', '') for s in steps)
         self.assertIn('tools/perf/run_ab.py', scripts)
         self.assertIn('tools/perf/compare.py', scripts)
+        self.assertIn('--require-execution', scripts)
         self.assertNotIn('gap_vs_c', scripts)
         self.assertNotIn('get(\'leg\',\'stream\')', scripts)
         self.assertNotIn('100% 落在', scripts)

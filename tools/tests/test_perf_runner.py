@@ -25,7 +25,7 @@ if args == ['--identity']:
 round_no = int(args[args.index('--round') + 1]) if '--round' in args else 0
 side = args[args.index('--side') + 1] if '--side' in args else 'plan'
 with open(os.environ['TRACE_PATH'], 'a') as fh:
-    fh.write(json.dumps({'side':side, 'round':round_no, 'binary':os.environ.get('PERF_BINARY_SHA256')}) + '\n')
+    fh.write(json.dumps({'side':side, 'round':round_no, 'binary':os.environ.get('PERF_BINARY_SHA256'), 'affinity':sorted(os.sched_getaffinity(0))}) + '\n')
 cases = [{'kind':kind,'corpus':'SYNTHETIC-fixture','leg':leg,'bytes':4,'sha256':'f'*64,
           'params':{'iters':1,'ref_level':1}} for kind,leg in
          [('sample','stream'),('sample','known'),('encode','fastest')]]
@@ -83,8 +83,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = [json.loads(line) for line in self.trace.read_text().splitlines()]
         self.assertEqual([(x['side'], x['round']) for x in calls],
-                         [('plan', 0), ('base', 1), ('head', 1), ('base2', 1),
-                          ('base', 2), ('head', 2), ('base2', 2)])
+                         [('plan', 0), ('plan', 0), ('base', 1), ('head', 1), ('base2', 1),
+                          ('head', 2), ('base2', 2), ('base', 2)])
         manifest = json.loads((self.root / "result/manifest.json").read_text())
         self.assertEqual(manifest['builds']['base'], manifest['builds']['base2'])
         self.assertEqual(len(manifest['cases']), 3)
