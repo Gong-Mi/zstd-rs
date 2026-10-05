@@ -197,10 +197,22 @@ pub(super) struct SymbolStates {
 
 impl SymbolStates {
     fn get(&self, idx: usize, max_idx: usize) -> &State {
-        let start_search_at = (idx * self.states.len()) / max_idx;
-        self.states[start_search_at..]
-            .iter()
-            .find(|state| state.contains(idx))
+        assert!(idx < max_idx);
+        // The builder sorts equal-sized short ranges before double-sized ranges.
+        // For n ranges of width 2^bits or 2^(bits + 1) covering max_idx states,
+        // short_count = 2*n - (max_idx >> bits). Invert those two ranges directly.
+        // This also covers -1 probabilities: one range spans the whole table.
+        let bits = self.states[0].num_bits;
+        let short_count = self.states.len() * 2 - (max_idx >> bits);
+        let boundary = short_count << bits;
+        let position = if idx < boundary {
+            idx >> bits
+        } else {
+            short_count + ((idx - boundary) >> (bits + 1))
+        };
+        self.states
+            .get(position)
+            .filter(|state| state.contains(idx))
             .unwrap()
     }
 }
@@ -443,3 +455,7 @@ pub(crate) fn default_ll_table() -> FSETable {
 pub(crate) fn default_of_table() -> FSETable {
     build_table_from_probabilities(OF_DIST, 5)
 }
+
+#[cfg(test)]
+#[path = "fse_encoder_lookup_tests.rs"]
+mod lookup_tests;
