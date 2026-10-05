@@ -176,6 +176,9 @@ impl SuffixStore {
         hit
     }
 
+    /// 与 `get_hashed` 等价，哈希在内部算。仅测试用（库内调用点都走 `get_hashed`
+    /// 以共用同一位置的原始哈希），不加 `cfg(test)` 会在 `-D warnings` 下被判死代码。
+    #[cfg(test)]
     #[inline(always)]
     fn get(&self, suffix: &[u8]) -> Option<usize> {
         self.get_hashed(Self::key_raw(suffix))
