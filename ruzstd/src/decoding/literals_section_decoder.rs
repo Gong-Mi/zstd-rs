@@ -17,14 +17,38 @@ pub fn decode_literals(
 ) -> Result<u32, DecompressLiteralsError> {
     match section.ls_type {
         LiteralsSectionType::Raw => {
+            #[cfg(feature = "prof")]
+            {
+                crate::decoding::prof::count(
+                    &crate::decoding::prof::LIT_RAW_BYTES,
+                    section.regenerated_size as u64,
+                );
+                crate::decoding::prof::count(&crate::decoding::prof::LIT_BLOCKS_RAW, 1);
+            }
             target.extend(&source[0..section.regenerated_size as usize]);
             Ok(section.regenerated_size)
         }
         LiteralsSectionType::RLE => {
+            #[cfg(feature = "prof")]
+            {
+                crate::decoding::prof::count(
+                    &crate::decoding::prof::LIT_RLE_BYTES,
+                    section.regenerated_size as u64,
+                );
+                crate::decoding::prof::count(&crate::decoding::prof::LIT_BLOCKS_RLE, 1);
+            }
             target.resize(target.len() + section.regenerated_size as usize, source[0]);
             Ok(1)
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
+            #[cfg(feature = "prof")]
+            {
+                crate::decoding::prof::count(
+                    &crate::decoding::prof::LIT_HUF_BYTES,
+                    section.regenerated_size as u64,
+                );
+                crate::decoding::prof::count(&crate::decoding::prof::LIT_BLOCKS_HUF, 1);
+            }
             let bytes_read = decompress_literals(section, scratch, source, target)?;
 
             //return sum of used bytes
@@ -68,6 +92,8 @@ fn decompress_literals(
     let source = &source[bytes_read as usize..];
 
     if num_streams == 4 {
+        #[cfg(feature = "prof")]
+        crate::decoding::prof::count(&crate::decoding::prof::HUF4_SECTIONS, 1);
         //build jumptable
         if source.len() < 6 {
             return Err(err::MissingBytesForJumpHeader { got: source.len() });
@@ -202,6 +228,8 @@ fn decompress_literals(
     } else {
         //just decode the one stream
         assert!(num_streams == 1);
+        #[cfg(feature = "prof")]
+        crate::decoding::prof::count(&crate::decoding::prof::HUF1_SECTIONS, 1);
         let (mut decoder, mut br, mut budget) = init_huffman_stream(&scratch.table, source)?;
 
         // Same shape as the four-stream path: raw-pointer writes into the

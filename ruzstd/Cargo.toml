@@ -33,6 +33,8 @@ default = ["hash", "std"]
 dict_builder = ["std", "dep:fastrand"]
 hash = ["dep:twox-hash"]
 fuzz_exports = []
+# Internal, temporary decode-time attribution (CI perf harness only).
+prof = []
 std = []
 encstats = []
 
