@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+from json_contract import strict_json
+
 SIDES = ('base', 'head', 'base2')
 PROTOCOL = 'rotating-aba-v1'
 
@@ -15,19 +17,6 @@ def schedule(rounds):
         for side in order:
             result.append({'ordinal': len(result) + 1, 'round': number, 'side': side})
     return result
-
-
-def unique_fields(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError('duplicate completion field: ' + key)
-        result[key] = value
-    return result
-
-
-def reject_constant(value):
-    raise ValueError('nonfinite completion value: ' + value)
 
 
 def validate_execution(declaration, rounds, builds, path):
@@ -44,9 +33,8 @@ def validate_execution(declaration, rounds, builds, path):
         errors.append('execution: declared schedule is not rotating A/B/A')
     try:
         lines = Path(path).read_text(encoding='utf-8').splitlines()
-        rows = [json.loads(line, object_pairs_hook=unique_fields, parse_constant=reject_constant)
-                for line in lines if line.strip()]
-    except (OSError, ValueError, UnicodeError) as exc:
+        rows = [strict_json(line) for line in lines if line.strip()]
+    except (OSError, ValueError, RecursionError) as exc:
         return errors + ['execution: cannot read completion ledger: ' + str(exc)]
     if len(rows) != len(expected):
         errors.append('execution: completion count differs from declared schedule')
