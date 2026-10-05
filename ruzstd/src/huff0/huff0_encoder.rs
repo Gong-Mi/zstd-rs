@@ -205,7 +205,10 @@ impl HuffmanTable {
                     weights[*sym as usize] = max_bits + 1 - len;
                 }
                 // 安全网：权重和必须是 2 的幂（等价于 Kraft 和恰为 1），否则回退
-                let weight_sum: usize = weights.iter().map(|w| if *w > 0 { 1 << (w - 1) } else { 0 }).sum();
+                let weight_sum: usize = weights
+                    .iter()
+                    .map(|w| if *w > 0 { 1 << (w - 1) } else { 0 })
+                    .sum();
                 if weight_sum.is_power_of_two() {
                     return Self::build_from_weights(&weights);
                 }
@@ -313,8 +316,6 @@ impl HuffmanTable {
     }
 }
 
-/// Assert that the provided value is greater than zero, and returns index of the first set bit
-
 /// zstd 的 Huffman 表最多 11 bit（`HUF_TABLELOG_MAX`）
 const HUFF_MAX_BITS: usize = 11;
 
@@ -358,16 +359,33 @@ fn optimal_huffman_lengths(present: &[(usize, u8)]) -> Vec<usize> {
     let (mut li, mut mi) = (0usize, 0usize);
     let mut next = n;
 
-    let pick_min = |leaves: &[usize], li: &mut usize, merged: &[usize], mi: &mut usize, weight: &[u64]| -> usize {
+    let pick_min = |leaves: &[usize],
+                    li: &mut usize,
+                    merged: &[usize],
+                    mi: &mut usize,
+                    weight: &[u64]|
+     -> usize {
         let from_leaf = leaves.get(*li).copied();
         let from_merged = merged.get(*mi).copied();
         match (from_leaf, from_merged) {
             (Some(l), Some(m)) => {
                 // 权重相等时优先取叶子，保证确定性
-                if weight[l] <= weight[m] { *li += 1; l } else { *mi += 1; m }
+                if weight[l] <= weight[m] {
+                    *li += 1;
+                    l
+                } else {
+                    *mi += 1;
+                    m
+                }
             }
-            (Some(l), None) => { *li += 1; l }
-            (None, Some(m)) => { *mi += 1; m }
+            (Some(l), None) => {
+                *li += 1;
+                l
+            }
+            (None, Some(m)) => {
+                *mi += 1;
+                m
+            }
             (None, None) => unreachable!("huffman merge ran out of nodes"),
         }
     };
@@ -418,7 +436,7 @@ fn limit_code_lengths(lens: &mut [usize], present: &[(usize, u8)], max_bits: usi
         for i in 0..lens.len() {
             if lens[i] < max_bits {
                 let step = 1usize << (max_bits - lens[i] - 1);
-                if step <= excess && best.map_or(true, |b| present[i].0 < present[b].0) {
+                if step <= excess && best.is_none_or(|b| present[i].0 < present[b].0) {
                     best = Some(i);
                 }
             }
@@ -446,7 +464,7 @@ fn limit_code_lengths(lens: &mut [usize], present: &[(usize, u8)], max_bits: usi
         for i in 0..lens.len() {
             if lens[i] > 1 {
                 let step = 1usize << (max_bits - lens[i]);
-                if step <= room && best.map_or(true, |b| present[i].0 > present[b].0) {
+                if step <= room && best.is_none_or(|b| present[i].0 > present[b].0) {
                     best = Some(i);
                 }
             }
@@ -699,7 +717,9 @@ mod tests {
     /// 二进制字面量的典型形状：256 个符号全出现但频率明显偏斜（实测字面量熵 ≈6.2 bit/符号）。
     /// 旧实现按"符号个数"造表 ⇒ 平均 ≈8 bit（等于没压）；按频率建表必须显著低于 8。
     fn skewed_256() -> alloc::vec::Vec<usize> {
-        (0..256).map(|i| (20000 / (i + 1)).max(1) + (i % 5)).collect()
+        (0..256)
+            .map(|i| (20000 / (i + 1)).max(1) + (i % 5))
+            .collect()
     }
 
     #[test]
@@ -708,7 +728,10 @@ mod tests {
         let table = HuffmanTable::build_from_counts(&counts);
         let max_bits = (0..256).map(|s| table.codes[s].1).max().unwrap();
         let avg = avg_bits_x1000(&counts, &table);
-        assert!(max_bits as usize <= HUFF_MAX_BITS, "码长超过上限: {max_bits}");
+        assert!(
+            max_bits as usize <= HUFF_MAX_BITS,
+            "码长超过上限: {max_bits}"
+        );
         // 旧实现退化形态 ≈8.0 bit ⇒ 7.2 是明确的判别线
         assert!(avg < 7200, "平均码长 {avg}/1000 说明表仍然退化（≈8 bit）");
     }
@@ -738,13 +761,21 @@ mod tests {
                 .map(|s| table.codes[s].1 as usize)
                 .max()
                 .unwrap();
-            assert!(max_bits <= HUFF_MAX_BITS, "counts 首项 {} 码长超限", counts[0]);
+            assert!(
+                max_bits <= HUFF_MAX_BITS,
+                "counts 首项 {} 码长超限",
+                counts[0]
+            );
             let kraft: usize = (0..counts.len())
                 .filter(|s| counts[*s] > 0)
                 .map(|s| 1usize << (max_bits - table.codes[s].1 as usize))
                 .sum();
-            assert_eq!(kraft, 1usize << max_bits, "Kraft 和不完整（counts 首项 {}）", counts[0]);
+            assert_eq!(
+                kraft,
+                1usize << max_bits,
+                "Kraft 和不完整（counts 首项 {}）",
+                counts[0]
+            );
         }
     }
-
 }
