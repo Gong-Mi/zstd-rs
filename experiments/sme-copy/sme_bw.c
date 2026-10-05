@@ -21,6 +21,13 @@ static void neon_copy(unsigned char *d, const unsigned char *s, size_t n){
         : "+r"(d), "+r"(s), "+r"(left) : : "v0","v1","v2","v3","w4","cc","memory");
 }
 
+// ACLE: SMSTART/SMSTOP invalidates all Z/P state — full clobber list required.
+#define SME_CLOBBERS_BW                                                                      \
+    "z0","z1","z2","z3","z4","z5","z6","z7","z8","z9","z10","z11","z12","z13","z14","z15",   \
+    "z16","z17","z18","z19","z20","z21","z22","z23","z24","z25","z26","z27","z28","z29",      \
+    "z30","z31","p0","p1","p2","p3","p4","p5","p6","p7","p8","p9","p10","p11","p12","p13",    \
+    "p14","p15","cc","memory"
+
 // SME streaming copy: UNROLL x 64B per iteration, optional non-temporal stores.
 #define SME_LOOP(UNROLL, NT)                                                     \
     __asm__ volatile(                                                            \
@@ -53,7 +60,7 @@ static void neon_copy(unsigned char *d, const unsigned char *s, size_t n){
         "3:\n cbz %2, 5f\n"                                                      \
         "whilelt p1.b, xzr, %2\n" "ld1b {z0.b}, p1/z, [%1]\n" "st1b {z0.b}, p1, [%0]\n" \
         "5:\n smstop\n"                                                          \
-        : "+r"(dst), "+r"(src), "+r"(left) : : "z0","z1","z2","z3","z4","z5","z6","z7","p0","p1","cc","memory")
+        : "+r"(dst), "+r"(src), "+r"(left) : : SME_CLOBBERS_BW)
 
 #define SME_FN(NAME, UNROLL, NT)                                                  \
 __attribute__((target("arch=armv9-a+sme2"),noinline))                             \

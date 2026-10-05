@@ -80,6 +80,17 @@ static inline void sme_account(size_t n) {
     sme_hist[b]++;
 }
 
+// ACLE (Arm C Language Extensions): an inline asm that performs an
+// SMSTART/SMSTOP pair invalidates all Z and P register state. Every register
+// whose value might be changed therefore has to be named in the clobber list —
+// otherwise the compiler may keep live values (including timing values) in
+// registers that the streaming region silently destroys.
+#define SME_CLOBBERS                                                                         \
+    "z0","z1","z2","z3","z4","z5","z6","z7","z8","z9","z10","z11","z12","z13","z14","z15",   \
+    "z16","z17","z18","z19","z20","z21","z22","z23","z24","z25","z26","z27","z28","z29",      \
+    "z30","z31","p0","p1","p2","p3","p4","p5","p6","p7","p8","p9","p10","p11","p12","p13",    \
+    "p14","p15","cc","memory"
+
 // Bandwidth-oriented body: 4x64 B per iteration, then 1x64 B, then a predicated
 // tail. All inside one streaming region (smstart/smstop).
 #define SME_BODY(dstp, srcp, lenp)                                        \
@@ -119,7 +130,7 @@ static inline void sme_account(size_t n) {
         "smstop\n"                                                        \
         : "+r"(dstp), "+r"(srcp), "+r"(lenp)                              \
         :                                                                 \
-        : "z0", "z1", "z2", "z3", "p0", "p1", "cc", "memory")
+        : SME_CLOBBERS)
 
 // NEON 16B-chunk reference copy (for third-party comparison in-situ).
 __attribute__((target("arch=armv8-a"), noinline))
@@ -149,7 +160,7 @@ void ruzstd_sme_copy(unsigned char *dst, const unsigned char *src, size_t n) {
             __asm__ volatile("smstart\nptrue p0.b\n1:\ncmp %2,#64\nb.lo 2f\n"
                 "ld1b {z0.b},p0/z,[%1]\nst1b {z0.b},p0,[%0]\nadd %1,%1,#64\nadd %0,%0,#64\nsub %2,%2,#64\nb 1b\n"
                 "2:\ncbz %2,3f\nwhilelt p1.b,xzr,%2\nld1b {z0.b},p1/z,[%1]\nst1b {z0.b},p1,[%0]\n3:\nsmstop\n"
-                : "+r"(d), "+r"(s), "+r"(left) : : "z0","p0","p1","cc","memory");
+                : "+r"(d), "+r"(s), "+r"(left) : : SME_CLOBBERS);
             stat_end(t0); return;
         }
         if (backend_sel == 3) {        // NEON reference
@@ -236,13 +247,13 @@ void ruzstd_sme_copy_pf(unsigned char *dst, const unsigned char *src, size_t n) 
         "smstop\n"
         : "+r"(d), "+r"(s), "+r"(left)
         :
-        : "z0", "z1", "z2", "z3", "p0", "p1", "cc", "memory");
+        : SME_CLOBBERS);
 }
 
 uint64_t ruzstd_sme_pair_cost(int reps) {
     uint64_t a, b;
     __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(a));
-    for (int i = 0; i < reps; i++) __asm__ volatile("smstart\nsmstop" ::: "memory");
+    for (int i = 0; i < reps; i++) __asm__ volatile("smstart\nsmstop" ::: SME_CLOBBERS);
     __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(b));
     return (b - a) / (uint64_t)reps;
 }
