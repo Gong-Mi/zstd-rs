@@ -1,0 +1,174 @@
+diff --git a/ruzstd/src/decoding/decode_buffer.rs b/ruzstd/src/decoding/decode_buffer.rs
+index 7a53cc7..261f7b0 100644
+--- a/ruzstd/src/decoding/decode_buffer.rs
++++ b/ruzstd/src/decoding/decode_buffer.rs
+@@ -133,7 +133,15 @@ impl DecodeBuffer {
+             // SAFETY: 容量已检查；ptr 生命周期由 set_direct_output 的调用方保证，
+             // 且 written 之前的区域是本帧自己写过的，不与 data 重叠（data 来自
+             // literals_buffer 或同帧更早的输出，见 repeat 的调用约定）。
+-            core::ptr::copy_nonoverlapping(data.as_ptr(), d.ptr.add(d.written), data.len());
++            let dst_ptr = d.ptr.add(d.written);
++            // EXPERIMENT: streaming-SME for large literal writes.
++            #[cfg(all(target_arch = "aarch64", feature = "std"))]
++            let sme_done = crate::sme_copy::try_copy(dst_ptr, data.as_ptr(), data.len());
++            #[cfg(not(all(target_arch = "aarch64", feature = "std")))]
++            let sme_done = false;
++            if !sme_done {
++                core::ptr::copy_nonoverlapping(data.as_ptr(), dst_ptr, data.len());
++            }
+         }
+         d.written += data.len();
+         true
+@@ -208,11 +216,16 @@ impl DecodeBuffer {
+                 // 源区间 `[start_idx, start_idx + match_length)` 完全位于目标区间 `[written, written + match_length)` 之前，
+                 // 两段完全不重叠。目标缓冲区容量已在入口处由 `written + match_length > cap` 检查保证。
+                 // 这条快路覆盖 90%+ 的常规匹配，消除循环与步长更新开销。
+-                core::ptr::copy_nonoverlapping(
+-                    dst_base.add(start_idx),
+-                    dst_base.add(written),
+-                    match_length,
+-                );
++                let src_ptr = dst_base.add(start_idx).cast_const();
++                let dst_ptr = dst_base.add(written);
++                // EXPERIMENT: streaming-SME for large non-overlapping match copies.
++                #[cfg(all(target_arch = "aarch64", feature = "std"))]
++                let sme_done = crate::sme_copy::try_copy(dst_ptr, src_ptr, match_length);
++                #[cfg(not(all(target_arch = "aarch64", feature = "std")))]
++                let sme_done = false;
++                if !sme_done {
++                    core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, match_length);
++                }
+             }
+         } else {
+             // 与 repeat_in_chunks 同样的倍增步长：仅在真正周期重叠 (offset < match_length) 时按 1x/2x/4x… 拷贝。
+diff --git a/ruzstd/src/decoding/ringbuffer.rs b/ruzstd/src/decoding/ringbuffer.rs
+index 96e3576..bc69eab 100644
+--- a/ruzstd/src/decoding/ringbuffer.rs
++++ b/ruzstd/src/decoding/ringbuffer.rs
+@@ -181,11 +181,26 @@ impl RingBuffer {
+         unsafe {
+             // SAFETY: `in_f₁ + in_f₂ = len`, so this writes `len` bytes total
+             // upholding invariant 2
+-            if in_f1 > 0 {
+-                f1_ptr.copy_from_nonoverlapping(ptr, in_f1);
++            // EXPERIMENT: streaming-SME for large literal pushes.
++            #[cfg(all(target_arch = "aarch64", feature = "std"))]
++            {
++                if in_f1 > 0 && crate::sme_copy::try_copy(f1_ptr, ptr, in_f1) {
++                } else if in_f1 > 0 {
++                    f1_ptr.copy_from_nonoverlapping(ptr, in_f1);
++                }
++                if in_f2 > 0 && crate::sme_copy::try_copy(f2_ptr, ptr.add(in_f1), in_f2) {
++                } else if in_f2 > 0 {
++                    f2_ptr.copy_from_nonoverlapping(ptr.add(in_f1), in_f2);
++                }
+             }
+-            if in_f2 > 0 {
+-                f2_ptr.copy_from_nonoverlapping(ptr.add(in_f1), in_f2);
++            #[cfg(not(all(target_arch = "aarch64", feature = "std")))]
++            {
++                if in_f1 > 0 {
++                    f1_ptr.copy_from_nonoverlapping(ptr, in_f1);
++                }
++                if in_f2 > 0 {
++                    f2_ptr.copy_from_nonoverlapping(ptr.add(in_f1), in_f2);
++                }
+             }
+         }
+         // SAFETY: Upholds invariant 3 by wrapping `tail` around.
+@@ -611,6 +626,20 @@ unsafe fn copy_bytes_overshooting(
+     dst: (*mut u8, usize),
+     copy_at_least: usize,
+ ) {
++    // EXPERIMENT: streaming-SME path for large transfers; exact copy, no overshoot.
++    #[cfg(all(target_arch = "aarch64", feature = "std"))]
++    if copy_at_least >= 8192
++        && dst.1 >= copy_at_least
++        && src.1 >= copy_at_least
++        && crate::sme_copy::try_copy(dst.0, src.0, copy_at_least)
++    {
++        debug_assert_eq!(
++            slice::from_raw_parts(src.0, copy_at_least),
++            slice::from_raw_parts(dst.0, copy_at_least)
++        );
++        return;
++    }
++
+     // By default use usize as the copy size
+     #[cfg(all(not(target_feature = "sse2"), not(target_feature = "neon")))]
+     type CopyType = usize;
+diff --git a/ruzstd/src/lib.rs b/ruzstd/src/lib.rs
+index 7a82f78..abc534d 100644
+--- a/ruzstd/src/lib.rs
++++ b/ruzstd/src/lib.rs
+@@ -35,6 +35,10 @@ macro_rules! vprintln {
+ mod bit_io;
+ mod common;
+ pub mod decoding;
++// EXPERIMENT (device-only): streaming-SME bulk copy hook over the C ABI.
++// Inert unless RUZSTD_SME_MIN is set in the environment.
++#[cfg(all(target_arch = "aarch64", feature = "std"))]
++pub(crate) mod sme_copy;
+ #[cfg(feature = "dict_builder")]
+ #[cfg_attr(docsrs, doc(cfg(feature = "dict_builder")))]
+ pub mod dictionary;
+diff --git a/ruzstd/src/sme_copy.rs b/ruzstd/src/sme_copy.rs
+new file mode 100644
+index 0000000..48d1c1a
+--- /dev/null
++++ b/ruzstd/src/sme_copy.rs
+@@ -0,0 +1,54 @@
++//! Experimental hook: hand-written streaming-SME ("SME") bulk copy, called over
++//! the C ABI. Rust nightly has no SME intrinsics (feature `stdarch_aarch64_sme`
++//! does not exist), so the wide copy lives in `sme/ruzstd_sme_copy.c` and is
++//! linked as a static library for the on-device experiment.
++//!
++//! Gate: `RUZSTD_SME_MIN=<bytes>` (read once per process). Unset/0 = disabled,
++//! i.e. this module is inert unless the environment asks for it, so the same
++//! binary can be used for A/B.
++
++use core::sync::atomic::{AtomicUsize, Ordering};
++
++const UNINIT: usize = usize::MAX;
++const DISABLED: usize = usize::MAX - 1;
++
++static THRESHOLD: AtomicUsize = AtomicUsize::new(UNINIT);
++
++extern "C" {
++    fn ruzstd_sme_copy(dst: *mut u8, src: *const u8, n: usize);
++}
++
++#[cold]
++fn init() {
++    let v = std::env::var("RUZSTD_SME_MIN")
++        .ok()
++        .and_then(|s| s.parse::<usize>().ok())
++        .unwrap_or(0);
++    THRESHOLD.store(if v == 0 { DISABLED } else { v }, Ordering::SeqCst);
++}
++
++#[inline(always)]
++fn threshold() -> usize {
++    let t = THRESHOLD.load(Ordering::Relaxed);
++    if t == UNINIT {
++        init();
++        THRESHOLD.load(Ordering::Relaxed)
++    } else {
++        t
++    }
++}
++
++/// Copy `len` bytes with the streaming-SME kernel when it is enabled and the
++/// transfer is at least as large as the configured threshold.
++///
++/// # Safety
++/// `dst`/`src` must be valid for `len` bytes and must not overlap.
++#[inline(always)]
++pub(crate) unsafe fn try_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
++    if len >= threshold() {
++        ruzstd_sme_copy(dst, src, len);
++        true
++    } else {
++        false
++    }
++}
