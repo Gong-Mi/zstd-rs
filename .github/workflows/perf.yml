@@ -273,7 +273,7 @@ jobs:
           set +e
           python3 tooling/tools/perf/compare.py --manifest "$GITHUB_WORKSPACE/perf-results/manifest.json" \
             --data-dir "$GITHUB_WORKSPACE/perf-results" --output "$GITHUB_WORKSPACE/perf-results/report.json" \
-            --summary "$GITHUB_WORKSPACE/perf-results/report.md" --min-effect-pct 1.0 "${EXTRA[@]}"
+            --summary "$GITHUB_WORKSPACE/perf-results/report.md" --require-execution --min-effect-pct 1.0 "${EXTRA[@]}"
           status=$?
           set -e
           python3 - <<'PY'

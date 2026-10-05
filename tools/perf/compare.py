@@ -28,6 +28,8 @@ from pathlib import Path
 import re
 import sys
 
+from execution_contract import validate_execution
+
 SIDES = ("base", "head", "base2")
 LEGS = ("stream", "known", "fastest")
 ATTACHMENT_STATES = ("NOT_RUN", "FAILED", "COMPLETE")
@@ -425,7 +427,7 @@ def primary_performance(cases):
     return "NO_GAIN", False
 
 
-def compare(manifest_path, data_dir, min_effect_pct=1.0, *, allow_attachments=True):
+def compare(manifest_path, data_dir, min_effect_pct=1.0, *, allow_attachments=True, require_execution=False):
     """Return a JSON report; allow_attachments=False forbids nested config suites."""
     errors, warnings = [], []
     if not finite_number(min_effect_pct) or min_effect_pct < 0:
@@ -439,9 +441,16 @@ def compare(manifest_path, data_dir, min_effect_pct=1.0, *, allow_attachments=Tr
             errors.append("nested config attachments are forbidden in an independent suite")
     rounds = manifest.get("rounds") if positive_int(manifest.get("rounds")) else 0
     builds = manifest.get("builds") if isinstance(manifest.get("builds"), dict) else {}
+    if "execution" in manifest:
+        errors.extend(validate_execution(manifest["execution"], rounds, builds,
+                                         Path(data_dir) / "execution.jsonl"))
+    elif require_execution:
+        errors.append("execution: required rotating single-core declaration is missing")
+    else:
+        warnings.append("legacy execution protocol: affinity/order completion ledger not validated")
     report = {"schema": 1, "data_status": "INCOMPLETE", "performance_status": "NOT_EVALUATED",
               "accepted": False, "errors": errors, "warnings": warnings, "cases": [], "sides": {},
-              "provenance": {key: manifest.get(key) for key in ("runner", "rounds", "harness_sha256", "lock_sha256", "builds")},
+              "provenance": {key: manifest.get(key) for key in ("runner", "rounds", "harness_sha256", "lock_sha256", "builds", "execution")},
               "method": {"min_effect_pct": min_effect_pct,
                          "estimator": "median of matched-round head/base percent differences",
                          "noise": "per-case per-metric max absolute matched-round base2/base difference",
@@ -504,7 +513,7 @@ def compare(manifest_path, data_dir, min_effect_pct=1.0, *, allow_attachments=Tr
         attachment["suite"] = suite
         if suite_path is not None:
             independent = compare(suite_path / "manifest.json", suite_path, min_effect_pct,
-                                  allow_attachments=False)
+                                  allow_attachments=False, require_execution=require_execution)
             attachment["report"] = independent
             attachment_errors.extend("config suite: " + error for error in independent["errors"])
             suite_builds = independent["provenance"].get("builds")
@@ -622,8 +631,11 @@ def main(argv=None):
     parser.add_argument("--summary", required=True)
     parser.add_argument("--min-effect-pct", type=float, default=1.0)
     parser.add_argument("--fail-on-regression", action="store_true")
+    parser.add_argument("--require-execution", action="store_true",
+                        help="require rotating single-core declaration and completion ledger")
     args = parser.parse_args(argv)
-    report = compare(args.manifest, args.data_dir, args.min_effect_pct)
+    report = compare(args.manifest, args.data_dir, args.min_effect_pct,
+                     require_execution=args.require_execution)
     write_failed = False
     for path, content in ((args.output, json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n"),
                           (args.summary, render_markdown(report))):

@@ -15,6 +15,8 @@ import re
 import subprocess
 import sys
 
+from execution_contract import PROTOCOL, schedule
+
 
 def sha256(path):
     digest = hashlib.sha256()
@@ -102,10 +104,20 @@ def suite(args, directory, base_bin, head_bin, base_source, head_source, rounds)
                               directory / "run.log", args.timeout))
     if plan.get("schema") != 1 or not plan.get("cases"):
         raise ValueError("harness produced no valid expected plan")
+    base_plan = json.loads(execute(base_bin, [*common, "--plan"], env,
+                                   directory / "run.log", args.timeout))
+    if base_plan != plan:
+        raise ValueError("base/head input or parameter plan mismatch before measurement")
+    affinity = sorted(os.sched_getaffinity(0))
+    if len(affinity) != 1:
+        raise ValueError("measurement requires singleton CPU affinity")
+    declared_schedule = schedule(rounds)
     manifest = {
         "schema": 1, "rounds": rounds, "runner": runner_fingerprint(),
         "harness_sha256": harness_sha, "lock_sha256": lock_sha,
         "builds": builds, "cases": plan["cases"],
+        "execution": {"protocol": PROTOCOL, "affinity": affinity,
+                      "schedule": declared_schedule},
         "attachments": {
             "config": {"status": "NOT_RUN", "reason": "not requested"},
             "profile": {"status": "NOT_RUN", "reason":
@@ -122,18 +134,32 @@ def suite(args, directory, base_bin, head_bin, base_source, head_source, rounds)
     }, indent=2) + "\n")
     for side in bins:
         (directory / (side + ".jsonl")).touch()
-    for round_number in range(1, rounds + 1):
-        for side in ("base", "head", "base2"):
-            identity = builds[side]
-            if sha256(bins[side]) != identity["binary_sha256"]:
-                raise ValueError("binary changed after manifest was frozen: " + side)
-            env = dict(os.environ, PERF_SOURCE_SHA=identity["source_sha"],
-                       PERF_BINARY_SHA256=identity["binary_sha256"])
-            with (directory / "run.log").open("a") as log:
-                log.write(f"round={round_number} side={side} binary={identity['binary_sha256']}\n")
-            execute(bins[side], [*common, "--round", str(round_number), "--side", side],
-                    env, directory / "run.log", args.timeout,
-                    directory / (side + ".jsonl"))
+    for invocation in declared_schedule:
+        round_number, side = invocation["round"], invocation["side"]
+        if sorted(os.sched_getaffinity(0)) != affinity:
+            raise ValueError("measurement CPU affinity changed after freeze")
+        if harness_identity(args.harness_dir) != (harness_sha, lock_sha):
+            raise ValueError("measurement harness or lock changed after freeze")
+        identity = builds[side]
+        if sha256(bins[side]) != identity["binary_sha256"]:
+            raise ValueError("binary changed after manifest was frozen: " + side)
+        env = dict(os.environ, PERF_SOURCE_SHA=identity["source_sha"],
+                   PERF_BINARY_SHA256=identity["binary_sha256"])
+        with (directory / "run.log").open("a") as log:
+            log.write(f"round={round_number} side={side} binary={identity['binary_sha256']}\n")
+        execute(bins[side], [*common, "--round", str(round_number), "--side", side],
+                env, directory / "run.log", args.timeout,
+                directory / (side + ".jsonl"))
+        if sha256(bins[side]) != identity["binary_sha256"]:
+            raise ValueError("binary changed during measurement: " + side)
+        if harness_identity(args.harness_dir) != (harness_sha, lock_sha):
+            raise ValueError("measurement harness or lock changed during measurement")
+        observed_affinity = sorted(os.sched_getaffinity(0))
+        if observed_affinity != affinity:
+            raise ValueError("measurement CPU affinity changed during measurement")
+        completion = dict(invocation, affinity=observed_affinity, **identity)
+        with (directory / "execution.jsonl").open("a") as ledger:
+            ledger.write(json.dumps(completion, sort_keys=True) + "\n")
     return manifest
 
 
@@ -146,6 +172,7 @@ def main():
     parser.add_argument("--repo-dir", type=Path, required=True)
     parser.add_argument("--harness-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--cpu", type=int, help="single CPU within current affinity; default=min allowed CPU")
     parser.add_argument("--rounds", type=positive, default=3)
     parser.add_argument("--iters", type=positive, default=3)
     parser.add_argument("--size-mb", type=positive, default=1)
@@ -169,6 +196,13 @@ def main():
         parser.error("output directory already exists; use a fresh exact-run path")
     if args.size_mb > 64 or args.encode_mb > 64:
         parser.error("64 MiB per-corpus limit")
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        parser.error("Linux CPU affinity API is required for this measurement protocol")
+    allowed = os.sched_getaffinity(0)
+    cpu = min(allowed) if args.cpu is None else args.cpu
+    if cpu not in allowed:
+        parser.error("requested CPU is outside current affinity")
+    os.sched_setaffinity(0, {cpu})
     manifest = suite(args, args.output_dir, args.base_bin, args.head_bin,
                      args.base_source, args.head_source, args.rounds)
     if args.tuned_bin:
