@@ -2,6 +2,24 @@ use crate::io::Read;
 use alloc::alloc::{alloc, dealloc};
 use core::{alloc::Layout, ptr::NonNull, slice};
 
+/// Advance a ring index by `amount`, wrapping at most once.
+///
+/// Equivalent to `(pos + amount) % cap` whenever `amount < cap` (which every
+/// caller here guarantees through `reserve`/`len` bounds), but avoids the
+/// 64-bit division on the common non-wrapping path. When `cap == 0` the
+/// division is still executed, so the previous "remainder by zero" panic is
+/// preserved exactly.
+#[inline(always)]
+fn wrap_advance(pos: usize, amount: usize, cap: usize) -> usize {
+    debug_assert!(cap == 0 || amount < cap, "wrap_advance needs amount < cap");
+    let s = pos + amount;
+    if s < cap {
+        s
+    } else {
+        s % cap
+    }
+}
+
 pub struct RingBuffer {
     // Safety invariants:
     //
@@ -140,7 +158,7 @@ impl RingBuffer {
         // SAFETY: Upholds invariant 2 by writing initialized memory
         unsafe { self.buf.as_ptr().add(self.tail).write(byte) };
         // SAFETY: Upholds invariant 3 by wrapping `tail` around
-        self.tail = (self.tail + 1) % self.cap;
+        self.tail = wrap_advance(self.tail, 1, self.cap);
     }
 
     /// Fetch the byte stored at the selected index from the buffer, returning it, or
@@ -150,7 +168,7 @@ impl RingBuffer {
         if idx < self.len() {
             // SAFETY: Establishes invariants on memory being initialized and the range being in-bounds
             // (Invariants 2 & 3)
-            let idx = (self.head + idx) % self.cap;
+            let idx = wrap_advance(self.head, idx, self.cap);
             Some(unsafe { self.buf.as_ptr().add(idx).read() })
         } else {
             None
@@ -189,7 +207,7 @@ impl RingBuffer {
             }
         }
         // SAFETY: Upholds invariant 3 by wrapping `tail` around.
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = wrap_advance(self.tail, len, self.cap);
     }
 
     /// Advance head past `amount` elements, effectively removing
@@ -199,7 +217,7 @@ impl RingBuffer {
         let amount = usize::min(amount, self.len());
         // SAFETY: we maintain invariant 2 here since this will always lead to a smaller buffer
         // for amount≤len
-        self.head = (self.head + amount) % self.cap;
+        self.head = wrap_advance(self.head, amount, self.cap);
     }
 
     /// Return the size of the two contiguous occupied sections of memory used
@@ -374,7 +392,7 @@ impl RingBuffer {
                 // D: Destination bytes, going to be copied from S bytes
                 // _: Uninvolved bytes in the writable section
 
-                let start = (self.head + start) % self.cap;
+                let start = wrap_advance(self.head, start, self.cap);
 
                 let src = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
@@ -461,7 +479,7 @@ impl RingBuffer {
             }
         }
 
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = wrap_advance(self.tail, len, self.cap);
     }
 
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
@@ -482,7 +500,7 @@ impl RingBuffer {
                 ptr2.write_bytes(fill_with, fill2);
             }
         }
-        self.tail = (self.tail + fill_length) % self.cap;
+        self.tail = wrap_advance(self.tail, fill_length, self.cap);
     }
 
     pub fn extend_from_reader<R: Read>(
@@ -511,7 +529,7 @@ impl RingBuffer {
             };
             read.read_exact(s2)?;
         }
-        self.tail = (self.tail + fill_length) % self.cap;
+        self.tail = wrap_advance(self.tail, fill_length, self.cap);
         Ok(())
     }
 
@@ -572,7 +590,7 @@ impl RingBuffer {
         copy_with_checks(
             m1_ptr, m2_ptr, f1_ptr, f2_ptr, m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2,
         );
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = wrap_advance(self.tail, len, self.cap);
     }
 }
 
@@ -936,5 +954,121 @@ mod tests {
         rb.extend_from_within(0, 4);
         assert_eq!(b"11", rb.as_slices().0);
         assert_eq!(b"111111", rb.as_slices().1);
+    }
+
+    /// 本片等价性硬门：`wrap_advance` 必须与 `(pos + amount) % cap` 逐点一致
+    /// （含跨界与反复回绕），否则解码输出不再逐字节相同。
+    #[test]
+    fn wrap_advance_matches_modulo() {
+        for cap in [1usize, 2, 3, 7, 17, 64] {
+            for pos in 0..2 * cap {
+                for amount in 0..cap {
+                    assert_eq!(
+                        super::wrap_advance(pos, amount, cap),
+                        (pos + amount) % cap,
+                        "cap={cap} pos={pos} amount={amount}"
+                    );
+                }
+            }
+        }
+        // 大容量抽样（覆盖多圈位置）
+        let cap = 4096usize;
+        for &pos in &[0, 1, cap - 1, cap, cap + 1, 2 * cap - 1, 3 * cap] {
+            for &amount in &[0, 1, 2, cap / 2, cap - 1] {
+                assert_eq!(
+                    super::wrap_advance(pos, amount, cap),
+                    (pos + amount) % cap,
+                    "big cap pos={pos} amount={amount}"
+                );
+            }
+        }
+    }
+
+    /// 回绕边界：随机 push_back/extend/drop_first_n/get 与朴素镜像完全一致
+    /// （覆盖回绕点前后的任意读写组合；50k 次操作确定性种子）。
+    #[test]
+    fn wrap_boundary_random_ops_match_mirror() {
+        let mut rb = RingBuffer::new();
+        rb.reserve(64);
+        let mut mirror: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut x: u32 = 0x1234_5678;
+        let mut next = move || {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            x
+        };
+        for _ in 0..50_000 {
+            match next() % 4 {
+                0 => {
+                    let b = (next() >> 7) as u8;
+                    if rb.free() == 0 {
+                        let d = rb.len();
+                        rb.drop_first_n(d);
+                        mirror.clear();
+                    }
+                    rb.push_back(b);
+                    mirror.push(b);
+                }
+                1 => {
+                    let n = (next() as usize) % 17;
+                    while rb.free() < n {
+                        let d = core::cmp::min(rb.len(), n);
+                        rb.drop_first_n(d);
+                        mirror.drain(..d);
+                    }
+                    let mut vals = alloc::vec::Vec::with_capacity(n);
+                    for _ in 0..n {
+                        vals.push((next() >> 9) as u8);
+                    }
+                    rb.extend(&vals);
+                    mirror.extend_from_slice(&vals);
+                }
+                2 => {
+                    let n = (next() as usize) % (mirror.len() + 1);
+                    rb.drop_first_n(n);
+                    mirror.drain(..n);
+                }
+                _ => {
+                    if !mirror.is_empty() {
+                        let i = (next() as usize) % mirror.len();
+                        assert_eq!(rb.get(i), Some(mirror[i]), "get({i})");
+                    }
+                }
+            }
+            assert_eq!(rb.len(), mirror.len(), "len 失配");
+        }
+        for (i, want) in mirror.iter().enumerate() {
+            assert_eq!(rb.get(i), Some(*want), "final get({i})");
+        }
+        let (s0, s1) = rb.as_slices();
+        let joined: alloc::vec::Vec<u8> = s0.iter().chain(s1.iter()).copied().collect();
+        assert_eq!(joined, mirror, "as_slices 拼接应与镜像一致");
+    }
+
+    /// 增长：回绕状态下 reserve 扩容后，内容与顺序必须保持。
+    #[test]
+    fn reserve_growth_preserves_wrapped_contents() {
+        let mut rb = RingBuffer::new();
+        rb.reserve(8);
+        let mut mirror: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let feed: alloc::vec::Vec<u8> = (0..64u8).collect();
+        for chunk in feed.chunks(5) {
+            if rb.free() < chunk.len() {
+                let drop = core::cmp::min(chunk.len() - rb.free(), rb.len());
+                rb.drop_first_n(drop);
+                mirror.drain(..drop);
+            }
+            rb.extend(chunk);
+            mirror.extend_from_slice(chunk);
+        }
+        let cap_before = rb.cap;
+        rb.reserve(4 * cap_before);
+        assert!(rb.cap > cap_before, "reserve 应触发扩容");
+        assert_eq!(rb.len(), mirror.len());
+        for (i, want) in mirror.iter().enumerate() {
+            assert_eq!(rb.get(i), Some(*want), "扩容后 get({i})");
+        }
+        let (s0, s1) = rb.as_slices();
+        let joined: alloc::vec::Vec<u8> = s0.iter().chain(s1.iter()).copied().collect();
+        assert_eq!(joined, mirror, "扩容后 as_slices 拼接应与镜像一致");
     }
 }
