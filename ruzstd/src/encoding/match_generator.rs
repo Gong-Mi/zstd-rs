@@ -129,11 +129,18 @@ impl SuffixStore {
         }
     }
 
+    /// 与 `insert_hashed` 等价，哈希在内部算（逐位置插入路径用）
     #[inline(always)]
     fn insert(&mut self, suffix: &[u8], idx: usize) {
+        self.insert_hashed(Self::key_raw(suffix), idx);
+    }
+
+    /// 与 `insert` 等价，但原始哈希由调用方算好（同一位置探针 + 插入共用一次）
+    #[inline(always)]
+    fn insert_hashed(&mut self, raw: u64, idx: usize) {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::INSERTS, 1);
-        let key = self.key(suffix);
+        let key = self.index_of(raw);
         // 链：同 key 已有上一个位置才写 links（random 类无重复 key 的语料
         // 因此零链簿记，插入路径与单槽基线同成本）；候选切片止于当前位置
         // ⇒ 只有"足够远"的位置才给得出合法匹配，链把更老的位置留住。
@@ -155,11 +162,12 @@ impl SuffixStore {
         }
     }
 
+    /// 与 `get` 等价，但原始哈希由调用方算好
     #[inline(always)]
-    fn get(&self, suffix: &[u8]) -> Option<usize> {
+    fn get_hashed(&self, raw: u64) -> Option<usize> {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::PROBES, 1);
-        let key = self.key(suffix);
+        let key = self.index_of(raw);
         let hit = self.slots[key].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1);
         #[cfg(feature = "encstats")]
         if hit.is_some() {
@@ -168,8 +176,21 @@ impl SuffixStore {
         hit
     }
 
+    /// 与 `get_hashed` 等价，哈希在内部算。仅测试用（库内调用点都走 `get_hashed`
+    /// 以共用同一位置的原始哈希），不加 `cfg(test)` 会在 `-D warnings` 下被判死代码。
+    #[cfg(test)]
     #[inline(always)]
-    fn key(&self, suffix: &[u8]) -> usize {
+    fn get(&self, suffix: &[u8]) -> Option<usize> {
+        self.get_hashed(Self::key_raw(suffix))
+    }
+
+    /// 原始哈希：位置的 5 字节 key → 64 位混合值（未按表宽截断、未映射到槽下标）。
+    /// 同一位置的探针与插入共用它，窗口内多个后缀表也共用它；调用点若各算一遍，
+    /// 每位置就要付两遍 5 次 64 位乘法。
+    #[inline(always)]
+    fn key_raw(suffix: &[u8]) -> u64 {
+        #[cfg(feature = "encstats")]
+        crate::encstats::bump(crate::encstats::HASHES, 1);
         let s0 = suffix[0] as u64;
         let s1 = suffix[1] as u64;
         let s2 = suffix[2] as u64;
@@ -184,9 +205,23 @@ impl SuffixStore {
         let s3 = (s3 << 48).wrapping_mul(POLY);
         let s4 = (s4 << 56).wrapping_mul(POLY);
 
-        let index = s0 ^ s1 ^ s2 ^ s3 ^ s4;
-        let index = index >> (64 - self.len_log);
-        index as usize % self.slots.len()
+        s0 ^ s1 ^ s2 ^ s3 ^ s4
+    }
+
+    /// 原始哈希 → 本表槽下标。
+    /// `raw >> (64 - len_log)` 恒 < 2^len_log <= slots.len()（len_log 由
+    /// `with_capacity` 取槽表长度的 floor(log2)，清空/重用路径只把长度恢复成同一
+    /// 容量），所以原先尾部的 `% self.slots.len()` 是恒等变换：LLVM 看不到 ilog2
+    /// 与 len 的关系，于是每个位置都生成一次 64 位取模（aarch64: udiv + msub +
+    /// 除零检查），而结果永远不变。
+    #[inline(always)]
+    fn index_of(&self, raw: u64) -> usize {
+        debug_assert_eq!(
+            self.len_log,
+            self.slots.len().ilog2(),
+            "len_log 必须等于槽表长度的 floor(log2)"
+        );
+        (raw >> (64 - self.len_log)) as usize
     }
 }
 
@@ -276,8 +311,9 @@ impl MatchGenerator {
                 return true;
             }
 
-            // This is the key we are looking to find a match for
-            let key = &data_slice[..MIN_MATCH_LEN];
+            // 该位置的原始哈希：窗口内每个后缀表的探针与随后的插入共用一次计算
+            // （原先 `get` 与 `insert` 各算一遍，每遍 5 次 64 位乘法 + 一次动态取模）。
+            let key_raw = SuffixStore::key_raw(&data_slice[..MIN_MATCH_LEN]);
 
             // Look in each window entry
             let mut candidate = None;
@@ -307,7 +343,7 @@ impl MatchGenerator {
                 let mut cmps = 0usize;
                 // 首次比较命中长度：条件预算用它决定要不要花第二次比较
                 let mut last_hit_len = 0usize;
-                let mut cur = match_entry.suffixes.get(key);
+                let mut cur = match_entry.suffixes.get_hashed(key_raw);
                 while let Some(match_index) = cur {
                     let match_slice = if is_last {
                         &match_entry.data[match_index..self.suffix_idx]
@@ -389,8 +425,7 @@ impl MatchGenerator {
                 // (avoids O(match_len) hash inserts per match).
                 // We still insert the current position's key so future lookups work.
                 let last_entry = self.window.last_mut().unwrap();
-                let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-                last_entry.suffixes.insert(key, self.suffix_idx);
+                last_entry.suffixes.insert_hashed(key_raw, self.suffix_idx);
 
                 // 扣除倒退吸纳的字面量
                 let last_entry = self.window.last().unwrap();
@@ -412,8 +447,7 @@ impl MatchGenerator {
             }
 
             let last_entry = self.window.last_mut().unwrap();
-            let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-            last_entry.suffixes.insert(key, self.suffix_idx);
+            last_entry.suffixes.insert_hashed(key_raw, self.suffix_idx);
             // Step acceleration, aligned with C's fast path
             // (`ZSTD_compressBlock_fast_generic`, lib/compress/zstd_fast.c:
             //  `step = stepSize` / `if (ip1 >= nextStep) { step++; nextStep += kStepIncr; }`
@@ -768,3 +802,105 @@ fn chain_reaches_old_positions() {
     }
     assert_eq!(seen, alloc::vec![4, 3, 2, 1, 0], "链走查应能回到最老位置");
 }
+
+/// 本片等价性硬门：`key_raw` + `index_of` 必须与重构前的 `key()`（含结尾的
+/// `% slots.len()`）给出**完全相同**的下标，否则压缩输出就不再逐字节相同。
+#[test]
+fn key_raw_and_index_of_match_legacy_hash() {
+    fn legacy_key(suffix: &[u8], len_log: u32, slots_len: usize) -> usize {
+        let s0 = suffix[0] as u64;
+        let s1 = suffix[1] as u64;
+        let s2 = suffix[2] as u64;
+        let s3 = suffix[3] as u64;
+        let s4 = suffix[4] as u64;
+        const POLY: u64 = 0xCF3BCCDCABu64;
+        let s0 = (s0 << 24).wrapping_mul(POLY);
+        let s1 = (s1 << 32).wrapping_mul(POLY);
+        let s2 = (s2 << 40).wrapping_mul(POLY);
+        let s3 = (s3 << 48).wrapping_mul(POLY);
+        let s4 = (s4 << 56).wrapping_mul(POLY);
+        let index = s0 ^ s1 ^ s2 ^ s3 ^ s4;
+        let index = index >> (64 - len_log);
+        index as usize % slots_len
+    }
+
+    let mut state = 0x1234_5678_9ABC_DEF0u64;
+    for round in 0..4096u32 {
+        let mut key = [0u8; 5];
+        for b in key.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (state >> 33) as u8;
+        }
+        for capacity in [64usize, 100, 1024, 4096, 131_072] {
+            let store = SuffixStore::with_capacity(capacity);
+            let got = store.index_of(SuffixStore::key_raw(&key));
+            let want = legacy_key(&key, capacity.ilog2(), store.slots.len());
+            assert_eq!(
+                got, want,
+                "round {} capacity {} key {:?}",
+                round, capacity, key
+            );
+        }
+    }
+}
+
+/// 去掉恒等取模的安全前提：下标必须始终落在槽表长度内（含非 2 的幂的容量）。
+#[test]
+fn index_of_stays_in_bounds() {
+    for capacity in [64usize, 100, 1024, 4096, 131_072] {
+        let store = SuffixStore::with_capacity(capacity);
+        assert_eq!(store.slots.len(), capacity);
+        for seed in 0u64..2048 {
+            let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut key = [0u8; 5];
+            for b in key.iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                *b = s as u8;
+            }
+            let idx = store.index_of(SuffixStore::key_raw(&key));
+            assert!(
+                idx < store.slots.len(),
+                "index_of 越界: capacity {} seed {} idx {}",
+                capacity,
+                seed,
+                idx
+            );
+        }
+    }
+}
+
+/// `get`/`insert` 薄包装与 `get_hashed`/`insert_hashed` 必须完全一致。
+#[test]
+fn hashed_variants_agree_with_wrappers() {
+    let mut plain = SuffixStore::with_capacity(1024);
+    let mut hashed = SuffixStore::with_capacity(1024);
+    let mut keys = alloc::vec::Vec::new();
+    let mut s = 0xDEAD_BEEF_CAFE_1234u64;
+    for _ in 0..2048 {
+        let mut key = [0u8; 5];
+        for b in key.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *b = s as u8;
+        }
+        keys.push(key);
+    }
+    for (i, key) in keys.iter().enumerate() {
+        plain.insert(key, i);
+        hashed.insert_hashed(SuffixStore::key_raw(key), i);
+    }
+    for key in keys.iter() {
+        assert_eq!(plain.get(key), hashed.get_hashed(SuffixStore::key_raw(key)));
+    }
+}
+
+// 说明：同一位置只算一次哈希"的行为门（`hashes < probes + inserts`）不放在这里。
+// `encstats` 是进程级全局计数器，而 `cargo hack test` 会在同一个进程里并行跑整套
+// 用例：别人的压缩会 bump 同一组计数器，`take()` 逐项 swap 又会把并发者上半段计数
+// 切在中间，于是窗口内会出现 `hashes > probes + inserts` 的假失败。
+// 该门放在单进程的 `examples/enccounts.rs` 里（那里 take() 前后没有别的压缩）。
