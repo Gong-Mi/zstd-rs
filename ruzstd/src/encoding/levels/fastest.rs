@@ -24,8 +24,7 @@ pub fn compress_fastest<M: Matcher>(
     output: &mut Vec<u8>,
 ) {
     let block_size = uncompressed_data.len() as u32;
-    // Combined fast-path: check RLE and incompressibility in a single pass
-    // over a sample, avoiding the old O(n) RLE scan on every block.
+    // Check the RLE sample before scanning the rest of a potentially RLE block.
     let sample_len = uncompressed_data.len().min(1024);
     let first_byte = uncompressed_data[0];
     let mut all_same = true;
@@ -54,33 +53,8 @@ pub fn compress_fastest<M: Matcher>(
         header.serialize(output);
         output.push(rle_byte);
     } else {
-        // Quick incompressibility check: sample up to 1KB of the block and count
-        // distinct byte values. If the data is near-maximum entropy (>= 250 distinct
-        // values out of 256), hash matching will find nothing useful — skip straight
-        // to a raw block. This mirrors C zstd's fast-path acceleration behaviour where
-        // the step size grows until it effectively skips the whole block.
-        let sample_len = uncompressed_data.len().min(1024);
-        let mut seen = [false; 256];
-        let mut distinct: u16 = 0;
-        for &b in &uncompressed_data[..sample_len] {
-            if !seen[b as usize] {
-                seen[b as usize] = true;
-                distinct += 1;
-            }
-        }
-        if distinct >= 250 {
-            // Data is effectively incompressible — emit raw block without matching.
-            // Recycle the buffer directly without building suffix indexes.
-            let header = BlockHeader {
-                last_block,
-                block_type: crate::blocks::block::BlockType::Raw,
-                block_size,
-            };
-            header.serialize(output);
-            output.extend_from_slice(&uncompressed_data);
-            state.matcher.recycle_space(uncompressed_data);
-            return;
-        }
+        // Byte diversity does not rule out LZ matches elsewhere in the block.
+        // Try compression and retain the existing size-based raw fallback.
 
         // Compress as a standard compressed block
         let mut compressed = Vec::new();

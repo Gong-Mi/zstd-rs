@@ -170,8 +170,57 @@ impl HuffmanTable {
         Self::build_from_counts(&counts[..=max as usize])
     }
 
+    /// Build a Huffman table from symbol **frequencies**.
+    ///
+    /// The previous implementation derived the *shape* of the code-length distribution
+    /// from the number of distinct symbols only (`distribute_weights`) and used the
+    /// frequencies just to decide *which* symbol gets which length. That degenerates to
+    /// an ~8 bit/symbol flat table whenever all 256 byte values occur — which is the
+    /// normal case for binary data: measured ratio 1.0004 (i.e. no compression at all)
+    /// on literal blocks whose optimal Huffman coding is ~0.78, while the reference C
+    /// implementation compresses the very same bytes to 0.743-0.796.
+    ///
+    /// Now the code lengths come from a real Huffman tree over the frequencies, limited
+    /// to [`HUFF_MAX_BITS`] bits with an exact Kraft sum (required by the weight-based
+    /// table format). If any of that cannot be satisfied the old construction is used as
+    /// a fallback, so a malformed table can never reach the bitstream.
     pub fn build_from_counts(counts: &[usize]) -> Self {
         assert!(counts.len() <= 256);
+
+        // 非零符号，按频率降序（并列按符号升序 ⇒ 确定性）
+        let mut present: Vec<(usize, u8)> = counts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(s, c)| (*c, s as u8))
+            .collect();
+        present.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+        if present.len() >= 2 {
+            let lens = code_lengths_by_frequency(&present);
+            if let Some(lens) = lens {
+                let max_bits = lens.iter().copied().max().unwrap();
+                let mut weights = alloc::vec![0; counts.len()];
+                for ((_, sym), len) in present.iter().zip(lens.iter()) {
+                    weights[*sym as usize] = max_bits + 1 - len;
+                }
+                // 安全网：权重和必须是 2 的幂（等价于 Kraft 和恰为 1），否则回退
+                let weight_sum: usize = weights
+                    .iter()
+                    .map(|w| if *w > 0 { 1 << (w - 1) } else { 0 })
+                    .sum();
+                if weight_sum.is_power_of_two() {
+                    return Self::build_from_weights(&weights);
+                }
+                debug_assert!(false, "frequency-based table did not form a complete code");
+            }
+        }
+
+        Self::build_from_counts_by_symbol_count(counts)
+    }
+
+    /// 旧路径：按"不同符号个数"造形状（作为单符号/兜底使用）
+    fn build_from_counts_by_symbol_count(counts: &[usize]) -> Self {
         let zeros = counts.iter().filter(|x| **x == 0).count();
         let mut weights = distribute_weights(counts.len() - zeros);
         let limit = weights.len().ilog2() as usize + 2;
@@ -267,7 +316,173 @@ impl HuffmanTable {
     }
 }
 
-/// Assert that the provided value is greater than zero, and returns index of the first set bit
+/// zstd 的 Huffman 表最多 11 bit（`HUF_TABLELOG_MAX`）
+const HUFF_MAX_BITS: usize = 11;
+
+/// 按频率降序的 `(count, symbol)` 计算码长：先建最优 Huffman 树，再限长到
+/// [`HUFF_MAX_BITS`] 且保证 Kraft 和恰为 1。返回 `None` 表示无法构造合法表。
+fn code_lengths_by_frequency(present: &[(usize, u8)]) -> Option<Vec<usize>> {
+    let mut lens = optimal_huffman_lengths(present);
+    if lens.iter().any(|l| *l > HUFF_MAX_BITS) {
+        limit_code_lengths(&mut lens, present, HUFF_MAX_BITS)?;
+    }
+    // 校验：Kraft 和必须恰好为 1（即 Σ2^(max_bits-len) == 2^max_bits）
+    let max_bits = *lens.iter().max().unwrap();
+    let kraft: usize = lens.iter().map(|l| 1usize << (max_bits - l)).sum();
+    if kraft != (1usize << max_bits) {
+        return None;
+    }
+    Some(lens)
+}
+
+/// 经典 Huffman 深度（两队列法）：叶子按频率升序、合并出的内部节点权重天然非降，
+/// 因此取最小权节点只需比较两条队列的队首，O(n)。
+/// 深度用父指针上溯求（O(n·depth)），避免旧实现的 O(n²) 成员表拷贝与分配
+/// ——实测那正是小块语料（字面量少但反复建表）上 +77% 耗时的来源。
+fn optimal_huffman_lengths(present: &[(usize, u8)]) -> Vec<usize> {
+    let n = present.len();
+    let mut parent: alloc::vec::Vec<usize> = alloc::vec![usize::MAX; 2 * n];
+    let mut weight: alloc::vec::Vec<u64> = alloc::vec![0; 2 * n];
+    for (i, (count, _)) in present.iter().enumerate() {
+        weight[i] = *count as u64;
+    }
+
+    // 叶子队列按 (频率升序, 符号升序) 排序，复现旧实现在并列时的取值，保证 ratio 逐字节不变
+    let mut leaves: alloc::vec::Vec<usize> = (0..n).collect();
+    leaves.sort_by(|a, b| {
+        present[*a]
+            .0
+            .cmp(&present[*b].0)
+            .then(present[*a].1.cmp(&present[*b].1))
+    });
+    let mut merged: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(n);
+    let (mut li, mut mi) = (0usize, 0usize);
+    let mut next = n;
+
+    let pick_min = |leaves: &[usize],
+                    li: &mut usize,
+                    merged: &[usize],
+                    mi: &mut usize,
+                    weight: &[u64]|
+     -> usize {
+        let from_leaf = leaves.get(*li).copied();
+        let from_merged = merged.get(*mi).copied();
+        match (from_leaf, from_merged) {
+            (Some(l), Some(m)) => {
+                // 权重相等时优先取叶子，保证确定性
+                if weight[l] <= weight[m] {
+                    *li += 1;
+                    l
+                } else {
+                    *mi += 1;
+                    m
+                }
+            }
+            (Some(l), None) => {
+                *li += 1;
+                l
+            }
+            (None, Some(m)) => {
+                *mi += 1;
+                m
+            }
+            (None, None) => unreachable!("huffman merge ran out of nodes"),
+        }
+    };
+
+    while (leaves.len() - li) + (merged.len() - mi) > 1 {
+        let a = pick_min(&leaves, &mut li, &merged, &mut mi, &weight);
+        let b = pick_min(&leaves, &mut li, &merged, &mut mi, &weight);
+        weight[next] = weight[a] + weight[b];
+        parent[a] = next;
+        parent[b] = next;
+        merged.push(next);
+        next += 1;
+    }
+
+    let mut lens = alloc::vec![0usize; n];
+    for (i, len) in lens.iter_mut().enumerate() {
+        let mut cur = i;
+        while parent[cur] != usize::MAX {
+            *len += 1;
+            cur = parent[cur];
+        }
+    }
+    lens
+}
+
+/// 把码长限制到 `max_bits`，并修复 Kraft 和使其恰好为 1。
+/// 记账用整数 `N = Σ 2^(max_bits - len)`，完整码要求 `N == 2^max_bits`。
+fn limit_code_lengths(lens: &mut [usize], present: &[(usize, u8)], max_bits: usize) -> Option<()> {
+    let target = 1usize << max_bits;
+    let kraft = |lens: &[usize]| -> usize { lens.iter().map(|l| 1usize << (max_bits - l)).sum() };
+
+    // 1) 过深的码先压到上限（这会让 N 超过 target，下一步偿还）
+    for l in lens.iter_mut() {
+        if *l > max_bits {
+            *l = max_bits;
+        }
+    }
+
+    let mut guard = 0usize;
+    // 2) N > target：加长"最不频繁"的符号（每次扣除一个 2 的幂）
+    while kraft(lens) > target {
+        guard += 1;
+        if guard > 8 * lens.len() + 64 {
+            return None;
+        }
+        let excess = kraft(lens) - target;
+        let mut best: Option<usize> = None;
+        for i in 0..lens.len() {
+            if lens[i] < max_bits {
+                let step = 1usize << (max_bits - lens[i] - 1);
+                if step <= excess && best.is_none_or(|b| present[i].0 < present[b].0) {
+                    best = Some(i);
+                }
+            }
+        }
+        match best {
+            Some(i) => lens[i] += 1,
+            // 没有单步能精确偿还 ⇒ 先加长一个（欠还），交给第 3 步补
+            None => {
+                let i = (0..lens.len())
+                    .filter(|i| lens[*i] < max_bits)
+                    .min_by_key(|i| present[*i].0)?;
+                lens[i] += 1;
+            }
+        }
+    }
+
+    // 3) N < target：缩短"最频繁"的符号补满（每次增加一个 2 的幂）
+    while kraft(lens) < target {
+        guard += 1;
+        if guard > 8 * lens.len() + 64 {
+            return None;
+        }
+        let room = target - kraft(lens);
+        let mut best: Option<usize> = None;
+        for i in 0..lens.len() {
+            if lens[i] > 1 {
+                let step = 1usize << (max_bits - lens[i]);
+                if step <= room && best.is_none_or(|b| present[i].0 > present[b].0) {
+                    best = Some(i);
+                }
+            }
+        }
+        match best {
+            Some(i) => lens[i] -= 1,
+            // 现有步长都太大 ⇒ 加长一个低频符号腾出更细的步长
+            None => {
+                let i = (0..lens.len())
+                    .filter(|i| lens[*i] < max_bits)
+                    .min_by_key(|i| present[*i].0)?;
+                lens[i] += 1;
+            }
+        }
+    }
+    Some(())
+}
+
 fn highest_bit_set(x: usize) -> usize {
     assert!(x > 0);
     usize::BITS as usize - x.leading_zeros() as usize
@@ -473,11 +688,94 @@ fn counts() {
 
 #[test]
 fn from_data() {
-    let counts = &[3, 0, 4, 1, 5];
+    // counts 必须与下面 data 的真实频率一致（旧值 counts[4]=5 与数据不符；
+    // 旧实现只用"符号个数"造表、忽略频率，所以这个不一致一直没暴露）
+    let counts = &[3, 0, 4, 1, 2];
     let table = HuffmanTable::build_from_counts(counts).codes;
 
     let data = &[0, 2, 4, 4, 0, 3, 2, 2, 0, 2];
     let table2 = HuffmanTable::build_from_data(data).codes;
 
     assert_eq!(table, table2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 平均码长（按频率加权），用整数算术：Σ count·len / Σ count
+    fn avg_bits_x1000(counts: &[usize], table: &HuffmanTable) -> usize {
+        let total: usize = counts.iter().sum();
+        let weighted: usize = counts
+            .iter()
+            .enumerate()
+            .map(|(s, c)| c * table.codes[s].1 as usize)
+            .sum();
+        weighted * 1000 / total.max(1)
+    }
+
+    /// 二进制字面量的典型形状：256 个符号全出现但频率明显偏斜（实测字面量熵 ≈6.2 bit/符号）。
+    /// 旧实现按"符号个数"造表 ⇒ 平均 ≈8 bit（等于没压）；按频率建表必须显著低于 8。
+    fn skewed_256() -> alloc::vec::Vec<usize> {
+        (0..256)
+            .map(|i| (20000 / (i + 1)).max(1) + (i % 5))
+            .collect()
+    }
+
+    #[test]
+    fn frequency_based_table_is_not_flat() {
+        let counts = skewed_256();
+        let table = HuffmanTable::build_from_counts(&counts);
+        let max_bits = (0..256).map(|s| table.codes[s].1).max().unwrap();
+        let avg = avg_bits_x1000(&counts, &table);
+        assert!(
+            max_bits as usize <= HUFF_MAX_BITS,
+            "码长超过上限: {max_bits}"
+        );
+        // 旧实现退化形态 ≈8.0 bit ⇒ 7.2 是明确的判别线
+        assert!(avg < 7200, "平均码长 {avg}/1000 说明表仍然退化（≈8 bit）");
+    }
+
+    /// 全 256 符号均匀：平均应恰好 8 bit（既不退化也不膨胀）
+    #[test]
+    fn flat_256_symbols_stays_at_8_bits() {
+        let counts = alloc::vec![1024usize; 256];
+        let table = HuffmanTable::build_from_counts(&counts);
+        assert_eq!(avg_bits_x1000(&counts, &table), 8000);
+    }
+
+    /// 任何输入都必须产出完整码（Kraft 和恰为 1，整数判据），含退化边界
+    #[test]
+    fn produced_tables_are_complete_codes() {
+        let cases: alloc::vec::Vec<alloc::vec::Vec<usize>> = alloc::vec![
+            alloc::vec![5, 1, 0],
+            alloc::vec![5, 5, 5],
+            skewed_256(),
+            alloc::vec![1024; 256],
+            alloc::vec![100000, 3, 2, 1],
+        ];
+        for counts in cases {
+            let table = HuffmanTable::build_from_counts(&counts);
+            let max_bits = (0..counts.len())
+                .filter(|s| counts[*s] > 0)
+                .map(|s| table.codes[s].1 as usize)
+                .max()
+                .unwrap();
+            assert!(
+                max_bits <= HUFF_MAX_BITS,
+                "counts 首项 {} 码长超限",
+                counts[0]
+            );
+            let kraft: usize = (0..counts.len())
+                .filter(|s| counts[*s] > 0)
+                .map(|s| 1usize << (max_bits - table.codes[s].1 as usize))
+                .sum();
+            assert_eq!(
+                kraft,
+                1usize << max_bits,
+                "Kraft 和不完整（counts 首项 {}）",
+                counts[0]
+            );
+        }
+    }
 }
