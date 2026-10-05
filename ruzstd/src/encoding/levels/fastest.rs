@@ -153,7 +153,19 @@ mod tests {
 
     #[test]
     fn early_raw_and_rle_preserve_offset_history() {
-        let early_raw: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        // Deterministic pseudo-random block: incompressible no matter how good
+        // the matcher gets, so this keeps exercising the size-based raw fallback
+        // (the previous 0..=255 cycling fixture became compressible once the
+        // matcher learned to find the 256-byte repeat).
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let early_raw: Vec<u8> = (0..1024)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
         let rle = alloc::vec![7; 64];
         for (input, block_type) in [(early_raw, 0), (rle, 1)] {
             let mut state = state();
