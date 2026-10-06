@@ -1,4 +1,4 @@
-name: perf A/B
+name: Rust explicit C-equivalent flags
 
 # All routes use the same locked harness, runner, manifest and comparator.
 # Automatic runs are schema/correctness smoke, NOT performance acceptance.
@@ -28,7 +28,7 @@ on:
         type: boolean
         default: false
       config_leg:
-        description: 'Separate default/tuned/default interleaved configuration suite'
+        description: 'Diagnostic explicit PIC + function/data sections; no native or extra LTO'
         type: boolean
         default: false
       arm_crosscheck:
@@ -39,10 +39,6 @@ on:
         description: 'Explicit performance gate; default green means data-complete only'
         type: boolean
         default: false
-  push:
-    branches: ['ci-perf*', 'perf/*', 'test/perf-contract']
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -181,8 +177,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "CC=$CC CXX=$CXX" >> build-records/cc.txt
-          (cd base/tools/perf/harness && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/targets/base" cargo build --locked --release) > build-records/base.log 2>&1
-          (cd head/tools/perf/harness && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/targets/head" cargo build --locked --release) > build-records/head.log 2>&1
+          (cd base/tools/perf/harness && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/targets/base" RUSTFLAGS="-C save-temps=yes" cargo build --locked --release -vv) > build-records/base.log 2>&1
+          (cd head/tools/perf/harness && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/targets/head" RUSTFLAGS="-C save-temps=yes" cargo build --locked --release -vv) > build-records/head.log 2>&1
           cp targets/base/release/ruzstd-perf-harness bins/base
           cp targets/head/release/ruzstd-perf-harness bins/head
           sha256sum bins/base bins/head > build-records/binaries.sha256
@@ -214,6 +210,25 @@ jobs:
             echo "FAIL: hand-written assembly is present in the C reference" | tee -a build-records/c-asm.txt
             exit 1
           fi
+      - name: Record and probe Rust flag correspondence
+        run: |
+          set -euo pipefail
+          rustc -vV > build-records/rustc-explicit-flags.txt
+          RUSTC_BOOTSTRAP=1 rustc -Z unstable-options --print target-spec-json > build-records/rust-target.json
+          printf '%s\n' '-C save-temps=yes' > build-records/default-rust-flags.txt
+          printf '%s\n' '-C save-temps=yes -C relocation-model=pic -Z function-sections=yes' > build-records/explicit-rust-flags.txt
+          printf '%s\n' 'Diagnostic RUSTC_BOOTSTRAP=1 is required for -Z function-sections; no production flags or C flags changed.' > build-records/flag-scope.txt
+          printf '%s\n' '#![crate_type="lib"]' '#![no_std]' '#[no_mangle] pub extern "C" fn flag_probe(x:u64)->u64 { x.wrapping_mul(31) }' > build-records/flag_probe.rs
+          RUSTC_BOOTSTRAP=1 rustc -O --emit=obj -C relocation-model=pic -Z function-sections=yes build-records/flag_probe.rs -o build-records/flag_probe.o
+          readelf -SW build-records/flag_probe.o > build-records/flag_probe.sections.txt
+          set +e
+          rustc -O --emit=obj -C llvm-args=-merge-all-constants build-records/flag_probe.rs -o build-records/clang-front-end-flag.o > build-records/merge-all-constants-probe.log 2>&1
+          status=$?
+          set -e
+          printf '%s\n' "$status" > build-records/merge-all-constants-probe.exit
+          # Unsupported C-front-end flags are not silently substituted with another optimization.
+          [ "$status" -ne 0 ] || { echo 'Unexpected compiler support: inspect before interpreting equivalence'; exit 1; }
+          python3 -c "from pathlib import Path; s=Path('build-records/merge-all-constants-probe.log').read_text(); assert 'Unknown command line argument' in s and 'merge-all-constants' in s, s"
       - name: Optional tuned binary, with explicit build status
         env:
           CONFIG: ${{ inputs.config_leg && 'true' || 'false' }}
@@ -221,8 +236,9 @@ jobs:
           printf 'NOT_RUN\n' > build-records/config.status
           if [ "$CONFIG" = true ]; then
             if (cd head/tools/perf/harness && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/targets/tuned" \
-                CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
-                RUSTFLAGS='-C target-cpu=native' cargo build --locked --release) > build-records/config.log 2>&1 && \
+                RUSTC_BOOTSTRAP=1 \
+                RUSTFLAGS='-C save-temps=yes -C relocation-model=pic -Z function-sections=yes' \
+                cargo build --locked --release -vv) > build-records/config.log 2>&1 && \
                 cp targets/tuned/release/ruzstd-perf-harness bins/head_tuned; then
               printf 'COMPLETE\n' > build-records/config.status
             else
@@ -295,5 +311,6 @@ jobs:
           path: |
             perf-results/
             build-records/
+            bins/
             corpus-cache/status.json
             policy-corpus/policy-manifest.json
