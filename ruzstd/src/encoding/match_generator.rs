@@ -279,9 +279,17 @@ impl MatchGenerator {
             // This is the key we are looking to find a match for
             let key = &data_slice[..MIN_MATCH_LEN];
 
-            // Look in each window entry
+            // Look in each window entry. The walk/compare budgets are shared
+            // across the entries: with a single slice this is identical to the
+            // per-entry scope, and with several slices it keeps the per-position
+            // work bounded instead of paying the budget once per slice.
             let mut candidate = None;
-            for (match_entry_idx, match_entry) in self.window.iter().enumerate() {
+            let mut walked = 0usize;
+            let mut cmps = 0usize;
+            // 首次比较命中长度：条件预算用它决定要不要花第二次比较
+            let mut last_hit_len = 0usize;
+            // 最新切片优先：共享预算下先让最近（同长取近）的候选参与。
+            for (match_entry_idx, match_entry) in self.window.iter().enumerate().rev() {
                 // 有界链走查（与比较融合，不预取整条链）：
                 //  - 内容比较是成本主项 ⇒ 预算 CHAIN_CMP_MAX 次；
                 //  - "太近"候选（切片 < MIN_MATCH_LEN，步进加速下常见）不消耗比较预算，
@@ -302,10 +310,6 @@ impl MatchGenerator {
                 const CHAIN_CMP_MAX: usize = 4;
                 const LONG_HIT_CUT: usize = 8;
                 const CHAIN_WALK_MAX: usize = 32;
-                let mut walked = 0usize;
-                let mut cmps = 0usize;
-                // 首次比较命中长度：条件预算用它决定要不要花第二次比较
-                let mut last_hit_len = 0usize;
                 let mut cur = match_entry.suffixes.get(key);
                 while let Some(match_index) = cur {
                     // Full forward extension for every candidate, mirroring
