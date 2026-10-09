@@ -253,7 +253,10 @@ impl FSETable {
             }
         }
 
-        let mut br = Lsb { data: source, pos: 0 };
+        let mut br = Lsb {
+            data: source,
+            pos: 0,
+        };
         let table_log = (br.peek(4) as u8) + ACC_LOG_OFFSET;
         br.consume(4);
         if table_log > max_log {

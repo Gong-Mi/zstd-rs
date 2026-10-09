@@ -649,7 +649,11 @@ mod normalization_tests {
             ),
             (vec![256, 256], 9, "14f03f"),
             (vec![128, 128], 8, "13f80f"),
-            (vec![256, 128, 64, 32, 16, 8, 4, 2, 1, 1], 9, "14303018c6ec1c"),
+            (
+                vec![256, 128, 64, 32, 16, 8, 4, 2, 1, 1],
+                9,
+                "14303018c6ec1c",
+            ),
             (vec![512], 9, "f43f"),
             (vec![340, 43, 43, 43, 43], 9, "5495c562fd"),
             (
@@ -687,7 +691,10 @@ mod normalization_tests {
             while got.last() == Some(&0) {
                 got.pop();
             }
-            assert_eq!(got, want, "read-back mismatch for probs={probs:?} log={log}");
+            assert_eq!(
+                got, want,
+                "read-back mismatch for probs={probs:?} log={log}"
+            );
         }
     }
 }
