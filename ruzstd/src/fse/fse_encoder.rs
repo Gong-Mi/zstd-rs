@@ -307,7 +307,7 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
     let n = counts.len();
     let total: u64 = counts.iter().map(|c| *c as u64).sum();
     assert!(total > 0);
-    let acc_log = max_log.min(12).max(5);
+    let acc_log = max_log.clamp(5, 12);
     let t = 1usize << acc_log;
     let mut probs = alloc::vec![0usize; n];
     let mut assigned = 0usize;
@@ -334,8 +334,8 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
     } else if assigned > t {
         while assigned > t {
             let mut best = usize::MAX;
-            for s in 0..n {
-                if probs[s] > 1 && (best == usize::MAX || probs[s] > probs[best]) {
+            for (s, &p) in probs.iter().enumerate() {
+                if p > 1 && (best == usize::MAX || p > probs[best]) {
                     best = s;
                 }
             }
@@ -363,23 +363,23 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
         let t2 = t / 2;
         let mut max_idx = 0usize;
         let mut max_val = 0usize;
-        for s in 0..n {
-            if probs[s] > max_val {
-                max_val = probs[s];
+        for (s, &p) in probs.iter().enumerate() {
+            if p > max_val {
+                max_val = p;
                 max_idx = s;
             }
         }
         if max_val > t2 {
             let redist = max_val - t2;
             let mut si = usize::MAX;
-            for s in 0..n {
-                if s != max_idx && probs[s] > 0 && (si == usize::MAX || probs[s] > probs[si]) {
+            for (s, &p) in probs.iter().enumerate() {
+                if s != max_idx && p > 0 && (si == usize::MAX || p > probs[si]) {
                     si = s;
                 }
             }
             if si == usize::MAX {
-                for s in 0..n {
-                    if s != max_idx && probs[s] == 0 {
+                for (s, &p) in probs.iter().enumerate() {
+                    if s != max_idx && p == 0 {
                         si = s;
                         break;
                     }
