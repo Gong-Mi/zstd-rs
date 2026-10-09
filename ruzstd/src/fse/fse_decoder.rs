@@ -338,7 +338,7 @@ impl FSETable {
             });
         }
 
-        let bytes_read = (br.pos + 7) / 8;
+        let bytes_read = br.pos.div_ceil(8);
 
         Ok(bytes_read)
     }
