@@ -80,7 +80,15 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             compressed_data: None,
             compression_level,
             state: CompressState {
-                matcher: MatchGeneratorDriver::new(1024 * 128, 1),
+                // EXPERIMENT (frontier held for the stage-2 search rewrite):
+                // 512 KiB window (4 x 128 KiB slices) buys the largest single
+                // ratio step measured (text4m -5.3%, elf4m -3.8%) but costs
+                // +128% encode locally because every position probes each
+                // slice's hash table separately. Ship together with the
+                // single-table 512 KiB search, not before. Frontier (text4m
+                // ms/bytes): 1=52.6/1,069,686  2=75.2/1,021,951
+                // 3=101.1/1,016,949  4=120.2/1,012,859.
+                matcher: MatchGeneratorDriver::new(1024 * 128, 4),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
             },
