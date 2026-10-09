@@ -348,13 +348,14 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
     }
 
     // Honor avoid_0_numbit: keep every symbol's probability at or below T/2 so
-    // no symbol owns num_bits == 0 states. This is not just a size heuristic:
-    // the Huffman weights table is decoded by a bit-exhaustion-terminated
-    // interleaved FSE pair (no symbol count), and runs of 0-bit states make the
-    // decoder overshoot, corrupting the reconstructed tree (observed as
-    // LeftoverIsNotAPowerOf2 / off-by-one top symbols). The frame sequence
-    // tables are count-terminated and do not require the cap; call sites that
-    // can count pass `false` (see choose_table in encoding/blocks/compressed.rs).
+    // no symbol owns num_bits == 0 states. The original motivation for the cap
+    // is load-bearing: the Huffman weights table is decoded by a
+    // bit-exhaustion-terminated interleaved FSE pair (no symbol count), and
+    // runs of 0-bit states make the decoder overshoot, corrupting the
+    // reconstructed tree (observed as LeftoverIsNotAPowerOf2 / off-by-one top
+    // symbols). Beyond correctness, mixed-width ranges also lengthen the
+    // encoder's state lookup compared to uniform ones, so the cap is kept for
+    // every call site.
     //
     // Single-symbol alphabets: build_table_from_data reserves a second slot
     // when avoid_0_numbit is set, so a receiver for the redistributed mass

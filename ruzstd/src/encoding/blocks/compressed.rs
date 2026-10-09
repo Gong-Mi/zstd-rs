@@ -128,11 +128,7 @@ fn choose_table<'a>(
     if use_previous_table {
         FseTableMode::RepeateLast(previous.unwrap())
     } else if use_new_table {
-        // `false` = the T/2 cap of the normalizer is not needed here: the fused
-        // sequence decoder is terminated by an explicit sequence count, so
-        // num_bits == 0 states cannot cause the bit-exhaustion overshoot that
-        // the Huffman weights decoder suffers from (it passes `true`).
-        FseTableMode::Encoded(build_table_from_data(data, max_log, false))
+        FseTableMode::Encoded(build_table_from_data(data, max_log, true))
     } else {
         FseTableMode::Predefined(default_table)
     }
