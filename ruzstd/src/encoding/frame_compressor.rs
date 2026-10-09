@@ -80,7 +80,14 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             compressed_data: None,
             compression_level,
             state: CompressState {
-                matcher: MatchGeneratorDriver::new(1024 * 128, 1),
+                // 256 KiB window (2 x 128 KiB slices). With a single slice the
+                // first sequences of every block restart from block-local
+                // literals; the shared-store search prices a second slice at
+                // ~+19% encode locally for text4m -4.2% (frontier with a 4th
+                // slice: -5.3% at +50%+ — held back until the search itself
+                // gets cheaper). Window covered by the shared suffix store, so
+                // this costs one probe per position, not one per slice.
+                matcher: MatchGeneratorDriver::new(1024 * 128, 2),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
             },
