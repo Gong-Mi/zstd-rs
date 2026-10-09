@@ -145,46 +145,94 @@ impl FSETable {
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
-        writer.write_bits(self.acc_log() - 5, 4);
-        let mut probability_counter = 0usize;
-        let probability_sum = 1 << self.acc_log();
-
-        let mut prob_idx = 0;
-        while probability_counter < probability_sum {
-            let max_remaining_value = probability_sum - probability_counter + 1;
-            let bits_to_write = max_remaining_value.ilog2() + 1;
-            let low_threshold = ((1 << bits_to_write) - 1) - (max_remaining_value);
-            let mask = (1 << (bits_to_write - 1)) - 1;
-
-            let prob = self.states[prob_idx].probability;
-            prob_idx += 1;
-            let value = (prob + 1) as u32;
-            if value < low_threshold as u32 {
-                writer.write_bits(value, bits_to_write as usize - 1);
-            } else if value > mask {
-                writer.write_bits(value + low_threshold as u32, bits_to_write as usize);
-            } else {
-                writer.write_bits(value, bits_to_write as usize);
-            }
-
-            if prob == -1 {
-                probability_counter += 1;
-            } else if prob > 0 {
-                probability_counter += prob as usize;
-            } else {
-                let mut zeros = 0u8;
-                while self.states[prob_idx].probability == 0 {
-                    zeros += 1;
-                    prob_idx += 1;
-                    if zeros == 3 {
-                        writer.write_bits(3u8, 2);
-                        zeros = 0;
-                    }
+        // Byte-exact port of C's FSE_writeNCount_generic (lib/compress/fse_compress.c,
+        // zstd v1.5.7): the table description is an LSB-first byte stream, so it is
+        // assembled with a local accumulator and appended whole (the frame cursor is
+        // byte aligned here). Matching the reference writer byte for byte keeps our
+        // streams canonical: the previous bit-by-bit writer produced different (for
+        // some shapes non-round-trippable) descriptions for the same probabilities.
+        let table_log = self.acc_log();
+        let table_size: u32 = 1 << table_log;
+        let alphabet = self.states.len();
+        let mut out: Vec<u8> = Vec::new();
+        let mut bit_stream: u32 = 0;
+        let mut bit_count: i32 = 0;
+        bit_stream = bit_stream.wrapping_add(((table_log - 5) as u32) << bit_count);
+        bit_count += 4;
+        let mut remaining: i32 = table_size as i32 + 1;
+        let mut threshold: i32 = table_size as i32;
+        let mut nb_bits: i32 = table_log as i32 + 1;
+        let mut symbol = 0usize;
+        let mut previous_is0 = false;
+        while symbol < alphabet && remaining > 1 {
+            if previous_is0 {
+                let start = symbol;
+                while symbol < alphabet && self.states[symbol].probability == 0 {
+                    symbol += 1;
                 }
-                writer.write_bits(zeros, 2);
+                if symbol == alphabet {
+                    break;
+                }
+                let mut st = start;
+                while symbol >= st + 24 {
+                    st += 24;
+                    bit_stream = bit_stream.wrapping_add(0xFFFFu32 << bit_count);
+                    out.push(bit_stream as u8);
+                    out.push((bit_stream >> 8) as u8);
+                    bit_stream >>= 16;
+                }
+                while symbol >= st + 3 {
+                    st += 3;
+                    bit_stream = bit_stream.wrapping_add(3u32 << bit_count);
+                    bit_count += 2;
+                }
+                bit_stream = bit_stream.wrapping_add(((symbol - st) as u32) << bit_count);
+                bit_count += 2;
+                if bit_count > 16 {
+                    out.push(bit_stream as u8);
+                    out.push((bit_stream >> 8) as u8);
+                    bit_stream >>= 16;
+                    bit_count -= 16;
+                }
+            }
+            {
+                let mut count = self.states[symbol].probability;
+                symbol += 1;
+                let max = (2 * threshold - 1) - remaining;
+                remaining -= if count < 0 { -count } else { count };
+                count += 1;
+                if count >= threshold {
+                    count += max;
+                }
+                bit_stream = bit_stream.wrapping_add((count as u32) << bit_count);
+                bit_count += nb_bits;
+                if count < max {
+                    bit_count -= 1;
+                }
+                previous_is0 = count == 1;
+                if remaining < 1 {
+                    panic!("writeNCount: incorrect distribution");
+                }
+                while remaining < threshold {
+                    nb_bits -= 1;
+                    threshold >>= 1;
+                }
+            }
+            if bit_count > 16 {
+                out.push(bit_stream as u8);
+                out.push((bit_stream >> 8) as u8);
+                bit_stream >>= 16;
+                bit_count -= 16;
             }
         }
-        writer.write_bits(0u8, writer.misaligned());
+        if remaining != 1 {
+            panic!("writeNCount: incorrect normalized distribution");
+        }
+        out.push(bit_stream as u8);
+        out.push((bit_stream >> 8) as u8);
+        let keep = ((bit_count + 7) / 8) as usize;
+        out.truncate(out.len() - 2 + keep);
+        writer.append_bytes(&out);
     }
 }
 
@@ -247,72 +295,107 @@ pub fn build_table_from_data(
 }
 
 fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
-    let mut probs = [0; 256];
-    let probs = &mut probs[..counts.len()];
-    let mut min_count = 0;
-    for (idx, count) in counts.iter().copied().enumerate() {
-        probs[idx] = count as i32;
-        if count > 0 && (count < min_count || min_count == 0) {
-            min_count = count;
+    // Deterministic proportional normalization at a fixed table log with
+    // largest-remainder rounding.
+    //
+    // The previous normalization derived the table log from the scaled count sum
+    // (often T = 2^6 for literal lengths instead of the format maximum 2^9), did
+    // coarse integer scaling with the whole deficit dumped into the largest
+    // symbol, and only then capped the top probability. All three distortions
+    // cost real bytes: on a 4 MiB text corpus the tables sit ~28 KiB above what
+    // proportional normalization at the format's maximum table log produces.
+    let n = counts.len();
+    let total: u64 = counts.iter().map(|c| *c as u64).sum();
+    assert!(total > 0);
+    let acc_log = max_log.min(12).max(5);
+    let t = 1usize << acc_log;
+    let mut probs = alloc::vec![0usize; n];
+    let mut assigned = 0usize;
+    let mut fracs: alloc::vec::Vec<(u64, usize)> = alloc::vec::Vec::new();
+    for (s, &c) in counts.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let scaled = (c as u64) * (t as u64);
+        let base = ((scaled / total) as usize).max(1);
+        probs[s] = base;
+        assigned += base;
+        fracs.push((scaled % total, s));
+    }
+    if assigned < t {
+        fracs.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        let mut i = 0usize;
+        while assigned < t {
+            let s = fracs[i % fracs.len()].1;
+            probs[s] += 1;
+            assigned += 1;
+            i += 1;
+        }
+    } else if assigned > t {
+        while assigned > t {
+            let mut best = usize::MAX;
+            for s in 0..n {
+                if probs[s] > 1 && (best == usize::MAX || probs[s] > probs[best]) {
+                    best = s;
+                }
+            }
+            if best == usize::MAX {
+                break;
+            }
+            probs[best] -= 1;
+            assigned -= 1;
         }
     }
 
-    // shift all probabilities down so that the lowest are 1
-    min_count -= 1;
-    let mut max_prob = 0i32;
-    for prob in probs.iter_mut() {
-        if *prob > 0 {
-            *prob -= min_count as i32;
-        }
-        max_prob = max_prob.max(*prob);
-    }
-
-    if max_prob > 0 && max_prob as usize > probs.len() {
-        let divisor = max_prob / (probs.len() as i32);
-        for prob in probs.iter_mut() {
-            if *prob > 0 {
-                *prob = (*prob / divisor).max(1)
+    // Honor avoid_0_numbit: keep every symbol's probability at or below T/2 so
+    // no symbol owns num_bits == 0 states. This is not just a size heuristic:
+    // the Huffman weights table is decoded by a bit-exhaustion-terminated
+    // interleaved FSE pair (no symbol count), and runs of 0-bit states make the
+    // decoder overshoot, corrupting the reconstructed tree (observed as
+    // LeftoverIsNotAPowerOf2 / off-by-one top symbols). The frame sequence
+    // tables are count-terminated and do not require the cap; call sites that
+    // can count pass `false` (see choose_table in encoding/blocks/compressed.rs).
+    //
+    // Single-symbol alphabets: build_table_from_data reserves a second slot
+    // when avoid_0_numbit is set, so a receiver for the redistributed mass
+    // exists; the fallback below still guards deeper callers.
+    if avoid_0_numbit {
+        let t2 = t / 2;
+        let mut max_idx = 0usize;
+        let mut max_val = 0usize;
+        for s in 0..n {
+            if probs[s] > max_val {
+                max_val = probs[s];
+                max_idx = s;
             }
         }
-    }
-
-    // normalize probabilities to a 2^x
-    let sum = probs.iter().sum::<i32>();
-    assert!(sum > 0);
-    let sum = sum as usize;
-    let acc_log = (sum.ilog2() as u8 + 1).max(5);
-    let acc_log = u8::min(acc_log, max_log);
-
-    if sum < 1 << acc_log {
-        // just raise the maximum probability as much as possible
-        // TODO is this optimal?
-        let diff = (1 << acc_log) - sum;
-        let max = probs.iter_mut().max().unwrap();
-        *max += diff as i32;
-    } else {
-        // decrease the smallest ones to 1 first
-        let mut diff = sum - (1 << acc_log);
-        while diff > 0 {
-            let min = probs.iter_mut().filter(|prob| **prob > 1).min().unwrap();
-            let decrease = usize::min(*min as usize - 1, diff);
-            diff -= decrease;
-            *min -= decrease as i32;
+        if max_val > t2 {
+            let redist = max_val - t2;
+            let mut si = usize::MAX;
+            for s in 0..n {
+                if s != max_idx && probs[s] > 0 && (si == usize::MAX || probs[s] > probs[si]) {
+                    si = s;
+                }
+            }
+            if si == usize::MAX {
+                for s in 0..n {
+                    if s != max_idx && probs[s] == 0 {
+                        si = s;
+                        break;
+                    }
+                }
+            }
+            if si != usize::MAX {
+                probs[max_idx] = t2;
+                probs[si] += redist;
+            }
+            // If no slot exists at all the alphabet has a single symbol; that
+            // table has a single state and nothing to redistribute to.
         }
     }
-    let max = probs.iter_mut().max().unwrap();
-    if avoid_0_numbit && *max > 1 << (acc_log - 1) {
-        let redistribute = *max - (1 << (acc_log - 1));
-        *max -= redistribute;
-        let max = *max;
 
-        // find first occurence of the second_max to avoid lifting the last zero
-        let second_max = *probs.iter_mut().filter(|x| **x != max).max().unwrap();
-        let second_max = probs.iter_mut().find(|x| **x == second_max).unwrap();
-        *second_max += redistribute;
-        assert!(*second_max <= max);
-    }
-
-    build_table_from_probabilities(probs, acc_log)
+    let probs: alloc::vec::Vec<i32> = probs.iter().map(|p| *p as i32).collect();
+    build_table_from_probabilities(&probs, acc_log)
 }
 
 pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSETable {
@@ -451,7 +534,7 @@ pub(crate) fn default_of_table() -> FSETable {
 
 #[cfg(test)]
 mod normalization_tests {
-    use super::build_table_from_data;
+    use super::{build_table_from_data, build_table_from_probabilities};
     use crate::encoding::{CompressionLevel, FrameCompressor, MatchGeneratorDriver};
     use alloc::vec::Vec;
 
@@ -524,5 +607,87 @@ mod normalization_tests {
             .decode_all_to_vec(&output, &mut decoded)
             .unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn descriptions_match_reference_bytes() {
+        // Golden bytes produced by the reference implementation (libzstd v1.5.7,
+        // FSE_writeNCount_generic) for the same probability distributions. These
+        // pin the description writer to the reference byte for byte and double as
+        // a reader round-trip check (the old bit-writer produced different and,
+        // for several of these shapes, non-round-trippable descriptions).
+        use crate::bit_io::BitWriter;
+        use crate::fse::FSETable;
+        use alloc::vec;
+
+        let mut zeros250 = vec![1i32];
+        zeros250.extend(core::iter::repeat(0).take(250));
+        zeros250.push(511);
+
+        let cases: alloc::vec::Vec<(alloc::vec::Vec<i32>, u8, &str)> = vec![
+            (vec![32, 2, 2, 2, 5, 12, 4, 3, 1, 1], 6, "118e314cab3a"),
+            (
+                vec![
+                    256, 227, 3, 3, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1,
+                    1, 1,
+                ],
+                9,
+                "14909c1091111111119124490a1d",
+            ),
+            (
+                vec![0, 0, 0, 1, 1, 6, 8, 8, 11, 76, 10, 7, 128],
+                8,
+                "13a080c0414282d1b440fc03",
+            ),
+            (
+                vec![
+                    0, 0, 186, 59, 58, 33, 17, 24, 14, 14, 10, 9, 5, 5, 8, 4, 9, 5, 7, 8, 4, 2, 4,
+                    3, 0, 1, 1, 2, 2, 3, 1, 1, 1, 1, 1, 1, 1, 1, 2, 0, 2, 1, 0, 0, 1, 1,
+                ],
+                9,
+                "14a05d3c3b2249e6f15814c3480ac540a98c42029119121191a485590e",
+            ),
+            (vec![256, 256], 9, "14f03f"),
+            (vec![128, 128], 8, "13f80f"),
+            (vec![256, 128, 64, 32, 16, 8, 4, 2, 1, 1], 9, "14303018c6ec1c"),
+            (vec![512], 9, "f43f"),
+            (vec![340, 43, 43, 43, 43], 9, "5495c562fd"),
+            (
+                zeros250,
+                9,
+                "2420c0ffffffffffffffffffffffffffffffffffffffffcfff",
+            ),
+        ];
+
+        for (probs, log, expected) in cases {
+            let table = build_table_from_probabilities(&probs, log);
+            let mut writer = BitWriter::new();
+            table.write_table(&mut writer);
+            writer.flush();
+            let bytes = writer.dump();
+
+            let mut hex = alloc::string::String::new();
+            for b in bytes.iter() {
+                hex.push_str(&alloc::format!("{b:02x}"));
+            }
+            assert_eq!(
+                hex, expected,
+                "description bytes drifted for probs={probs:?} log={log}"
+            );
+
+            // The description must also round-trip through our own reader.
+            let mut dec = FSETable::new(255);
+            let used = dec.build_decoder(&bytes, log).unwrap();
+            assert_eq!(used, bytes.len());
+            let mut want = probs.clone();
+            while want.last() == Some(&0) {
+                want.pop();
+            }
+            let mut got = dec.symbol_probabilities.clone();
+            while got.last() == Some(&0) {
+                got.pop();
+            }
+            assert_eq!(got, want, "read-back mismatch for probs={probs:?} log={log}");
+        }
     }
 }
