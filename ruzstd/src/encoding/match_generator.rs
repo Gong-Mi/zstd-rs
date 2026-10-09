@@ -282,7 +282,6 @@ impl MatchGenerator {
             // Look in each window entry
             let mut candidate = None;
             for (match_entry_idx, match_entry) in self.window.iter().enumerate() {
-                let is_last = match_entry_idx == self.window.len() - 1;
                 // 有界链走查（与比较融合，不预取整条链）：
                 //  - 内容比较是成本主项 ⇒ 预算 CHAIN_CMP_MAX 次；
                 //  - "太近"候选（切片 < MIN_MATCH_LEN，步进加速下常见）不消耗比较预算，
@@ -309,11 +308,12 @@ impl MatchGenerator {
                 let mut last_hit_len = 0usize;
                 let mut cur = match_entry.suffixes.get(key);
                 while let Some(match_index) = cur {
-                    let match_slice = if is_last {
-                        &match_entry.data[match_index..self.suffix_idx]
-                    } else {
-                        &match_entry.data[match_index..]
-                    };
+                    // Full forward extension for every candidate, mirroring
+                    // the reference match finder: the restricted slice for the
+                    // trailing entry structurally forbids overlapping matches,
+                    // which makes highly repetitive input cascade in
+                    // offset-doubling steps instead of encoding one long match.
+                    let match_slice = &match_entry.data[match_index..];
 
                     if match_slice.len() < MIN_MATCH_LEN {
                         // 太近的候选给不出合法匹配，只走链不比较
@@ -539,7 +539,18 @@ fn matches() {
                 reconstructed.extend_from_slice(literals);
                 let start = reconstructed.len() - offset;
                 let end = start + match_len;
-                reconstructed.extend_from_within(start..end);
+                if end <= reconstructed.len() {
+                    reconstructed.extend_from_within(start..end);
+                } else {
+                    // Overlapping match (match_len > offset): the decoder copies
+                    // the periodic run byte by byte as the buffer grows; mirror
+                    // that here instead of extend_from_within (which requires
+                    // end <= len).
+                    for i in 0..match_len {
+                        let b = reconstructed[start + i];
+                        reconstructed.push(b);
+                    }
+                }
             }
         }
     };
@@ -552,12 +563,14 @@ fn matches() {
     original_data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     matcher.next_sequence(|seq| {
+        // 全前向扩展（对齐 C 的 ZSTD_count）：十个 0 由 1 字面量 + 距离 1 的
+        // 9 字节重叠匹配覆盖（旧截断策略产出 5+5@5，更差且非 C 行为）。
         assert_seq_equal(
             seq,
             Sequence::Triple {
-                literals: &[0, 0, 0, 0, 0],
-                offset: 5,
-                match_len: 5,
+                literals: &[0],
+                offset: 1,
+                match_len: 9,
             },
             &mut reconstructed,
         )
@@ -575,37 +588,26 @@ fn matches() {
     ]);
 
     matcher.next_sequence(|seq| {
+        // 全前向扩展：pos 6 处的候选不再止于当前位置，[1..6] 两个完整重复
+        // 一次吃满（12 字节），而非旧行为的 2×6。
         assert_seq_equal(
             seq,
             Sequence::Triple {
                 literals: &[1, 2, 3, 4, 5, 6],
                 offset: 6,
-                match_len: 6,
+                match_len: 12,
             },
             &mut reconstructed,
         )
     });
     matcher.next_sequence(|seq| {
-        // 链候选使这里多出一个 **等长且更近** 的候选（offset 6，指向本块内前一段
-        // `1..6`）；按本实现既有的取用规则（等长取更近 offset）应取 6 而非基线
-        // 单槽给的 12。压缩比与正确性均不受损（等长替换，流仍逐字节重建）。
+        // 全前向扩展把两段 [1..6] 并进上一条 12 字节匹配；随后只剩尾部 5 个 0，
+        // 仍由跨块候选覆盖（旧表征里它是第三条：offset 23×5）。
         assert_seq_equal(
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 6,
-                match_len: 6,
-            },
-            &mut reconstructed,
-        )
-    });
-    matcher.next_sequence(|seq| {
-        // 同上：等长候选更多，按"等长取更近"应取 23（更靠近当前位置）而非基线的 28。
-        assert_seq_equal(
-            seq,
-            Sequence::Triple {
-                literals: &[],
-                offset: 23,
+                offset: 27,
                 match_len: 5,
             },
             &mut reconstructed,
@@ -621,13 +623,13 @@ fn matches() {
     original_data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 0, 0, 0]);
 
     matcher.next_sequence(|seq| {
-        // 链候选带来的第三个表征变化：本块内 offset 11 的等长候选（1..6 段）胜过
-        // 基线的 23（跨块候选）。取用规则不变（等长取更近），仍是等长替换。
+        // 全前向扩展改变走位后，本块 [1..6] 的等长候选仍是更近者，但偏移随
+        // 前序覆盖变化：11 → 17。（取用规则不变：等长取更近，流逐字节重建。）
         assert_seq_equal(
             seq,
             Sequence::Triple {
                 literals: &[],
-                offset: 11,
+                offset: 17,
                 match_len: 6,
             },
             &mut reconstructed,
@@ -767,4 +769,37 @@ fn chain_reaches_old_positions() {
         cur = store.link_of(p);
     }
     assert_eq!(seen, alloc::vec![4, 3, 2, 1, 0], "链走查应能回到最老位置");
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec::Vec;
+
+    /// Repetitive input must be covered by long overlapping matches instead of
+    /// the offset-doubling cascade. The previous candidate truncation ("slice
+    /// ends at the current position") structurally forbade overlapping matches
+    /// and produced 11~12 sequences per 128 KiB block for this pattern
+    /// (~750 bytes for 1 MiB; full forward extension measures 309).
+    #[test]
+    fn repetitive_input_encodes_without_offset_cascade() {
+        let original = b"abcdefgh".repeat(131072);
+        let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
+        compressor.set_source(original.as_slice());
+        compressor.set_drain(Vec::new());
+        compressor.compress();
+        let output = compressor.take_drain().unwrap();
+        assert!(
+            output.len() < 450,
+            "repetitive 1 MiB input produced {} bytes; the offset-doubling cascade is likely back",
+            output.len()
+        );
+        // The stream must decode back both with the C reference and our decoder.
+        assert_eq!(zstd::decode_all(output.as_slice()).unwrap(), original);
+        let mut decoded = Vec::with_capacity(original.len());
+        crate::decoding::FrameDecoder::new()
+            .decode_all_to_vec(&output, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, original);
+    }
 }
