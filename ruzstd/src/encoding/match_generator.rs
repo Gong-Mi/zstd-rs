@@ -22,6 +22,38 @@ pub struct MatchGeneratorDriver {
     slice_size: usize,
 }
 
+#[doc(hidden)]
+pub mod counters {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    pub static POSITIONS: AtomicU64 = AtomicU64::new(0);
+    pub static PROBES: AtomicU64 = AtomicU64::new(0);
+    pub static WALK: AtomicU64 = AtomicU64::new(0);
+    pub static CMPS: AtomicU64 = AtomicU64::new(0);
+    pub static CMP_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static HITS: AtomicU64 = AtomicU64::new(0);
+    pub static STEP_RESETS: AtomicU64 = AtomicU64::new(0);
+    pub static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    pub fn reset_all() {
+        for c in [
+            &POSITIONS, &PROBES, &WALK, &CMPS, &CMP_BYTES, &HITS, &STEP_RESETS, &BLOCKS,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+    pub fn dump() -> [u64; 8] {
+        [
+            POSITIONS.load(Ordering::Relaxed),
+            PROBES.load(Ordering::Relaxed),
+            WALK.load(Ordering::Relaxed),
+            CMPS.load(Ordering::Relaxed),
+            CMP_BYTES.load(Ordering::Relaxed),
+            HITS.load(Ordering::Relaxed),
+            STEP_RESETS.load(Ordering::Relaxed),
+            BLOCKS.load(Ordering::Relaxed),
+        ]
+    }
+}
+
 impl MatchGeneratorDriver {
     /// slice_size says how big the slices should be that are allocated to work with
     /// max_slices_in_window says how many slices should at most be used while looking for matches
@@ -70,8 +102,11 @@ impl Matcher for MatchGeneratorDriver {
         let vec_pool = &mut self.vec_pool;
         let suffix_pool = &mut self.suffix_pool;
         const SUFFIX_STORE_MIN_CAPACITY: usize = 1024;
-        let requested_suffix_store_size =
-            usize::max(SUFFIX_STORE_MIN_CAPACITY, space.len().next_power_of_two());
+        let slices = (self.match_generator.max_window_size / self.slice_size).max(1);
+        let requested_suffix_store_size = usize::max(
+            SUFFIX_STORE_MIN_CAPACITY,
+            (space.len() / slices).next_power_of_two(),
+        ); // GRID log=17
         let requested_size_log = requested_suffix_store_size.ilog2();
         let suffix_store_idx = suffix_pool
             .iter()
@@ -248,6 +283,7 @@ impl MatchGenerator {
     /// * If no more matches can be found but there are bytes still left handle_sequence is called with the Literals variant
     /// * If no more matches can be found and no more bytes are left this returns false
     fn next_sequence(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) -> bool {
+        counters::POSITIONS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         loop {
             let last_entry = self.window.last().unwrap();
             let data_slice = &last_entry.data;
@@ -310,6 +346,7 @@ impl MatchGenerator {
                 const CHAIN_CMP_MAX: usize = 4;
                 const LONG_HIT_CUT: usize = 8;
                 const CHAIN_WALK_MAX: usize = 32;
+                counters::PROBES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 let mut cur = match_entry.suffixes.get(key);
                 while let Some(match_index) = cur {
                     // Full forward extension for every candidate, mirroring
@@ -322,6 +359,7 @@ impl MatchGenerator {
                     if match_slice.len() < MIN_MATCH_LEN {
                         // 太近的候选给不出合法匹配，只走链不比较
                         walked += 1;
+                        counters::WALK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         if walked >= CHAIN_WALK_MAX {
                             break;
                         }
@@ -332,9 +370,15 @@ impl MatchGenerator {
                         break;
                     }
                     cmps += 1;
+                    counters::CMPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
                     // Check how long the common prefix actually is
                     let match_len = Self::common_prefix_len(match_slice, data_slice);
+                    counters::CMP_BYTES
+                        .fetch_add(match_len as u64, core::sync::atomic::Ordering::Relaxed);
+                    if match_len >= MIN_MATCH_LEN {
+                        counters::HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    }
 
                     // Collisions in the suffix store might make this check fail
                     if match_len >= MIN_MATCH_LEN {
@@ -403,6 +447,7 @@ impl MatchGenerator {
 
                 // Update the indexes, all indexes upto and including the current index have been included in a sequence now
                 self.step_dist = 0;
+                counters::STEP_RESETS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 self.suffix_idx += match_len;
                 match_len += back;
                 self.last_idx_in_sequence = self.suffix_idx;
@@ -480,6 +525,7 @@ impl MatchGenerator {
         suffixes: SuffixStore,
         reuse_space: impl FnMut(Vec<u8>, SuffixStore),
     ) {
+        counters::BLOCKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         assert!(
             self.window.is_empty() || self.suffix_idx == self.window.last().unwrap().data.len()
         );

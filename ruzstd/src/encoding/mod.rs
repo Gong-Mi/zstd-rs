@@ -3,7 +3,7 @@
 pub(crate) mod block_header;
 pub(crate) mod blocks;
 pub(crate) mod frame_header;
-pub(crate) mod match_generator;
+pub mod match_generator;
 pub(crate) mod util;
 
 mod frame_compressor;
