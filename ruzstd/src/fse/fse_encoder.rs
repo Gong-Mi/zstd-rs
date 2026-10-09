@@ -319,7 +319,30 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
     let n = counts.len();
     let total: u64 = counts.iter().map(|c| *c as u64).sum();
     assert!(total > 0);
-    let acc_log = max_log.clamp(5, 12);
+    // Table log: faithful port of C's FSE_optimalTableLog (fse_compress.c,
+    // minus = 2 as used by both the sequence tables and the Huffman weights
+    // in libzstd): scale the log with the actual data size instead of always
+    // using the format maximum, so small blocks / few weights get small
+    // tables (smaller descriptions, fewer states, cheaper walk).
+    let acc_log = if total > 1 {
+        let highbit = |x: u64| 63 - x.leading_zeros() as i64; // floor(log2)
+        let max_bits_src = highbit(total - 1) - 2;
+        let min_bits = (highbit(total) + 1).min(if n > 1 {
+            highbit((n - 1) as u64) + 2
+        } else {
+            2
+        });
+        let mut log = (max_log.min(12)) as i64;
+        if max_bits_src < log {
+            log = max_bits_src;
+        }
+        if min_bits > log {
+            log = min_bits;
+        }
+        log.clamp(5, 12) as u8
+    } else {
+        max_log.clamp(5, 12)
+    };
     let t = 1usize << acc_log;
     let mut probs = alloc::vec![0usize; n];
     let mut assigned = 0usize;
