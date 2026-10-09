@@ -14,17 +14,6 @@ impl<'s> BitReader<'s> {
         self.source.len() * 8 - self.idx
     }
 
-    pub fn bits_read(&self) -> usize {
-        self.idx
-    }
-
-    pub fn return_bits(&mut self, n: usize) {
-        if n > self.idx {
-            panic!("Cant return this many bits");
-        }
-        self.idx -= n;
-    }
-
     pub fn get_bits(&mut self, n: usize) -> Result<u64, GetBitsError> {
         if n > 64 {
             return Err(GetBitsError::TooManyBits {

@@ -128,7 +128,15 @@ fn choose_table<'a>(
     if use_previous_table {
         FseTableMode::RepeateLast(previous.unwrap())
     } else if use_new_table {
-        FseTableMode::Encoded(build_table_from_data(data, max_log, true))
+        // `false` = no T/2 cap for frame tables. The fused sequence decoder is
+        // terminated by an explicit sequence count, so num_bits == 0 states
+        // cannot cause the bit-exhaustion overshoot that would corrupt the
+        // count-less Huffman weights decoder (that call site keeps the cap).
+        // With the O(1) state lookup in place (SymbolStates::get), the
+        // mixed-width ranges of uncapped tables no longer lengthen the encode
+        // walk: local interleaved runs put the full uncapped package at or
+        // below baseline encode time.
+        FseTableMode::Encoded(build_table_from_data(data, max_log, false))
     } else {
         FseTableMode::Predefined(default_table)
     }

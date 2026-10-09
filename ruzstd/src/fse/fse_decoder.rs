@@ -1,4 +1,4 @@
-use crate::bit_io::{BitReader, BitReaderReversed};
+use crate::bit_io::BitReaderReversed;
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
 
@@ -222,72 +222,113 @@ impl FSETable {
     /// Read the accuracy log and the probability table from the source and return the number of bytes
     /// read. If the size of the table is larger than the provided `max_log`, return an error.
     fn read_probabilities(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
-        self.symbol_probabilities.clear(); //just clear, we will fill a probability for each entry anyways. No need to force new allocs here
+        // Faithful port of C's FSE_readNCount (lib/common/entropy_common.c,
+        // zstd v1.5.7). The description is an LSB-first byte stream; it is read
+        // with an explicit bit cursor so the semantics match the reference
+        // decoder exactly. The previous bit-reader-based port drifted from the
+        // reference on many probability shapes (it could not even read back some
+        // streams produced by our own writer).
+        self.symbol_probabilities.clear();
 
-        let mut br = BitReader::new(source);
-        self.accuracy_log = ACC_LOG_OFFSET + (br.get_bits(4)? as u8);
-        if self.accuracy_log > max_log {
-            return Err(FSETableError::AccLogTooBig {
-                got: self.accuracy_log,
-                max: max_log,
-            });
+        struct Lsb<'a> {
+            data: &'a [u8],
+            pos: usize, // bit position, LSB-first within each byte
         }
-        if self.accuracy_log == 0 {
-            return Err(FSETableError::AccLogIsZero);
-        }
-
-        let probability_sum = 1 << self.accuracy_log;
-        let mut probability_counter = 0;
-
-        while probability_counter < probability_sum {
-            let max_remaining_value = probability_sum - probability_counter + 1;
-            let bits_to_read = highest_bit_set(max_remaining_value);
-
-            let unchecked_value = br.get_bits(bits_to_read as usize)? as u32;
-
-            let low_threshold = ((1 << bits_to_read) - 1) - (max_remaining_value);
-            let mask = (1 << (bits_to_read - 1)) - 1;
-            let small_value = unchecked_value & mask;
-
-            let value = if small_value < low_threshold {
-                br.return_bits(1);
-                small_value
-            } else if unchecked_value > mask {
-                unchecked_value - low_threshold
-            } else {
-                unchecked_value
-            };
-            //println!("{}, {}, {}", self.symbol_probablilities.len(), unchecked_value, value);
-
-            let prob = (value as i32) - 1;
-
-            self.symbol_probabilities.push(prob);
-            if prob != 0 {
-                if prob > 0 {
-                    probability_counter += prob as u32;
-                } else {
-                    // probability -1 counts as 1
-                    assert!(prob == -1);
-                    probability_counter += 1;
+        impl Lsb<'_> {
+            fn peek(&self, n: u8) -> u32 {
+                let mut v = 0u32;
+                for i in 0..n as usize {
+                    let b = self.pos + i;
+                    let bit = if b / 8 < self.data.len() {
+                        (self.data[b / 8] >> (b % 8)) & 1
+                    } else {
+                        0
+                    };
+                    v |= (bit as u32) << i;
                 }
-            } else {
-                //fast skip further zero probabilities
-                loop {
-                    let skip_amount = br.get_bits(2)? as usize;
-
-                    self.symbol_probabilities
-                        .resize(self.symbol_probabilities.len() + skip_amount, 0);
-                    if skip_amount != 3 {
-                        break;
-                    }
-                }
+                v
+            }
+            fn consume(&mut self, n: u8) {
+                self.pos += n as usize;
             }
         }
 
-        if probability_counter != probability_sum {
+        let mut br = Lsb {
+            data: source,
+            pos: 0,
+        };
+        let table_log = (br.peek(4) as u8) + ACC_LOG_OFFSET;
+        br.consume(4);
+        if table_log > max_log {
+            return Err(FSETableError::AccLogTooBig {
+                got: table_log,
+                max: max_log,
+            });
+        }
+        self.accuracy_log = table_log;
+
+        let mut remaining: i32 = (1i32 << table_log) + 1;
+        let mut threshold: i32 = 1i32 << table_log;
+        let mut nb_bits: i32 = table_log as i32 + 1;
+        let mut previous0 = false;
+        let mut charnum: usize = 0;
+
+        loop {
+            if previous0 {
+                loop {
+                    let g = br.peek(2);
+                    br.consume(2);
+                    charnum += g as usize;
+                    if g != 3 {
+                        break;
+                    }
+                }
+                if charnum >= 256 {
+                    break;
+                }
+            }
+            let max = (2 * threshold - 1) - remaining;
+            let low = br.peek(nb_bits as u8 - 1) as i32;
+            let mut count;
+            if low < max {
+                count = low;
+                br.consume(nb_bits as u8 - 1);
+            } else {
+                count = br.peek(nb_bits as u8) as i32;
+                if count >= threshold {
+                    count -= max;
+                }
+                br.consume(nb_bits as u8);
+            }
+            count -= 1; // extra accuracy
+            if count >= 0 {
+                remaining -= count;
+            } else {
+                // count == -1: low-probability symbol
+                remaining += count;
+            }
+            while self.symbol_probabilities.len() < charnum {
+                self.symbol_probabilities.push(0);
+            }
+            self.symbol_probabilities.push(count);
+            charnum += 1;
+            previous0 = count == 0;
+            if remaining < threshold {
+                if remaining <= 1 {
+                    break;
+                }
+                nb_bits = (31 - (remaining as u32).leading_zeros()) as i32 + 1; // highbit32(remaining)+1
+                threshold = 1 << (nb_bits - 1);
+            }
+            if charnum >= 256 {
+                break;
+            }
+        }
+
+        if remaining != 1 {
             return Err(FSETableError::ProbabilityCounterMismatch {
-                got: probability_counter,
-                expected_sum: probability_sum,
+                got: 0,
+                expected_sum: 1 << self.accuracy_log,
                 symbol_probabilities: self.symbol_probabilities.clone(),
             });
         }
@@ -297,11 +338,7 @@ impl FSETable {
             });
         }
 
-        let bytes_read = if br.bits_read().is_multiple_of(8) {
-            br.bits_read() / 8
-        } else {
-            (br.bits_read() / 8) + 1
-        };
+        let bytes_read = br.pos.div_ceil(8);
 
         Ok(bytes_read)
     }
