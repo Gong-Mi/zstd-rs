@@ -17,7 +17,6 @@ const MIN_MATCH_LEN: usize = 5;
 /// This is the default implementation of the `Matcher` trait. It allocates and reuses the buffers when possible.
 pub struct MatchGeneratorDriver {
     vec_pool: Vec<Vec<u8>>,
-    suffix_pool: Vec<SuffixStore>,
     match_generator: MatchGenerator,
     slice_size: usize,
 }
@@ -28,8 +27,10 @@ impl MatchGeneratorDriver {
     pub(crate) fn new(slice_size: usize, max_slices_in_window: usize) -> Self {
         Self {
             vec_pool: Vec::new(),
-            suffix_pool: Vec::new(),
-            match_generator: MatchGenerator::new(max_slices_in_window * slice_size),
+            match_generator: MatchGenerator::new(
+                max_slices_in_window * slice_size,
+                slice_size.next_power_of_two().max(1024),
+            ),
             slice_size,
         }
     }
@@ -38,15 +39,10 @@ impl MatchGeneratorDriver {
 impl Matcher for MatchGeneratorDriver {
     fn reset(&mut self, _level: CompressionLevel) {
         let vec_pool = &mut self.vec_pool;
-        let suffix_pool = &mut self.suffix_pool;
 
-        self.match_generator.reset(|mut data, mut suffixes| {
+        self.match_generator.reset(|mut data| {
             data.resize(data.capacity(), 0);
             vec_pool.push(data);
-            suffixes.slots.clear();
-            suffixes.slots.resize(suffixes.slots.capacity(), None);
-            suffixes.links.clear();
-            suffix_pool.push(suffixes);
         });
     }
 
@@ -68,28 +64,10 @@ impl Matcher for MatchGeneratorDriver {
 
     fn commit_space(&mut self, space: Vec<u8>) {
         let vec_pool = &mut self.vec_pool;
-        let suffix_pool = &mut self.suffix_pool;
-        const SUFFIX_STORE_MIN_CAPACITY: usize = 1024;
-        let requested_suffix_store_size =
-            usize::max(SUFFIX_STORE_MIN_CAPACITY, space.len().next_power_of_two());
-        let requested_size_log = requested_suffix_store_size.ilog2();
-        let suffix_store_idx = suffix_pool
-            .iter()
-            .enumerate()
-            .find(|(_, store)| store.len_log >= requested_size_log)
-            .map(|(idx, _)| idx);
-        let suffixes = suffix_store_idx
-            .map(|idx| suffix_pool.remove(idx))
-            .unwrap_or_else(|| SuffixStore::with_capacity(requested_suffix_store_size));
-        self.match_generator
-            .add_data(space, suffixes, |mut data, mut suffixes| {
-                data.resize(data.capacity(), 0);
-                vec_pool.push(data);
-                suffixes.slots.clear();
-                suffixes.slots.resize(suffixes.slots.capacity(), None);
-                suffixes.links.clear();
-                suffix_pool.push(suffixes);
-            });
+        self.match_generator.add_data(space, |mut data| {
+            data.resize(data.capacity(), 0);
+            vec_pool.push(data);
+        });
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -104,54 +82,66 @@ impl Matcher for MatchGeneratorDriver {
     }
 }
 
-/// This stores the index of a suffix of a string by hashing the first few bytes of that suffix
-/// This means that collisions just overwrite and that you need to check validity after a get
+/// A store for suffixes (hash table + chains) shared by the whole window.
+///
+/// Positions are GLOBAL stream positions (`stream_start` of a window entry
+/// plus the local index), so a single table covers every slice of the window
+/// and each position costs one probe (the previous per-slice layout probed
+/// one hash table per slice: deterministic counting showed 2.8x the probes
+/// and 4x the hash working set against a 4-slice window).
+///
+/// Chain links live in a ring buffer indexed by `pos & ring_mask`: a link
+/// aliased by a position one ring-length older always sits at least the
+/// window size away, so window-distance validation in the walk rejects it.
 struct SuffixStore {
-    // We use NonZeroUsize to enable niche optimization here.
-    // On store we do +1 and on get -1
-    // This is ok since usize::MAX is never a valid offset
-    //
-    // 单槽保留每 key 最近位置；更早的位置由 links 链保留（见下）。
     slots: Vec<Option<NonZeroUsize>>,
-    /// 链：`links[pos]` = 同一 key 的上一个位置（+1 编码，0 表示链尾）。
-    /// 只靠槽位覆盖会丢"足够远"的候选（候选切片止于当前位置，太近的位置一律 < MIN_MATCH_LEN），
-    /// 链把更老的位置保留下来，按有界步数走查取"足够远且更长"的候选。
+    /// Ring of previous-position links (value = stream_pos + 1, 0 = chain end)
     links: Vec<u32>,
+    ring_mask: usize,
     len_log: u32,
 }
 
 impl SuffixStore {
-    fn with_capacity(capacity: usize) -> Self {
+    /// `capacity` = hash slot count (power of two), `ring_len` = link ring
+    /// length (power of two, at least the window size).
+    fn with_capacity(capacity: usize, ring_len: usize) -> Self {
         Self {
             slots: alloc::vec![None; capacity],
-            links: Vec::new(),
+            links: alloc::vec![0u32; ring_len],
+            ring_mask: ring_len - 1,
             len_log: capacity.ilog2(),
         }
     }
 
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.slots.resize(self.slots.capacity(), None);
+        self.links.clear();
+        self.links.resize(self.links.capacity(), 0);
+    }
+
     #[inline(always)]
-    fn insert(&mut self, suffix: &[u8], idx: usize) {
+    fn insert(&mut self, suffix: &[u8], stream_pos: usize) {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::INSERTS, 1);
         let key = self.key(suffix);
-        // 链：同 key 已有上一个位置才写 links（random 类无重复 key 的语料
-        // 因此零链簿记，插入路径与单槽基线同成本）；候选切片止于当前位置
-        // ⇒ 只有"足够远"的位置才给得出合法匹配，链把更老的位置留住。
-        if let Some(prev) = self.slots[key] {
-            if idx >= self.links.len() {
-                self.links.resize(idx + 1, 0);
-            }
-            self.links[idx] = prev.get() as u32;
+        let slot = &mut self.slots[key];
+        if let Some(prev) = *slot {
+            let prev = <NonZeroUsize as Into<usize>>::into(prev) - 1;
+            let idx = stream_pos & self.ring_mask;
+            // u32 stream positions cover frames up to 4 GiB; beyond that the
+            // link wraps and the distance check treats it as a chain end.
+            self.links[idx] = (prev as u32).wrapping_add(1);
         }
-        self.slots[key] = Some(NonZeroUsize::new(idx + 1).unwrap());
+        *slot = Some(NonZeroUsize::new(stream_pos + 1).unwrap());
     }
 
-    /// `pos` 在链上的上一位置（None = 链尾）。供融合走查用。
+    /// Previous stream position on the chain for `stream_pos` (None = end).
     #[inline(always)]
-    fn link_of(&self, pos: usize) -> Option<usize> {
-        match self.links.get(pos).copied().unwrap_or(0) {
+    fn link_of(&self, stream_pos: usize) -> Option<usize> {
+        match self.links[stream_pos & self.ring_mask] {
             0 => None,
-            l => Some(l as usize - 1),
+            v => Some(v as usize - 1),
         }
     }
 
@@ -194,10 +184,9 @@ impl SuffixStore {
 /// All of these are valid targets for a match to be generated for
 struct WindowEntry {
     data: Vec<u8>,
-    /// Stores indexes into data
-    suffixes: SuffixStore,
-    /// Makes offset calculations efficient
-    base_offset: usize,
+    /// Global stream position of this slice's first byte (monotonic across
+    /// the whole frame); candidates from any entry are addressed through it.
+    stream_start: usize,
 }
 
 pub(crate) struct MatchGenerator {
@@ -214,11 +203,15 @@ pub(crate) struct MatchGenerator {
     step_dist: usize,
     /// Gets updated when a new sequence is returned to point right behind that sequence
     last_idx_in_sequence: usize,
+    /// Hash table + chains covering the whole window (global stream positions)
+    store: SuffixStore,
+    /// Global stream position just past the end of the newest slice
+    stream_cumulative: usize,
 }
 
 impl MatchGenerator {
     /// max_size defines how many bytes will be used at most in the window used for matching
-    fn new(max_size: usize) -> Self {
+    fn new(max_size: usize, suffix_slot_capacity: usize) -> Self {
         Self {
             max_window_size: max_size,
             window: Vec::new(),
@@ -228,18 +221,25 @@ impl MatchGenerator {
             suffix_idx: 0,
             step_dist: 0,
             last_idx_in_sequence: 0,
+            store: SuffixStore::with_capacity(
+                suffix_slot_capacity.next_power_of_two().max(1024),
+                max_size.next_power_of_two().max(1024),
+            ),
+            stream_cumulative: 0,
         }
     }
 
-    fn reset(&mut self, mut reuse_space: impl FnMut(Vec<u8>, SuffixStore)) {
+    fn reset(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
         self.window_size = 0;
         #[cfg(debug_assertions)]
         self.concat_window.clear();
         self.suffix_idx = 0;
         self.last_idx_in_sequence = 0;
         self.step_dist = 0;
+        self.store.clear();
+        self.stream_cumulative = 0;
         self.window.drain(..).for_each(|entry| {
-            reuse_space(entry.data, entry.suffixes);
+            reuse_space(entry.data);
         });
     }
 
@@ -279,90 +279,93 @@ impl MatchGenerator {
             // This is the key we are looking to find a match for
             let key = &data_slice[..MIN_MATCH_LEN];
 
-            // Look in each window entry
+            // Single shared store: one probe per position, one chain spanning
+            // the whole window (newest first). 有界链走查（与比较融合）：
+            //  - 内容比较是成本主项 ⇒ 预算 CHAIN_CMP_MAX 次；
+            //  - "太近"候选（切片 < MIN_MATCH_LEN，步进加速下常见）不消耗比较预算，
+            //    只走链（否则预算全被近邻吃掉，单测 matches 会退化成找不到匹配）；
+            //  - 走查总步数另有上限，防长链退化。
+            // 单表下这些预算天然全窗口共享（旧逐切片布局会按切片数重复计费）。
+            const CHAIN_CMP_MAX: usize = 4;
+            const LONG_HIT_CUT: usize = 8;
+            const CHAIN_WALK_MAX: usize = 32;
             let mut candidate = None;
-            for (match_entry_idx, match_entry) in self.window.iter().enumerate() {
-                // 有界链走查（与比较融合，不预取整条链）：
-                //  - 内容比较是成本主项 ⇒ 预算 CHAIN_CMP_MAX 次；
-                //  - "太近"候选（切片 < MIN_MATCH_LEN，步进加速下常见）不消耗比较预算，
-                //    只走链（否则预算全被近邻吃掉，单测 matches 会退化成找不到匹配）；
-                //  - 走查总步数另有上限，防长链退化。
-                // 预算 1：本地确定性计数实测（4MB，单次压缩）——
-                //   text ratio 3.174（预算 2 为 3.259）/ cmp 调用 1,296,622（预算 2 为 2,406,990；
-                //   基线 1,296,066）/ 比较字节 2.5GB（预算 2 为 7.1GB，基线 41.8GB）。
-                //   src-like 4.718（2 档 4.909）/ cmp 669,292（基线 815,362）。
-                // 即：3% 的 ratio 换近一半的比较开销，且比较字节数远低于基线。
-                // 条件预算：内容比较硬预算仍是 1 次；若首次比较命中且匹配长度
-                // ≥ LONG_HIT_CUT，则额外允许 1 次比较（长匹配处多一个候选才换得来
-                // ratio，短匹配处纯亏）。
-                // 本地确定性计数（4MB 单次压缩，base text cmp 1,296,066 / ratio 2.480）：
-                //   budget1     text 3.174/1,296,622  src-like 4.718/669,292  bin-like 1.482/820,086
-                //   cond-long8  text 3.176/1,524,382  src-like 4.871/969,684  bin-like 1.516/784,322
-                //   budget2     text 3.259/2,406,990  src-like 4.909/1,187,948 bin-like 1.527/1,097,398
-                const CHAIN_CMP_MAX: usize = 4;
-                const LONG_HIT_CUT: usize = 8;
-                const CHAIN_WALK_MAX: usize = 32;
-                let mut walked = 0usize;
-                let mut cmps = 0usize;
-                // 首次比较命中长度：条件预算用它决定要不要花第二次比较
-                let mut last_hit_len = 0usize;
-                let mut cur = match_entry.suffixes.get(key);
-                while let Some(match_index) = cur {
-                    // Full forward extension for every candidate, mirroring
-                    // the reference match finder: the restricted slice for the
-                    // trailing entry structurally forbids overlapping matches,
-                    // which makes highly repetitive input cascade in
-                    // offset-doubling steps instead of encoding one long match.
-                    let match_slice = &match_entry.data[match_index..];
-
-                    if match_slice.len() < MIN_MATCH_LEN {
-                        // 太近的候选给不出合法匹配，只走链不比较
-                        walked += 1;
-                        if walked >= CHAIN_WALK_MAX {
+            let mut walked = 0usize;
+            let mut cmps = 0usize;
+            // 首次比较命中长度：条件预算用它决定要不要花第二次比较
+            let mut last_hit_len = 0usize;
+            let current_stream = last_entry.stream_start + self.suffix_idx;
+            let mut cur = self.store.get(key);
+            while let Some(pos) = cur {
+                // 链按位置降序；出窗口即可收链（更老的位置只会更远）
+                let dist = current_stream - pos;
+                if dist > self.window_size {
+                    break;
+                }
+                // 定位候选所在切片（窗口内 ≤ 切片数 次比较）
+                let (match_entry_idx, match_local) = {
+                    let mut found = None;
+                    for (idx, entry) in self.window.iter().enumerate() {
+                        if pos >= entry.stream_start && pos < entry.stream_start + entry.data.len()
+                        {
+                            found = Some((idx, pos - entry.stream_start));
                             break;
                         }
-                        cur = match_entry.suffixes.link_of(match_index);
-                        continue;
                     }
-                    if cmps >= CHAIN_CMP_MAX && !(cmps == 1 && last_hit_len >= LONG_HIT_CUT) {
+                    match found {
+                        Some(x) => x,
+                        None => break,
+                    }
+                };
+                let match_slice = &self.window[match_entry_idx].data[match_local..];
+
+                if match_slice.len() < MIN_MATCH_LEN {
+                    // 太近的候选给不出合法匹配，只走链不比较
+                    walked += 1;
+                    if walked >= CHAIN_WALK_MAX {
                         break;
                     }
-                    cmps += 1;
+                    cur = self.store.link_of(pos);
+                    continue;
+                }
+                if cmps >= CHAIN_CMP_MAX && !(cmps == 1 && last_hit_len >= LONG_HIT_CUT) {
+                    break;
+                }
+                cmps += 1;
 
-                    // Check how long the common prefix actually is
-                    let match_len = Self::common_prefix_len(match_slice, data_slice);
+                // Check how long the common prefix actually is
+                let match_len = Self::common_prefix_len(match_slice, data_slice);
 
-                    // Collisions in the suffix store might make this check fail
-                    if match_len >= MIN_MATCH_LEN {
-                        let offset = match_entry.base_offset + self.suffix_idx - match_index;
+                // Collisions in the suffix store might make this check fail
+                if match_len >= MIN_MATCH_LEN {
+                    let offset = dist;
 
-                        // If we are in debug/tests make sure the match we found is actually at the offset we calculated
-                        #[cfg(debug_assertions)]
+                    // If we are in debug/tests make sure the match we found is actually at the offset we calculated
+                    #[cfg(debug_assertions)]
+                    {
+                        let unprocessed = last_entry.data.len() - self.suffix_idx;
+                        let start = self.concat_window.len() - unprocessed - offset;
+                        let end = start + match_len;
+                        let check_slice = &self.concat_window[start..end];
+                        debug_assert_eq!(check_slice, &match_slice[..match_len]);
+                    }
+
+                    if let Some((_, _, old_offset, old_match_len)) = candidate {
+                        if match_len > old_match_len
+                            || (match_len == old_match_len && offset < old_offset)
                         {
-                            let unprocessed = last_entry.data.len() - self.suffix_idx;
-                            let start = self.concat_window.len() - unprocessed - offset;
-                            let end = start + match_len;
-                            let check_slice = &self.concat_window[start..end];
-                            debug_assert_eq!(check_slice, &match_slice[..match_len]);
+                            candidate = Some((match_entry_idx, match_local, offset, match_len));
                         }
-
-                        if let Some((_, _, old_offset, old_match_len)) = candidate {
-                            if match_len > old_match_len
-                                || (match_len == old_match_len && offset < old_offset)
-                            {
-                                candidate = Some((match_entry_idx, match_index, offset, match_len));
-                            }
-                        } else {
-                            candidate = Some((match_entry_idx, match_index, offset, match_len));
-                        }
-                        last_hit_len = match_len;
-                        cur = match_entry.suffixes.link_of(match_index);
                     } else {
-                        // 候选切片足够长却内容不匹配 ⇒ 放弃整条链：同槽更老的候选
-                        // 内容命中概率只低不高（确定性计数实测：不断链时
-                        // common_prefix_len 调用数是基线的数倍，纯浪费）。
-                        break;
+                        candidate = Some((match_entry_idx, match_local, offset, match_len));
                     }
+                    last_hit_len = match_len;
+                    cur = self.store.link_of(pos);
+                } else {
+                    // 候选切片足够长却内容不匹配 ⇒ 放弃整条链：同槽更老的候选
+                    // 内容命中概率只低不高（确定性计数实测：不断链时
+                    // common_prefix_len 调用数是基线的数倍，纯浪费）。
+                    break;
                 }
             }
 
@@ -388,9 +391,10 @@ impl MatchGenerator {
                 // get inserted. This trades a small ratio loss for large speed gain
                 // (avoids O(match_len) hash inserts per match).
                 // We still insert the current position's key so future lookups work.
-                let last_entry = self.window.last_mut().unwrap();
+                let last_entry = self.window.last().unwrap();
                 let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-                last_entry.suffixes.insert(key, self.suffix_idx);
+                let current_stream = last_entry.stream_start + self.suffix_idx;
+                self.store.insert(key, current_stream);
 
                 // 扣除倒退吸纳的字面量
                 let last_entry = self.window.last().unwrap();
@@ -411,9 +415,10 @@ impl MatchGenerator {
                 return true;
             }
 
-            let last_entry = self.window.last_mut().unwrap();
+            let last_entry = self.window.last().unwrap();
             let key = &last_entry.data[self.suffix_idx..self.suffix_idx + MIN_MATCH_LEN];
-            last_entry.suffixes.insert(key, self.suffix_idx);
+            let current_stream = last_entry.stream_start + self.suffix_idx;
+            self.store.insert(key, current_stream);
             // Step acceleration, aligned with C's fast path
             // (`ZSTD_compressBlock_fast_generic`, lib/compress/zstd_fast.c:
             //  `step = stepSize` / `if (ip1 >= nextStep) { step++; nextStep += kStepIncr; }`
@@ -454,9 +459,10 @@ impl MatchGenerator {
         if last_entry.data.len() < MIN_MATCH_LEN {
             return;
         }
-        let slice = &last_entry.data[self.suffix_idx..idx];
+        let base = last_entry.stream_start;
+        let slice = &self.window.last().unwrap().data[self.suffix_idx..idx];
         for (key_index, key) in slice.windows(MIN_MATCH_LEN).enumerate() {
-            last_entry.suffixes.insert(key, self.suffix_idx + key_index);
+            self.store.insert(key, base + self.suffix_idx + key_index);
         }
     }
 
@@ -470,12 +476,7 @@ impl MatchGenerator {
 
     /// Add a new window entry. Will panic if the last window entry hasn't been processed properly.
     /// If any resources are released by pushing the new entry they are returned via the callback
-    fn add_data(
-        &mut self,
-        data: Vec<u8>,
-        suffixes: SuffixStore,
-        reuse_space: impl FnMut(Vec<u8>, SuffixStore),
-    ) {
+    fn add_data(&mut self, data: Vec<u8>, reuse_space: impl FnMut(Vec<u8>)) {
         assert!(
             self.window.is_empty() || self.suffix_idx == self.window.last().unwrap().data.len()
         );
@@ -483,18 +484,10 @@ impl MatchGenerator {
         #[cfg(debug_assertions)]
         self.concat_window.extend_from_slice(&data);
 
-        if let Some(last_len) = self.window.last().map(|last| last.data.len()) {
-            for entry in self.window.iter_mut() {
-                entry.base_offset += last_len;
-            }
-        }
-
         let len = data.len();
-        self.window.push(WindowEntry {
-            data,
-            suffixes,
-            base_offset: 0,
-        });
+        let stream_start = self.stream_cumulative;
+        self.stream_cumulative += len;
+        self.window.push(WindowEntry { data, stream_start });
         self.window_size += len;
         self.suffix_idx = 0;
         self.last_idx_in_sequence = 0;
@@ -503,7 +496,7 @@ impl MatchGenerator {
 
     /// Reserve space for a new window entry
     /// If any resources are released by pushing the new entry they are returned via the callback
-    fn reserve(&mut self, amount: usize, mut reuse_space: impl FnMut(Vec<u8>, SuffixStore)) {
+    fn reserve(&mut self, amount: usize, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(self.max_window_size >= amount);
         while self.window_size + amount > self.max_window_size {
             let removed = self.window.remove(0);
@@ -511,19 +504,20 @@ impl MatchGenerator {
             #[cfg(debug_assertions)]
             self.concat_window.drain(0..removed.data.len());
 
+            // The shared store keeps its slots/links; entries dropped from the
+            // window are rejected by the distance check during the walk.
             let WindowEntry {
-                suffixes,
                 data: leaked_vec,
-                base_offset: _,
+                stream_start: _,
             } = removed;
-            reuse_space(leaked_vec, suffixes);
+            reuse_space(leaked_vec);
         }
     }
 }
 
 #[test]
 fn matches() {
-    let mut matcher = MatchGenerator::new(1000);
+    let mut matcher = MatchGenerator::new(1000, 1024);
     let mut original_data = Vec::new();
     let mut reconstructed = Vec::new();
 
@@ -555,11 +549,7 @@ fn matches() {
         }
     };
 
-    matcher.add_data(
-        alloc::vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
+    matcher.add_data(alloc::vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0], |_| {});
     original_data.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
     matcher.next_sequence(|seq| {
@@ -580,8 +570,7 @@ fn matches() {
 
     matcher.add_data(
         alloc::vec![1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0,],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
+        |_| {},
     );
     original_data.extend_from_slice(&[
         1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 0, 0, 0, 0, 0,
@@ -617,8 +606,7 @@ fn matches() {
 
     matcher.add_data(
         alloc::vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 0, 0, 0],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
+        |_| {},
     );
     original_data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 0, 0, 0, 0]);
 
@@ -648,11 +636,7 @@ fn matches() {
     });
     assert!(!matcher.next_sequence(|_| {}));
 
-    matcher.add_data(
-        alloc::vec![0, 0, 0, 0, 0],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
+    matcher.add_data(alloc::vec![0, 0, 0, 0, 0], |_| {});
     original_data.extend_from_slice(&[0, 0, 0, 0, 0]);
 
     matcher.next_sequence(|seq| {
@@ -668,11 +652,7 @@ fn matches() {
     });
     assert!(!matcher.next_sequence(|_| {}));
 
-    matcher.add_data(
-        alloc::vec![7, 8, 9, 10, 11],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
+    matcher.add_data(alloc::vec![7, 8, 9, 10, 11], |_| {});
     original_data.extend_from_slice(&[7, 8, 9, 10, 11]);
 
     matcher.next_sequence(|seq| {
@@ -688,21 +668,13 @@ fn matches() {
     });
     assert!(!matcher.next_sequence(|_| {}));
 
-    matcher.add_data(
-        alloc::vec![1, 3, 5, 7, 9],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
+    matcher.add_data(alloc::vec![1, 3, 5, 7, 9], |_| {});
     matcher.skip_matching();
     original_data.extend_from_slice(&[1, 3, 5, 7, 9]);
     reconstructed.extend_from_slice(&[1, 3, 5, 7, 9]);
     assert!(!matcher.next_sequence(|_| {}));
 
-    matcher.add_data(
-        alloc::vec![1, 3, 5, 7, 9],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
-    );
+    matcher.add_data(alloc::vec![1, 3, 5, 7, 9], |_| {});
     original_data.extend_from_slice(&[1, 3, 5, 7, 9]);
 
     matcher.next_sequence(|seq| {
@@ -720,8 +692,7 @@ fn matches() {
 
     matcher.add_data(
         alloc::vec![0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23],
-        SuffixStore::with_capacity(100),
-        |_, _| {},
+        |_| {},
     );
     original_data.extend_from_slice(&[0, 0, 11, 13, 15, 17, 20, 11, 13, 15, 17, 20, 21, 23]);
 
@@ -758,7 +729,7 @@ fn matches() {
 
 #[test]
 fn chain_reaches_old_positions() {
-    let mut store = SuffixStore::with_capacity(64);
+    let mut store = SuffixStore::with_capacity(64, 64);
     for pos in 0..5usize {
         store.insert(&[0u8; 8][..MIN_MATCH_LEN], pos);
     }
