@@ -314,6 +314,30 @@ impl HuffmanTable {
         }
         Some(sum)
     }
+
+    /// Σ count[s] × nbBits(s) >> 3 — byte estimate over actual symbol counts
+    /// (C `HUF_estimateCompressedSize`, huf_compress.c).
+    pub(crate) fn estimated_size_bytes(&self, counts: &[usize; 256]) -> usize {
+        let mut bits = 0usize;
+        for (symbol, (_, num_bits)) in self.codes.iter().enumerate() {
+            bits += (*num_bits as usize) * counts[symbol];
+        }
+        bits >> 3
+    }
+
+    /// Size in bytes of this table's description (C `HUF_writeCTable` return):
+    /// the same bits `write_table` emits, measured on a scratch buffer.
+    pub(crate) fn description_len_bytes(&self) -> usize {
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut writer = BitWriter::from(&mut scratch);
+        {
+            let mut encoder = HuffmanEncoder::new(self, &mut writer);
+            encoder.write_table();
+        }
+        let bits = writer.index();
+        let _ = writer.flush();
+        bits.div_ceil(8)
+    }
 }
 
 /// zstd 的 Huffman 表最多 11 bit（`HUF_TABLELOG_MAX`）
