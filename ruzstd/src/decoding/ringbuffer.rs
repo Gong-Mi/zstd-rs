@@ -2,6 +2,24 @@ use crate::io::Read;
 use alloc::alloc::{alloc, dealloc};
 use core::{alloc::Layout, ptr::NonNull, slice};
 
+/// Advance a ring index by `amount`, wrapping at most once.
+///
+/// Equivalent to `(pos + amount) % cap` whenever `amount < cap` (which every
+/// caller here guarantees through `reserve`/`len` bounds), but avoids the
+/// 64-bit division on the common non-wrapping path. When `cap == 0` the
+/// division is still executed, so the previous "remainder by zero" panic is
+/// preserved exactly.
+#[inline(always)]
+fn wrap_advance(pos: usize, amount: usize, cap: usize) -> usize {
+    debug_assert!(cap == 0 || amount < cap, "wrap_advance needs amount < cap");
+    let s = pos + amount;
+    if s < cap {
+        s
+    } else {
+        s % cap
+    }
+}
+
 pub struct RingBuffer {
     // Safety invariants:
     //
@@ -140,7 +158,7 @@ impl RingBuffer {
         // SAFETY: Upholds invariant 2 by writing initialized memory
         unsafe { self.buf.as_ptr().add(self.tail).write(byte) };
         // SAFETY: Upholds invariant 3 by wrapping `tail` around
-        self.tail = (self.tail + 1) % self.cap;
+        self.tail = wrap_advance(self.tail, 1, self.cap);
     }
 
     /// Fetch the byte stored at the selected index from the buffer, returning it, or
@@ -150,7 +168,7 @@ impl RingBuffer {
         if idx < self.len() {
             // SAFETY: Establishes invariants on memory being initialized and the range being in-bounds
             // (Invariants 2 & 3)
-            let idx = (self.head + idx) % self.cap;
+            let idx = wrap_advance(self.head, idx, self.cap);
             Some(unsafe { self.buf.as_ptr().add(idx).read() })
         } else {
             None
@@ -189,7 +207,7 @@ impl RingBuffer {
             }
         }
         // SAFETY: Upholds invariant 3 by wrapping `tail` around.
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = wrap_advance(self.tail, len, self.cap);
     }
 
     /// Advance head past `amount` elements, effectively removing
@@ -199,7 +217,7 @@ impl RingBuffer {
         let amount = usize::min(amount, self.len());
         // SAFETY: we maintain invariant 2 here since this will always lead to a smaller buffer
         // for amount≤len
-        self.head = (self.head + amount) % self.cap;
+        self.head = wrap_advance(self.head, amount, self.cap);
     }
 
     /// Return the size of the two contiguous occupied sections of memory used
@@ -374,7 +392,7 @@ impl RingBuffer {
                 // D: Destination bytes, going to be copied from S bytes
                 // _: Uninvolved bytes in the writable section
 
-                let start = (self.head + start) % self.cap;
+                let start = wrap_advance(self.head, start, self.cap);
 
                 let src = (
                     // SAFETY: `len <= isize::MAX` and fits the memory range of `buf`
@@ -461,7 +479,7 @@ impl RingBuffer {
             }
         }
 
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = wrap_advance(self.tail, len, self.cap);
     }
 
     pub fn extend_and_fill(&mut self, fill_with: u8, fill_length: usize) {
@@ -482,7 +500,7 @@ impl RingBuffer {
                 ptr2.write_bytes(fill_with, fill2);
             }
         }
-        self.tail = (self.tail + fill_length) % self.cap;
+        self.tail = wrap_advance(self.tail, fill_length, self.cap);
     }
 
     pub fn extend_from_reader<R: Read>(
@@ -511,7 +529,7 @@ impl RingBuffer {
             };
             read.read_exact(s2)?;
         }
-        self.tail = (self.tail + fill_length) % self.cap;
+        self.tail = wrap_advance(self.tail, fill_length, self.cap);
         Ok(())
     }
 
@@ -572,7 +590,7 @@ impl RingBuffer {
         copy_with_checks(
             m1_ptr, m2_ptr, f1_ptr, f2_ptr, m1_in_f1, m2_in_f1, m1_in_f2, m2_in_f2,
         );
-        self.tail = (self.tail + len) % self.cap;
+        self.tail = wrap_advance(self.tail, len, self.cap);
     }
 }
 
