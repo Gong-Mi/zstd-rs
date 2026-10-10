@@ -289,11 +289,15 @@ impl MatchGenerator {
             const CHAIN_CMP_MAX: usize = 4;
             const LONG_HIT_CUT: usize = 8;
             const CHAIN_WALK_MAX: usize = 32;
+            // 老片（非当前切片）候选的独立比较帽：老片赢家集中在最新候选，
+            // 帽 1 保留 97.8% 的老片赢家而砍掉 42% 的老片比较（确定性计数）。
+            const OLD_CMP_MAX: usize = 1;
             let mut candidate = None;
             let mut walked = 0usize;
             let mut cmps = 0usize;
             // 首次比较命中长度：条件预算用它决定要不要花第二次比较
             let mut last_hit_len = 0usize;
+            let mut old_cmps = 0usize;
             let current_stream = last_entry.stream_start + self.suffix_idx;
             let mut cur = self.store.get(key);
             while let Some(pos) = cur {
@@ -330,6 +334,13 @@ impl MatchGenerator {
                 }
                 if cmps >= CHAIN_CMP_MAX && !(cmps == 1 && last_hit_len >= LONG_HIT_CUT) {
                     break;
+                }
+                let from_old_slice = match_entry_idx + 1 < self.window.len();
+                if from_old_slice {
+                    old_cmps += 1;
+                    if old_cmps > OLD_CMP_MAX {
+                        break;
+                    }
                 }
                 cmps += 1;
 
