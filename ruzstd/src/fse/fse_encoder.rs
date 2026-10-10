@@ -123,8 +123,13 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
 
 #[derive(Debug, Clone)]
 pub struct FSETable {
-    /// Indexed by symbol
-    pub(super) states: [SymbolStates; 256],
+    /// Indexed by symbol（长度固定 256，内容在堆上）
+    ///
+    /// 以前这里是内联 `[SymbolStates; 256]`，使 FSETable 自身 8,200 字节：任何
+    /// 按值传递都要整块搬移——构造返回、放进 `CompressState`/`FrameCompressor`，
+    /// 以及每块把新表存回 `*_previous`。改成堆上 Vec 后 FSETable 只剩
+    /// 指针/长度/`table_size`，这些搬移在最终 IR 里不再表现为大 memcpy。
+    pub(super) states: Vec<SymbolStates>,
     /// Sum of all states.states.len()
     pub(crate) table_size: usize,
 }
@@ -435,10 +440,14 @@ pub(crate) fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_num
 }
 
 pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSETable {
-    let mut states = core::array::from_fn::<SymbolStates, 256, _>(|_| SymbolStates {
-        states: Vec::new(),
-        probability: 0,
-    });
+    // 256 个描述符一次性建在堆上（只分配、不搬移），避免内联大数组每次按值传递都 memcpy
+    let mut states: Vec<SymbolStates> = Vec::with_capacity(256);
+    for _ in 0..256 {
+        states.push(SymbolStates {
+            states: Vec::new(),
+            probability: 0,
+        });
+    }
 
     // distribute -1 symbols
     let mut negative_idx = (1 << acc_log) - 1;
@@ -528,9 +537,77 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         state.states.sort_by_key(|l| l.baseline);
     }
 
+    debug_assert_eq!(states.len(), 256, "FSETable 必须以符号为下标覆盖 256 项");
     FSETable {
         table_size: 1 << acc_log,
         states,
+    }
+}
+
+#[cfg(test)]
+mod table_layout_tests {
+    use super::*;
+    use core::mem::size_of;
+
+    /// 本片的不变量：FSETable 自身必须是指针大小的间接结构，不能把 256 个描述符
+    /// 内联进去。8,200 字节的内联版本会让每次按值传递产生大 memcpy（构造期
+    /// 49,200/49,320、每块 `compress_block` 6×8,200）。
+    #[test]
+    fn fsetable_is_heap_indirect() {
+        let descriptors = size_of::<SymbolStates>() * 256;
+        assert_eq!(descriptors, 8_192, "256 个描述符应为 8,192 字节");
+        assert!(
+            size_of::<FSETable>() < 128,
+            "FSETable 大小 {} 字节，说明描述符仍被内联",
+            size_of::<FSETable>()
+        );
+    }
+
+    /// 三种默认表内容不变：仍以符号为下标覆盖 256 项，且任何符号/下标组合上
+    /// `next_state` 返回的状态都必须包含该下标（查表语义）。
+    #[test]
+    fn default_tables_keep_lookup_semantics() {
+        for (table, acc_log) in [
+            (default_ll_table(), 6u8),
+            (default_ml_table(), 6u8),
+            (default_of_table(), 5u8),
+        ] {
+            assert_eq!(table.states.len(), 256);
+            assert_eq!(table.table_size, 1 << acc_log);
+            assert_eq!(table.acc_log(), acc_log);
+            for symbol in 0..256usize {
+                let states = &table.states[symbol];
+                if states.states.is_empty() {
+                    continue;
+                }
+                for idx in 0..table.table_size {
+                    let state = table.next_state(symbol as u8, idx);
+                    assert!(
+                        state.contains(idx),
+                        "symbol {symbol} idx {idx} 未被返回状态覆盖"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 表构建走的是同一套概率分布，重建两次必须逐项一致（堆化不改变内容）。
+    #[test]
+    fn rebuilt_default_table_is_identical() {
+        let a = default_of_table();
+        let b = default_of_table();
+        assert_eq!(a.table_size, b.table_size);
+        for symbol in 0..256usize {
+            let (x, y) = (&a.states[symbol], &b.states[symbol]);
+            assert_eq!(x.probability, y.probability);
+            assert_eq!(x.states.len(), y.states.len());
+            for (p, q) in x.states.iter().zip(y.states.iter()) {
+                assert_eq!(
+                    (p.num_bits, p.baseline, p.last_index, p.index),
+                    (q.num_bits, q.baseline, q.last_index, q.index)
+                );
+            }
+        }
     }
 }
 
