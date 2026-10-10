@@ -306,7 +306,7 @@ pub fn build_table_from_data(
     build_table_from_counts(&counts[..=max_symbol], max_log, avoid_0_numbit)
 }
 
-fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
+pub(crate) fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
     // Deterministic proportional normalization at a fixed table log with
     // largest-remainder rounding.
     //

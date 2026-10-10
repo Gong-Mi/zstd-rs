@@ -4,7 +4,7 @@ use crate::{
     bit_io::BitWriter,
     encoding::frame_compressor::CompressState,
     encoding::{Matcher, Sequence},
-    fse::fse_encoder::{build_table_from_data, FSETable, State},
+    fse::fse_encoder::{build_table_from_counts, FSETable, State},
     huff0::huff0_encoder,
 };
 
@@ -57,18 +57,24 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
             &state.fse_tables.ll_default,
             sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
             9,
+            6,
+            35,
         );
         let ml_mode = choose_table(
             state.fse_tables.ml_previous.as_ref(),
             &state.fse_tables.ml_default,
             sequences.iter().map(|seq| encode_match_len(seq.ml).0),
             9,
+            6,
+            52,
         );
         let of_mode = choose_table(
             state.fse_tables.of_previous.as_ref(),
             &state.fse_tables.of_default,
             sequences.iter().map(|seq| encode_offset(seq.of).0),
             8,
+            5,
+            28,
         );
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
@@ -121,13 +127,53 @@ fn choose_table<'a>(
     default_table: &'a FSETable,
     data: impl Iterator<Item = u8>,
     max_log: u8,
+    default_norm_log: u8,
+    max_basic_symbol: u8,
 ) -> FseTableMode<'a> {
-    // TODO check if the new table is better than the predefined and previous table
-    let use_new_table = true;
-    let use_previous_table = false;
-    if use_previous_table {
-        FseTableMode::RepeateLast(previous.unwrap())
-    } else if use_new_table {
+    // Port of C `ZSTD_selectEncodingType` (zstd_compress_sequences.c), the
+    // level-1 (`strategy < ZSTD_lazy`) branch with default tables allowed:
+    //   - every sequence maps to the same symbol: predefined (C prefers
+    //     basic for nbSeq <= 2 and rle above; rle is not emitted here, and
+    //     predefined avoids a table header for the remaining cases too);
+    //   - nbSeq < ((1 << defaultNormLog) * (10 - strategy)) >> 3  (strategy
+    //     fast = 1): 72 for LL/ML, 36 for OF — small sequence counts cannot
+    //     pay for a freshly described table;
+    //   - mostFrequent < (nbSeq >> (defaultNormLog - 1)): flat code
+    //     distributions cannot either;
+    //   - otherwise a freshly built table.
+    // C's set_repeat is not emitted: without a dictionary, C v1.5.7 never
+    // establishes a fully valid table (`ZSTD_dictNCountRepeat` is the only
+    // producer of FSE_repeat_valid), so level-1 frames never select repeat.
+    // `previous` stays for the pattern that set the previous-table plumbing.
+    let _ = previous;
+    // Single histogram pass (the table builder below consumes counts directly,
+    // so the codes iterator is only walked once — same cost as the previous
+    // unconditional `build_table_from_data` call).
+    let mut counts = [0usize; 256];
+    let mut nb_seq = 0usize;
+    let mut max_code = 0usize;
+    let mut most_frequent = 0usize;
+    for code in data {
+        let c = &mut counts[code as usize];
+        *c += 1;
+        nb_seq += 1;
+        if *c > most_frequent {
+            most_frequent = *c;
+        }
+        if (code as usize) > max_code {
+            max_code = code as usize;
+        }
+    }
+    let dynamic_min = ((1usize << default_norm_log) * 9) >> 3;
+    if nb_seq != 0
+        && max_code <= max_basic_symbol as usize
+        && ((most_frequent == nb_seq && nb_seq <= 2)
+            || nb_seq < dynamic_min
+            || most_frequent < (nb_seq >> (default_norm_log - 1)))
+    {
+        return FseTableMode::Predefined(default_table);
+    }
+    {
         // `false` = no T/2 cap for frame tables. The fused sequence decoder is
         // terminated by an explicit sequence count, so num_bits == 0 states
         // cannot cause the bit-exhaustion overshoot that would corrupt the
@@ -136,9 +182,16 @@ fn choose_table<'a>(
         // mixed-width ranges of uncapped tables no longer lengthen the encode
         // walk: local interleaved runs put the full uncapped package at or
         // below baseline encode time.
-        FseTableMode::Encoded(build_table_from_data(data, max_log, false))
-    } else {
-        FseTableMode::Predefined(default_table)
+        // Same construction as `build_table_from_data` (last non-zero symbol
+        // scan, no T/2 cap for frame tables — see the note above), fed from
+        // the histogram we already have.
+        let mut max_symbol = 0;
+        for (idx, count) in counts.iter().copied().enumerate() {
+            if count > 0 {
+                max_symbol = idx;
+            }
+        }
+        FseTableMode::Encoded(build_table_from_counts(&counts[..=max_symbol], max_log, false))
     }
 }
 
