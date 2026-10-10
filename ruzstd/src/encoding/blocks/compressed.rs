@@ -4,7 +4,7 @@ use crate::{
     bit_io::BitWriter,
     encoding::frame_compressor::CompressState,
     encoding::{Matcher, Sequence},
-    fse::fse_encoder::{build_table_from_data, FSETable, State},
+    fse::fse_encoder::{build_table_from_counts, FSETable, State},
     huff0::huff0_encoder,
 };
 
@@ -146,12 +146,14 @@ fn choose_table<'a>(
     // producer of FSE_repeat_valid), so level-1 frames never select repeat.
     // `previous` stays for the pattern that set the previous-table plumbing.
     let _ = previous;
-    let codes: alloc::vec::Vec<u8> = data.collect();
-    let mut counts = [0u32; 256];
+    // Single histogram pass (the table builder below consumes counts directly,
+    // so the codes iterator is only walked once — same cost as the previous
+    // unconditional `build_table_from_data` call).
+    let mut counts = [0usize; 256];
     let mut nb_seq = 0usize;
     let mut max_code = 0usize;
-    let mut most_frequent = 0u32;
-    for &code in &codes {
+    let mut most_frequent = 0usize;
+    for code in data {
         let c = &mut counts[code as usize];
         *c += 1;
         nb_seq += 1;
@@ -165,9 +167,9 @@ fn choose_table<'a>(
     let dynamic_min = ((1usize << default_norm_log) * 9) >> 3;
     if nb_seq != 0
         && max_code <= max_basic_symbol as usize
-        && ((most_frequent as usize == nb_seq && nb_seq <= 2)
+        && ((most_frequent == nb_seq && nb_seq <= 2)
             || nb_seq < dynamic_min
-            || (most_frequent as usize) < (nb_seq >> (default_norm_log - 1)))
+            || most_frequent < (nb_seq >> (default_norm_log - 1)))
     {
         return FseTableMode::Predefined(default_table);
     }
@@ -180,7 +182,16 @@ fn choose_table<'a>(
         // mixed-width ranges of uncapped tables no longer lengthen the encode
         // walk: local interleaved runs put the full uncapped package at or
         // below baseline encode time.
-        FseTableMode::Encoded(build_table_from_data(codes.iter().copied(), max_log, false))
+        // Same construction as `build_table_from_data` (last non-zero symbol
+        // scan, no T/2 cap for frame tables — see the note above), fed from
+        // the histogram we already have.
+        let mut max_symbol = 0;
+        for (idx, count) in counts.iter().copied().enumerate() {
+            if count > 0 {
+                max_symbol = idx;
+            }
+        }
+        FseTableMode::Encoded(build_table_from_counts(&counts[..=max_symbol], max_log, false))
     }
 }
 
