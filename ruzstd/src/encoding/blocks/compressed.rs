@@ -381,13 +381,29 @@ fn compress_literals(
 
     let new_encoder_table = huff0_encoder::HuffmanTable::build_from_data(literals);
 
+    // C `HUF_compress_internal` (huf_compress.c, v1.5.7) reuse criterion,
+    // ported: prefer the previous table (treeless block) unless the new
+    // table's frequency-weighted coding savings strictly exceed the size of
+    // its own description:
+    //   oldSize <= hSize + newSize   -> reuse (treeless)
+    //   hSize + 12 >= srcSize        -> reuse (description wouldn't fit)
+    // oldSize/newSize are byte estimates over the actual symbol counts of
+    // this block; hSize is the new table's description size in bytes. The
+    // previous `diff > 5` code-length heuristic never fired on real corpora
+    // (elf4m census: 0 treeless vs C's 17/34).
     let (encoder_table, new_table) = if let Some(_table) = last_table {
-        if let Some(diff) = _table.can_encode(&new_encoder_table) {
-            // TODO this is a very simple heuristic, maybe we should try to do better
-            if diff > 5 {
-                (&new_encoder_table, true)
-            } else {
+        if _table.can_encode(&new_encoder_table).is_some() {
+            let mut counts = [0usize; 256];
+            for &b in literals {
+                counts[b as usize] += 1;
+            }
+            let old_size = _table.estimated_size_bytes(&counts);
+            let new_size = new_encoder_table.estimated_size_bytes(&counts);
+            let h_size = new_encoder_table.description_len_bytes();
+            if old_size <= h_size + new_size || h_size + 12 >= literals.len() {
                 (_table, false)
+            } else {
+                (&new_encoder_table, true)
             }
         } else {
             (&new_encoder_table, true)
