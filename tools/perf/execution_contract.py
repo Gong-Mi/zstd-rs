@@ -6,14 +6,19 @@ from pathlib import Path
 from json_contract import strict_json
 
 SIDES = ('base', 'head', 'base2')
+# 可选第四侧：basex = base 源在独立路径的第二次构建（跨构建代码生成控制腿）。
+SIDES_XB = ('base', 'head', 'base2', 'basex')
 PROTOCOL = 'rotating-aba-v1'
+PROTOCOL_XB = 'rotating-aba-xb-v1'
 
 
-def schedule(rounds):
+def schedule(rounds, sides=SIDES):
+    if sides not in (SIDES, SIDES_XB):
+        raise ValueError('unknown side set')
     result = []
     for number in range(1, rounds + 1):
-        shift = (number - 1) % len(SIDES)
-        order = SIDES[shift:] + SIDES[:shift]
+        shift = (number - 1) % len(sides)
+        order = sides[shift:] + sides[:shift]
         for side in order:
             result.append({'ordinal': len(result) + 1, 'round': number, 'side': side})
     return result
@@ -22,15 +27,16 @@ def schedule(rounds):
 def validate_execution(declaration, rounds, builds, path):
     """Fail closed for new declarations; legacy manifests stay explicitly legacy."""
     errors = []
-    if not isinstance(declaration, dict) or declaration.get('protocol') != PROTOCOL:
+    if not isinstance(declaration, dict) or declaration.get('protocol') not in (PROTOCOL, PROTOCOL_XB):
         return ['execution: unknown protocol']
+    sides = SIDES_XB if declaration.get('protocol') == PROTOCOL_XB else SIDES
     affinity = declaration.get('affinity')
     if (not isinstance(affinity, list) or len(affinity) != 1 or
             type(affinity[0]) is not int or affinity[0] < 0):
         return ['execution: singleton nonnegative CPU affinity required']
-    expected = schedule(rounds)
+    expected = schedule(rounds, sides)
     if json.dumps(declaration.get('schedule'), sort_keys=True) != json.dumps(expected, sort_keys=True):
-        errors.append('execution: declared schedule is not rotating A/B/A')
+        errors.append('execution: declared schedule is not rotating interleaved')
     try:
         lines = Path(path).read_text(encoding='utf-8').splitlines()
         rows = [strict_json(line) for line in lines if line.strip()]

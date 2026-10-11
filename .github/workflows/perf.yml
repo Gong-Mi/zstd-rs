@@ -106,19 +106,27 @@ jobs:
         with:
           ref: ${{ steps.refs.outputs.head }}
           path: head
+      - name: Checkout basex (independent second build of BASE, cross-build control leg)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.refs.outputs.base }}
+          path: basex
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Copy the exact same locked measurement program into both subjects
+      - name: Copy the exact same locked measurement program into all subjects
         run: |
-          mkdir -p base/tools/perf/harness head/tools/perf/harness build-records bins
+          mkdir -p base/tools/perf/harness head/tools/perf/harness basex/tools/perf/harness build-records bins
           cp -R tooling/tools/perf/harness/. base/tools/perf/harness/
           cp -R tooling/tools/perf/harness/. head/tools/perf/harness/
+          cp -R tooling/tools/perf/harness/. basex/tools/perf/harness/
           rustc -vV > build-records/rustc.txt
           cargo -V > build-records/cargo.txt
           git -C base rev-parse HEAD > build-records/base-source.txt
           git -C head rev-parse HEAD > build-records/head-source.txt
+          git -C basex rev-parse HEAD > build-records/basex-source.txt
           git -C tooling rev-parse HEAD > build-records/tooling-source.txt
           diff -r base/tools/perf/harness head/tools/perf/harness
+          diff -r base/tools/perf/harness basex/tools/perf/harness
       - name: Pick a C compiler matching rustc's LLVM for the C reference
         id: ccpick
         continue-on-error: true
@@ -175,17 +183,20 @@ jobs:
           workspaces: |
             base/tools/perf/harness -> ../../../../targets/base
             head/tools/perf/harness -> ../../../../targets/head
+            basex/tools/perf/harness -> ../../../../targets/basex
           # 编译器进 key：换 C 编译器必须让 zstd-sys 重新构建，不能复用旧 .a
           key: ccompiler-${{ steps.ccpick.outputs.cc }}
-      - name: Build both locked release binaries
+      - name: Build all locked release binaries (base/head/basex)
         run: |
           set -euo pipefail
           echo "CC=$CC CXX=$CXX" >> build-records/cc.txt
           (cd base/tools/perf/harness && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/targets/base" cargo build --locked --release) > build-records/base.log 2>&1
           (cd head/tools/perf/harness && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/targets/head" cargo build --locked --release) > build-records/head.log 2>&1
+          (cd basex/tools/perf/harness && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/targets/basex" cargo build --locked --release) > build-records/basex.log 2>&1
           cp targets/base/release/ruzstd-perf-harness bins/base
           cp targets/head/release/ruzstd-perf-harness bins/head
-          sha256sum bins/base bins/head > build-records/binaries.sha256
+          cp targets/basex/release/ruzstd-perf-harness bins/basex
+          sha256sum bins/base bins/head bins/basex > build-records/binaries.sha256
       - name: Assert the C reference carries no hand-written assembly
         run: |
           set -uo pipefail
@@ -258,6 +269,7 @@ jobs:
           fi
           python3 tooling/tools/perf/run_ab.py \
             --base-bin "$GITHUB_WORKSPACE/bins/base" --head-bin "$GITHUB_WORKSPACE/bins/head" \
+            --basex-bin "$GITHUB_WORKSPACE/bins/basex" \
             --base-source "$(git -C base rev-parse HEAD)" --head-source "$(git -C head rev-parse HEAD)" \
             --harness-dir "$GITHUB_WORKSPACE/tooling/tools/perf/harness" --repo-dir "$GITHUB_WORKSPACE/head" \
             --output-dir "$GITHUB_WORKSPACE/perf-results" --rounds "$REPS" --iters "$ITERS" \

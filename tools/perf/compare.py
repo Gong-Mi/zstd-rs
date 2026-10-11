@@ -9,10 +9,16 @@ NO_CHANGE. Optional attachment failure does not invalidate primary data.
 
 Each metric uses the median of round-matched head/base percent differences.
 A/A noise is max(abs(base2/base percent difference)) for that case AND metric;
-threshold = max(min_effect_pct, noise). Both wall and CPU must STRICTLY exceed
-threshold in the same direction. This is a conservative operational screen,
-not a significance test or a cross-run speedup trajectory. Encoding ratios
-are input_bytes/output_bytes; a reduced implementation ratio is a tradeoff.
+threshold = max(min_effect_pct, noise). When the optional basex leg (an
+independent second build of the base source) is present, its max(abs(basex/base
+percent difference)) also joins the threshold as the cross-build noise floor.
+Opposite-direction deltas with BOTH metrics within their thresholds are
+classified NO_CHANGE (indistinguishable from noise); opposite directions with
+any metric beyond its threshold remain UNRESOLVED. Both wall and CPU must
+STRICTLY exceed threshold in the same direction. This is a conservative
+operational screen, not a significance test or a cross-run speedup trajectory.
+Encoding ratios are input_bytes/output_bytes; a reduced implementation ratio
+is a tradeoff.
 
 Each round selects one minimum-wall raw sample (first wins exact ties). Its
 CPU must accompany that same sample, including for the C reference. Across-
@@ -32,6 +38,8 @@ from execution_contract import validate_execution
 from json_contract import strict_json
 
 SIDES = ("base", "head", "base2")
+# 可选第四侧：basex = base 源独立二次构建（跨构建代码生成控制腿；见 rotate 协议 v1）。
+SIDES_XB = ("base", "head", "base2", "basex")
 LEGS = ("stream", "known", "fastest")
 ATTACHMENT_STATES = ("NOT_RUN", "FAILED", "COMPLETE")
 REL_TOL = 1e-9
@@ -133,6 +141,14 @@ def load_manifest(path, errors):
             validate_build(builds.get(side), "manifest.builds." + side, errors)
         check(isinstance(builds.get("base"), dict) and builds.get("base2") == builds["base"],
               "manifest: base2 build must exactly equal base (same source AND binary)", errors)
+        if "basex" in builds:
+            # 可选跨构建控制腿：源必须与 base 相同；binary 允许不同（控制对象即是
+            # 二次构建的代码生成差），相同（环境决定论）时退化为第二条 A/A。
+            validate_build(builds.get("basex"), "manifest.builds.basex", errors)
+            check(isinstance(builds.get("base"), dict) and
+                  isinstance(builds.get("basex"), dict) and
+                  builds["basex"].get("source_sha") == builds["base"].get("source_sha"),
+                  "manifest: basex source must equal base source (independent build only)", errors)
     cases = manifest.get("cases")
     expected = {}
     if check(isinstance(cases, list) and bool(cases), "manifest: cases must be nonempty list", errors):
@@ -324,7 +340,7 @@ def side_stats(rows):
     return result
 
 
-def paired_metric(before, after, field, base, base2, min_effect, inverse=False):
+def paired_metric(before, after, field, base, base2, min_effect, inverse=False, basex=None):
     rounds = sorted(set(before) & set(after))
     delta = lambda after_value, before_value: (percent(before_value, after_value) if inverse
                                              else percent(after_value, before_value))
@@ -333,10 +349,22 @@ def paired_metric(before, after, field, base, base2, min_effect, inverse=False):
     aa = [{"round": number, "delta_pct": delta(base2[number][field], base[number][field])}
           for number in sorted(set(base) & set(base2))]
     noise = max((abs(row["delta_pct"]) for row in aa), default=None)
-    return {"round_deltas_pct": deltas,
-            "median_delta_pct": median([row["delta_pct"] for row in deltas]),
-            "aa_round_deltas_pct": aa, "aa_noise_pct": noise,
-            "threshold_pct": max(min_effect, noise) if noise is not None else None}
+    xb, xb_noise = None, None
+    if basex is not None:
+        xb = [{"round": number, "delta_pct": delta(basex[number][field], base[number][field])}
+              for number in sorted(set(base) & set(basex))]
+        xb_noise = max((abs(row["delta_pct"]) for row in xb), default=None)
+    threshold = None
+    if noise is not None:
+        threshold = max(value for value in (min_effect, noise, xb_noise) if value is not None)
+    result = {"round_deltas_pct": deltas,
+              "median_delta_pct": median([row["delta_pct"] for row in deltas]),
+              "aa_round_deltas_pct": aa, "aa_noise_pct": noise,
+              "threshold_pct": threshold}
+    if xb is not None:
+        result["xb_round_deltas_pct"] = xb
+        result["xb_noise_pct"] = xb_noise
+    return result
 
 
 def classify(paired, ratio_degraded):
@@ -349,9 +377,12 @@ def classify(paired, ratio_degraded):
     # must never become permission to hide even one extra encoded byte.
     if ratio_degraded:
         return "TRADEOFF"
-    # Opposite directions are unresolved even if either is below threshold;
-    # one significant metric alone never proves a simultaneous gain.
+    # 方向冲突：只要任一指标超过自身噪声门即为真正的未决（UNRESOLVED）。
+    # 两侧都在各自阈值内的异号微值（|w|<=wt 且 |c|<=ct）与噪声不可分辨，
+    # 记 NO_CHANGE——不构成对候选的指控，也不构成收益。
     if w * c < 0:
+        if abs(w) <= wt and abs(c) <= ct:
+            return "NO_CHANGE"
         return "UNRESOLVED"
     if w < -wt and c < -ct:
         return "GAIN"
@@ -362,14 +393,16 @@ def classify(paired, ratio_degraded):
     return "NO_CHANGE"
 
 
-def compare_case(case, before, after, base, base2, min_effect, before_name="base", after_name="head"):
+def compare_case(case, before, after, base, base2, min_effect, before_name="base", after_name="head",
+                 basex=None):
     paired = {}
     for name, field in (("wall", "ruzstd_ms"), ("cpu", "ruzstd_cpu_ms"),
                         ("reference_wall", "c_ms"), ("reference_cpu", "c_cpu_ms")):
-        paired[name] = paired_metric(before, after, field, base, base2, min_effect)
+        paired[name] = paired_metric(before, after, field, base, base2, min_effect, basex=basex)
     for name, field in (("ratio", "ruzstd_bytes"), ("reference_ratio", "c_bytes")):
         if case["kind"] == "encode":
-            paired[name] = paired_metric(before, after, field, base, base2, min_effect, inverse=True)
+            paired[name] = paired_metric(before, after, field, base, base2, min_effect, inverse=True,
+                                         basex=basex)
         else:
             paired[name] = None
     ratio_degraded = case["kind"] == "encode" and any(
@@ -377,7 +410,8 @@ def compare_case(case, before, after, base, base2, min_effect, before_name="base
         for number in set(before) & set(after))
     return {"case": case, "data_status": "COMPLETE", "paired": paired,
             "sides": {before_name: side_stats(before), after_name: side_stats(after),
-                      **({"base2": side_stats(base2)} if before_name == "base" else {})},
+                      **({"base2": side_stats(base2)} if before_name == "base" else {}),
+                      **({"basex": side_stats(basex)} if basex is not None else {})},
             "performance_status": classify(paired, ratio_degraded)}
 
 
@@ -418,23 +452,25 @@ def compare(manifest_path, data_dir, min_effect_pct=1.0, *, allow_attachments=Tr
               "provenance": {key: manifest.get(key) for key in ("runner", "rounds", "harness_sha256", "lock_sha256", "builds", "execution")},
               "method": {"min_effect_pct": min_effect_pct,
                          "estimator": "median of matched-round head/base percent differences",
-                         "noise": "per-case per-metric max absolute matched-round base2/base difference",
-                         "threshold": "max(min_effect_pct, per-case A/A noise); strict exceedance",
+                         "noise": "per-case per-metric max absolute matched-round base2/base (same-binary) and, when present, basex/base (cross-build) differences",
+                         "threshold": "max(min_effect_pct, per-case same-binary A/A noise, per-case cross-build basex noise when present); strict exceedance",
                          "gate": "accept at least one GAIN, all remaining cases GAIN or NO_CHANGE; no ratio degradation",
                          "claim_scope": "same-run operational screen, not statistical significance or cross-run speedup",
                          "selection": "first minimum-wall sample; its paired CPU; minima diagnostic only",
                          "ratio": "input bytes / output bytes; lower implementation ratio is TRADEOFF"},
               "attachments": {}}
+    sides = SIDES_XB if "basex" in builds else SIDES
     records = {}
-    for side in SIDES:
+    for side in sides:
         build = builds.get(side) if isinstance(builds.get(side), dict) else {}
         records[side], report["sides"][side] = load_side(Path(data_dir) / (side + ".jsonl"), side,
                                                        rounds, build, expected, errors)
     for key, case in expected.items():
-        if rounds and all(len(records[side][key]) == rounds for side in SIDES):
+        if rounds and all(len(records[side][key]) == rounds for side in sides):
             try:
                 entry = compare_case(case, records["base"][key], records["head"][key],
-                                     records["base"][key], records["base2"][key], min_effect_pct)
+                                     records["base"][key], records["base2"][key], min_effect_pct,
+                                     basex=records.get("basex", {}).get(key))
             except (ValueError, OverflowError) as exc:
                 errors.append(case_label(case) + ": " + str(exc))
                 entry = None
@@ -442,7 +478,7 @@ def compare(manifest_path, data_dir, min_effect_pct=1.0, *, allow_attachments=Tr
             entry = None
         if entry is None:
             entry = {"case": case, "data_status": "INCOMPLETE", "performance_status": "NOT_EVALUATED",
-                     "paired": None, "sides": {side: side_stats(records[side][key]) for side in SIDES}}
+                     "paired": None, "sides": {side: side_stats(records[side][key]) for side in sides}}
         report["cases"].append(entry)
     if not errors:
         report["data_status"] = "COMPLETE"
@@ -563,7 +599,9 @@ def render_markdown(report):
              "With --fail-on-regression, exit 2 means complete but NOT_ACCEPTED: regression, ratio tradeoff, "
              "unresolved direction, or no gain. Acceptance requires at least one GAIN and all other cases GAIN or NO_CHANGE.",
              "", "Wall/CPU: median of paired-round head/base changes. Each case/metric threshold is "
-             "max(min_effect_pct, max absolute paired base2/base A/A fluctuation). Both metrics must strictly "
+             "max(min_effect_pct, max absolute paired base2/base A/A fluctuation"
+             "[, max absolute paired basex/base cross-build fluctuation when the optional "
+             "independent-second-build control leg is present]). Both metrics must strictly "
              "exceed their thresholds in the same direction. This is not statistical significance. "
              "Ratio = input/output bytes; lower implementation ratio is TRADEOFF. Cross-run absolute speedups "
              "are not inferred. Across-round minima are diagnostic only.", "", "## Provenance", ""]
