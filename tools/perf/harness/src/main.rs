@@ -83,7 +83,7 @@ fn args() -> Args {
     if !out.plan {
         assert!(matches!(
             out.side.as_str(),
-            "base" | "head" | "base2" | "head_tuned"
+            "base" | "head" | "base2" | "basex" | "head_tuned"
         ));
         assert!(
             hex_identity(&out.source_sha, 40),
