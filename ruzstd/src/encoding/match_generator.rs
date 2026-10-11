@@ -12,7 +12,20 @@ use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
 
-const MIN_MATCH_LEN: usize = 5;
+const MIN_MATCH_LEN: usize = 5; // 默认 5（诊断变体 B 曾临时置 4：见 REPORT.md 6.5 的负结果）
+
+/// 诊断变体 B：4 字节键哈希（默认变体用 5 字节键，见 `key_raw`）。
+/// 注意：`key_raw` 只在 `MIN_MATCH_LEN == 4` 时调用它；默认常量下该分支被常量折叠掉。
+#[inline(always)]
+#[allow(dead_code)]
+fn key_raw_4(suffix: &[u8]) -> u64 {
+    const POLY: u64 = 0xCF3BCCDCABu64;
+    let s0 = (suffix[0] as u64).wrapping_shl(24).wrapping_mul(POLY);
+    let s1 = (suffix[1] as u64).wrapping_shl(32).wrapping_mul(POLY);
+    let s2 = (suffix[2] as u64).wrapping_shl(40).wrapping_mul(POLY);
+    let s3 = (suffix[3] as u64).wrapping_shl(48).wrapping_mul(POLY);
+    s0 ^ s1 ^ s2 ^ s3
+}
 
 /// This is the default implementation of the `Matcher` trait. It allocates and reuses the buffers when possible.
 pub struct MatchGeneratorDriver {
@@ -25,7 +38,11 @@ pub struct MatchGeneratorDriver {
 impl MatchGeneratorDriver {
     /// slice_size says how big the slices should be that are allocated to work with
     /// max_slices_in_window says how many slices should at most be used while looking for matches
-    pub(crate) fn new(slice_size: usize, max_slices_in_window: usize) -> Self {
+    ///
+    /// 诊断用：本仓库默认用 128KiB × 1 片（= 128KiB 窗口）；改成 pub 是为了让窗口扫描
+    /// 例程能在不改库行为的前提下对齐 C 的 `windowLog` 口径做对照。窗口总字节 =
+    /// `slice_size * max_slices_in_window`，而 `slice_size` 同时是块大小。
+    pub fn new(slice_size: usize, max_slices_in_window: usize) -> Self {
         Self {
             vec_pool: Vec::new(),
             suffix_pool: Vec::new(),
@@ -191,6 +208,9 @@ impl SuffixStore {
     fn key_raw(suffix: &[u8]) -> u64 {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::HASHES, 1);
+        if MIN_MATCH_LEN == 4 {
+            return key_raw_4(suffix);
+        }
         let s0 = suffix[0] as u64;
         let s1 = suffix[1] as u64;
         let s2 = suffix[2] as u64;
@@ -315,9 +335,20 @@ impl MatchGenerator {
             // （原先 `get` 与 `insert` 各算一遍，每遍 5 次 64 位乘法 + 一次动态取模）。
             let key_raw = SuffixStore::key_raw(&data_slice[..MIN_MATCH_LEN]);
 
-            // Look in each window entry
+            // Look in each window entry（诊断特性下可切换走查顺序：默认最老先走）
             let mut candidate = None;
-            for (match_entry_idx, match_entry) in self.window.iter().enumerate() {
+            #[cfg(feature = "encstats")]
+            let newest_first = crate::encstats::window_order_newest_first();
+            #[cfg(not(feature = "encstats"))]
+            let newest_first = false;
+            let entry_count = self.window.len();
+            for step in 0..entry_count {
+                let match_entry_idx = if newest_first {
+                    entry_count - 1 - step
+                } else {
+                    step
+                };
+                let match_entry = &self.window[match_entry_idx];
                 // 有界链走查（与比较融合，不预取整条链）：
                 //  - 内容比较是成本主项 ⇒ 预算 CHAIN_CMP_MAX 次；
                 //  - "太近"候选（切片 < MIN_MATCH_LEN，步进加速下常见）不消耗比较预算，
@@ -383,9 +414,19 @@ impl MatchGenerator {
                         }
 
                         if let Some((_, _, old_offset, old_match_len)) = candidate {
-                            if match_len > old_match_len
-                                || (match_len == old_match_len && offset < old_offset)
-                            {
+                            // 次选入围条件：诊断特性下可由 encstats::set_cand_rule 切换规则，
+                            // 默认（rule 0 / 未开特性）与现行行为逐字节一致。
+                            #[cfg(feature = "encstats")]
+                            let accept = crate::encstats::cand_rule_accept(
+                                match_len,
+                                offset,
+                                old_match_len,
+                                old_offset,
+                            );
+                            #[cfg(not(feature = "encstats"))]
+                            let accept = match_len > old_match_len
+                                || (match_len == old_match_len && offset < old_offset);
+                            if accept {
                                 candidate = Some((match_entry_idx, match_index, offset, match_len));
                             }
                         } else {

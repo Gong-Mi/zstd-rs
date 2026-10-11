@@ -47,3 +47,24 @@ harness = false
 [[example]]
 name = "enccounts"
 required-features = ["encstats"]
+
+# repcode 潜在收益诊断：按 zstd 的 rep 语义观察有多少序列的 offset 命中 rep1/2/3，
+# 以及它们当前多付的 offset 附加位（上界）。不改输出字节。
+[[example]]
+name = "repcode_potential"
+required-features = ["encstats"]
+
+# 块内构成诊断：表开销 / literals / sequences 各占多少（B5 Repeat 模式值多少）。
+[[example]]
+name = "table_overhead"
+required-features = ["encstats"]
+
+# 次选候选入围规则扫描：量化「加强入围条件」对压缩率的影响（rule 0 = 现行）。
+[[example]]
+name = "cand_rule_sweep"
+required-features = ["encstats"]
+
+# 窗口条目走查顺序 × 入围规则 × 窗口大小 的压缩率扫描（诊断）。
+[[example]]
+name = "window_order_sweep"
+required-features = ["encstats"]
