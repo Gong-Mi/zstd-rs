@@ -12,7 +12,20 @@ use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
 
-const MIN_MATCH_LEN: usize = 5;
+const MIN_MATCH_LEN: usize = 5; // 默认 5（诊断变体 B 曾临时置 4：见 REPORT.md 6.5 的负结果）
+
+/// 诊断变体 B：4 字节键哈希（默认变体用 5 字节键，见 `key_raw`）。
+/// 注意：`key_raw` 只在 `MIN_MATCH_LEN == 4` 时调用它；默认常量下该分支被常量折叠掉。
+#[inline(always)]
+#[allow(dead_code)]
+fn key_raw_4(suffix: &[u8]) -> u64 {
+    const POLY: u64 = 0xCF3BCCDCABu64;
+    let s0 = (suffix[0] as u64).wrapping_shl(24).wrapping_mul(POLY);
+    let s1 = (suffix[1] as u64).wrapping_shl(32).wrapping_mul(POLY);
+    let s2 = (suffix[2] as u64).wrapping_shl(40).wrapping_mul(POLY);
+    let s3 = (suffix[3] as u64).wrapping_shl(48).wrapping_mul(POLY);
+    s0 ^ s1 ^ s2 ^ s3
+}
 
 /// This is the default implementation of the `Matcher` trait. It allocates and reuses the buffers when possible.
 pub struct MatchGeneratorDriver {
@@ -195,6 +208,9 @@ impl SuffixStore {
     fn key_raw(suffix: &[u8]) -> u64 {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::HASHES, 1);
+        if MIN_MATCH_LEN == 4 {
+            return key_raw_4(suffix);
+        }
         let s0 = suffix[0] as u64;
         let s1 = suffix[1] as u64;
         let s2 = suffix[2] as u64;
