@@ -53,3 +53,13 @@ required-features = ["encstats"]
 [[example]]
 name = "repcode_potential"
 required-features = ["encstats"]
+
+# 块内构成诊断：表开销 / literals / sequences 各占多少（B5 Repeat 模式值多少）。
+[[example]]
+name = "table_overhead"
+required-features = ["encstats"]
+
+# 次选候选入围规则扫描：量化「加强入围条件」对压缩率的影响（rule 0 = 现行）。
+[[example]]
+name = "cand_rule_sweep"
+required-features = ["encstats"]

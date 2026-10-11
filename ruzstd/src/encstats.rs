@@ -17,7 +17,65 @@ pub const SEQ_REP_HITS: usize = 5;
 pub const SEQ_REP_EXTRA_BITS: usize = 6;
 /// 起始 rep 历史（zstd 语义：rep1/rep2/rep3 = 1/4/8）。
 pub const REP_INIT: [u32; 3] = [1, 4, 8];
-pub const N: usize = 7;
+/// 走的压缩块数（`compress_block` 调用次数）。
+pub const BLK_NUM: usize = 7;
+/// ll/ml/of 三类 FSE 表模式里选 `Encoded`（重发表）的次数。
+pub const MODE_ENCODED: usize = 8;
+/// 选 `Predefined`（预定义表）的次数。
+pub const MODE_PREDEFINED: usize = 9;
+/// 表区占用（模式字节 + 三张表的 write_table）bit 数。
+pub const BLK_TABLE_BITS: usize = 10;
+/// literals 分区占用 bit 数（含 literals section header）。
+pub const BLK_LITERALS_BITS: usize = 11;
+/// sequences 分区占用 bit 数（含序列数头）。
+pub const BLK_SEQ_BITS: usize = 12;
+/// 因压缩无收益而退回 raw 的块数。
+pub const BLK_RAW: usize = 13;
+pub const N: usize = 14;
+
+/// 诊断用：次选候选入围规则开关（0 = 现行规则）。
+///
+/// 现行规则 = `match_len > old_match_len || (match_len == old_match_len && offset < old_offset)`
+/// ——任何"严格更长"或"等长且偏移更小"的候选都会顶掉当前选择。链走查最多比
+/// `CHAIN_CMP_MAX` 次，因此窗口/历史一多，就容易用"更长但偏移更大"的匹配替换掉
+/// 更划算的匹配（offset 附加位变多、局部性变差）。本开关让例程在不改默认行为的前提下
+/// 逐个量各条加强规则的压缩率后果。
+pub static CAND_RULE: core::sync::atomic::AtomicU8 = const { core::sync::atomic::AtomicU8::new(0) };
+
+pub fn set_cand_rule(rule: u8) {
+    CAND_RULE.store(rule, Ordering::Relaxed);
+}
+
+/// 次选入围判定（诊断）：返回是否接受新候选。
+///
+/// 规则表：
+/// - 0 现行：更长即接受；等长时取更小 offset
+/// - 1 严格更长：等长不接受
+/// - 2 至少长 2 字节
+/// - 3 至少长 4 字节
+/// - 4 长度增益须盖过 offset 附加位代价（Δlen×1bit ≥ Δlog2(offset)）
+/// - 5 规则 4 且等长时仅在 offset 更小时接受
+pub fn cand_rule_accept(match_len: usize, offset: usize, old_len: usize, old_offset: usize) -> bool {
+    let rule = CAND_RULE.load(Ordering::Relaxed);
+    match rule {
+        1 => match_len > old_len,
+        2 => match_len > old_len + 1,
+        3 => match_len > old_len + 3,
+        4 | 5 => {
+            let log2 = |v: usize| (usize::BITS - 1 - (v | 1).leading_zeros()) as i64;
+            let extra_bits = log2(offset) - log2(old_offset);
+            let len_gain = match_len as i64 - old_len as i64;
+            if len_gain > extra_bits {
+                true
+            } else if len_gain == 0 {
+                rule == 5 && offset < old_offset
+            } else {
+                false
+            }
+        }
+        _ => match_len > old_len || (match_len == old_len && offset < old_offset),
+    }
+}
 
 pub static C: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 

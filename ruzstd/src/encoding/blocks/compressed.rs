@@ -39,6 +39,10 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
     // literals section
 
     let mut writer = BitWriter::from(output);
+    #[cfg(feature = "encstats")]
+    let idx_literals_start = writer.index();
+    #[cfg(feature = "encstats")]
+    crate::encstats::bump(crate::encstats::BLK_NUM, 1);
     if literals_vec.len() > 1024 {
         if let Some(table) =
             compress_literals(&literals_vec, state.last_huff_table.as_ref(), &mut writer)
@@ -48,6 +52,11 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
     } else {
         raw_literals(&literals_vec, &mut writer);
     }
+    #[cfg(feature = "encstats")]
+    crate::encstats::bump(
+        crate::encstats::BLK_LITERALS_BITS,
+        (writer.index() - idx_literals_start) as u64,
+    );
 
     // sequences section
 
@@ -55,6 +64,8 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         writer.write_bits(0u8, 8);
     } else {
         encode_seqnum(sequences.len(), &mut writer);
+        #[cfg(feature = "encstats")]
+        let idx_tables_start = writer.index();
 
         // Choose the tables
         // TODO store previously used tables
@@ -89,12 +100,34 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         encode_table(&of_mode, &mut writer);
         encode_table(&ml_mode, &mut writer);
 
+        #[cfg(feature = "encstats")]
+        {
+            use crate::encstats as es;
+            for m in [&ll_mode, &of_mode, &ml_mode] {
+                match m {
+                    FseTableMode::Encoded(_) => es::bump(es::MODE_ENCODED, 1),
+                    FseTableMode::Predefined(_) => es::bump(es::MODE_PREDEFINED, 1),
+                    FseTableMode::RepeateLast(_) => {}
+                }
+            }
+            es::bump(es::BLK_TABLE_BITS, (writer.index() - idx_tables_start) as u64);
+        }
+
+        #[cfg(feature = "encstats")]
+        let idx_seq_start = writer.index();
+
         encode_sequences(
             &sequences,
             &mut writer,
             ll_mode.as_ref(),
             ml_mode.as_ref(),
             of_mode.as_ref(),
+        );
+
+        #[cfg(feature = "encstats")]
+        crate::encstats::bump(
+            crate::encstats::BLK_SEQ_BITS,
+            (writer.index() - idx_seq_start) as u64,
         );
 
         if let FseTableMode::Encoded(table) = ll_mode {

@@ -387,9 +387,19 @@ impl MatchGenerator {
                         }
 
                         if let Some((_, _, old_offset, old_match_len)) = candidate {
-                            if match_len > old_match_len
-                                || (match_len == old_match_len && offset < old_offset)
-                            {
+                            // 次选入围条件：诊断特性下可由 encstats::set_cand_rule 切换规则，
+                            // 默认（rule 0 / 未开特性）与现行行为逐字节一致。
+                            #[cfg(feature = "encstats")]
+                            let accept = crate::encstats::cand_rule_accept(
+                                match_len,
+                                offset,
+                                old_match_len,
+                                old_offset,
+                            );
+                            #[cfg(not(feature = "encstats"))]
+                            let accept = match_len > old_match_len
+                                || (match_len == old_match_len && offset < old_offset);
+                            if accept {
                                 candidate = Some((match_entry_idx, match_index, offset, match_len));
                             }
                         } else {

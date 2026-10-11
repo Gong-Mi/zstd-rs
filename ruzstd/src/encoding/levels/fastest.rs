@@ -65,6 +65,8 @@ pub fn compress_fastest<M: Matcher>(
         // Also preserve the format guard that compressed blocks must not
         // exceed the maximum block size.
         if compressed_size >= block_size as usize || compressed_size > MAX_BLOCK_SIZE as usize {
+            #[cfg(feature = "encstats")]
+            crate::encstats::bump(crate::encstats::BLK_RAW, 1);
             let header = BlockHeader {
                 last_block,
                 block_type: crate::blocks::block::BlockType::Raw,
