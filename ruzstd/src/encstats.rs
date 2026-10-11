@@ -6,7 +6,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const INSERTS: usize = 0;
 pub const PROBES: usize = 1;
 pub const HITS: usize = 2;
-pub const N: usize = 3;
+/// 原始哈希计算次数：同一位置探针+插入共用一次，故应 < PROBES + INSERTS。
+pub const HASHES: usize = 3;
+pub const N: usize = 4;
 
 pub static C: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
