@@ -25,7 +25,11 @@ pub struct MatchGeneratorDriver {
 impl MatchGeneratorDriver {
     /// slice_size says how big the slices should be that are allocated to work with
     /// max_slices_in_window says how many slices should at most be used while looking for matches
-    pub(crate) fn new(slice_size: usize, max_slices_in_window: usize) -> Self {
+    ///
+    /// 诊断用：本仓库默认用 128KiB × 1 片（= 128KiB 窗口）；改成 pub 是为了让窗口扫描
+    /// 例程能在不改库行为的前提下对齐 C 的 `windowLog` 口径做对照。窗口总字节 =
+    /// `slice_size * max_slices_in_window`，而 `slice_size` 同时是块大小。
+    pub fn new(slice_size: usize, max_slices_in_window: usize) -> Self {
         Self {
             vec_pool: Vec::new(),
             suffix_pool: Vec::new(),

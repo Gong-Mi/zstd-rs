@@ -30,6 +30,12 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
         }
     });
 
+    // 诊断计数：观察每条序列的真实 offset 是否命中 rep 历史（不改输出字节）
+    #[cfg(feature = "encstats")]
+    for seq in &sequences {
+        state.rep_history.observe(seq.of - 3);
+    }
+
     // literals section
 
     let mut writer = BitWriter::from(output);

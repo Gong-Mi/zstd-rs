@@ -47,3 +47,9 @@ harness = false
 [[example]]
 name = "enccounts"
 required-features = ["encstats"]
+
+# repcode 潜在收益诊断：按 zstd 的 rep 语义观察有多少序列的 offset 命中 rep1/2/3，
+# 以及它们当前多付的 offset 附加位（上界）。不改输出字节。
+[[example]]
+name = "repcode_potential"
+required-features = ["encstats"]

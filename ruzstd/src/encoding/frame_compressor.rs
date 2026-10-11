@@ -70,6 +70,9 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     pub(crate) fse_tables: FseTables,
+    /// rep 历史观察器（仅 `encstats` 诊断特性；不参与编码决策）。
+    #[cfg(feature = "encstats")]
+    pub(crate) rep_history: crate::encstats::RepHistory,
 }
 
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
@@ -83,6 +86,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                #[cfg(feature = "encstats")]
+                rep_history: crate::encstats::RepHistory::new(),
             },
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
@@ -100,6 +105,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                #[cfg(feature = "encstats")]
+                rep_history: crate::encstats::RepHistory::new(),
             },
             compression_level,
             #[cfg(feature = "hash")]
@@ -132,6 +139,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
         self.state.last_huff_table = None;
+        #[cfg(feature = "encstats")]
+        self.state.rep_history.reset();
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
