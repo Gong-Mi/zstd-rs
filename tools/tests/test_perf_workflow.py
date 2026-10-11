@@ -33,7 +33,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('gap_vs_c', scripts)
         self.assertNotIn('get(\'leg\',\'stream\')', scripts)
         self.assertNotIn('100% 落在', scripts)
-        self.assertEqual(scripts.count('cargo build --locked --release'), 3)
+        self.assertEqual(scripts.count('cargo build --locked --release'), 4)
+        self.assertIn('--basex-bin "$GITHUB_WORKSPACE/bins/basex"', scripts)
+        self.assertIn('basex/tools/perf/harness', scripts)
+        self.assertTrue(any(s.get('with') == {'ref': '${{ steps.refs.outputs.base }}', 'path': 'basex'}
+                            for s in steps))
         self.assertIn('cp -R tooling/tools/perf/harness/.', scripts)
         self.assertIn('--repo-dir "$GITHUB_WORKSPACE/head"', scripts)
         self.assertIn('--output-dir "$GITHUB_WORKSPACE/perf-results"', scripts)

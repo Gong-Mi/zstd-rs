@@ -13,3 +13,7 @@ ruzstd/fuzz/corpus
 base.jsonl
 head.jsonl
 run.log
+
+# Python 工具/测试运行产物
+__pycache__/
+*.pyc

@@ -512,8 +512,7 @@ class PerfContractRegression(unittest.TestCase):
             self.assertFalse(report["accepted"])
 
     def test_direction_conflict_and_single_metric_gain_are_unresolved(self):
-        for wall, cpu in ((8.0, 9.6), (12.0, 6.4), (8.0, 8.0), (10.0, 6.4),
-                          (9.95, 8.04)):
+        for wall, cpu in ((8.0, 9.6), (12.0, 6.4), (8.0, 8.0), (10.0, 6.4)):
             with self.subTest(wall=wall, cpu=cpu):
                 manifest, sides = fixture()
                 for row in sides["head"]:
@@ -522,6 +521,49 @@ class PerfContractRegression(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(report["performance_status"], "NOT_ACCEPTED")
                 self.assertEqual({case["performance_status"] for case in report["cases"]}, {"UNRESOLVED"})
+
+    def test_opposite_micro_within_thresholds_is_noise_no_change(self):
+        # 异号微值但两侧都在各自阈值内 → 与噪声不可分辨，记 NO_CHANGE（非未决）；
+        # 不产生 GAIN，性能判定 NO_GAIN，显式门 exit 2。
+        manifest, sides = fixture()
+        for row in sides["head"]:
+            set_time(row, wall=9.95, cpu=8.04)
+        result, report, _ = self.invoke(manifest, sides)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual({case["performance_status"] for case in report["cases"]}, {"NO_CHANGE"})
+        self.assertEqual(report["performance_status"], "NO_GAIN")
+        result, report, _ = self.invoke(manifest, sides, flags=("--fail-on-regression",))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(report["performance_status"], "NO_GAIN")
+
+    def test_basex_cross_build_noise_joins_threshold_and_source_is_pinned(self):
+        manifest, sides = fixture()
+        base = manifest["builds"]["base"]
+        manifest["builds"]["basex"] = {"source_sha": base["source_sha"], "binary_sha256": "8" * 64}
+        sides["basex"] = []
+        for row in sides["base"]:
+            clone = copy.deepcopy(row)
+            clone.update(side="basex", **manifest["builds"]["basex"])
+            sides["basex"].append(clone)
+        for row in sides["basex"]:
+            set_time(row, wall=11.0, cpu=8.8)  # +10% vs base ⇒ 跨构建本底 10%
+        for row in sides["head"]:
+            set_time(row, wall=9.5, cpu=7.6)   # −5%：原阈值 1.0 下是 GAIN，折入 xb 后为 NC
+        result, report, _ = self.invoke(manifest, sides)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("basex", report["sides"])
+        first = report["cases"][0]
+        self.assertEqual(first["paired"]["wall"]["xb_noise_pct"], 10.0)
+        self.assertEqual(first["paired"]["wall"]["threshold_pct"], 10.0)
+        self.assertEqual(first["paired"]["cpu"]["threshold_pct"], 10.0)
+        self.assertEqual(first["performance_status"], "NO_CHANGE")
+        # basex 源必须与 base 完全一致（只允许独立构建，不允许换源）
+        manifest2, sides2 = fixture()
+        manifest2["builds"]["basex"] = {"source_sha": "9" * 40, "binary_sha256": "8" * 64}
+        sides2["basex"] = copy.deepcopy(sides2["base"])
+        for row in sides2["basex"]:
+            row.update(side="basex", **manifest2["builds"]["basex"])
+        self.assert_incomplete(manifest2, sides2)
 
     def test_no_gain_is_not_accepted_by_explicit_gate(self):
         result, report, summary = self.invoke(*fixture(), flags=("--fail-on-regression",))

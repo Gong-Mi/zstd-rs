@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 
-from execution_contract import PROTOCOL, schedule
+from execution_contract import PROTOCOL, PROTOCOL_XB, SIDES, SIDES_XB, schedule
 
 
 def sha256(path):
@@ -78,19 +78,25 @@ def execute(binary, command, env, log, timeout, output=None):
     return None
 
 
-def suite(args, directory, base_bin, head_bin, base_source, head_source, rounds):
+def suite(args, directory, base_bin, head_bin, base_source, head_source, rounds, basex_bin=None):
     directory.mkdir(parents=True, exist_ok=False)
     builds = {
         "base": {"source_sha": base_source, "binary_sha256": sha256(base_bin)},
         "head": {"source_sha": head_source, "binary_sha256": sha256(head_bin)},
     }
     builds["base2"] = dict(builds["base"])
+    if basex_bin is not None:
+        # 跨构建控制腿：同一 base 源在独立路径的第二次构建（binary 预期不同；
+        # 若铸造环境使两者相同，该腿退化为第二条 A/A，仅使噪声地板更保守）。
+        builds["basex"] = {"source_sha": base_source, "binary_sha256": sha256(basex_bin)}
     bins = {"base": base_bin, "head": head_bin, "base2": base_bin}
+    if basex_bin is not None:
+        bins["basex"] = basex_bin
     common = argv(args)
     env = os.environ.copy()
     harness_sha, lock_sha = harness_identity(args.harness_dir)
     identities = {}
-    for side in ("base", "head"):
+    for side in ("base", "head", "basex") if basex_bin is not None else ("base", "head"):
         identity = json.loads(execute(bins[side], ["--identity"], env,
                                       directory / "run.log", args.timeout))
         if identity.get("source_sha") != builds[side]["source_sha"]:
@@ -108,15 +114,21 @@ def suite(args, directory, base_bin, head_bin, base_source, head_source, rounds)
                                    directory / "run.log", args.timeout))
     if base_plan != plan:
         raise ValueError("base/head input or parameter plan mismatch before measurement")
+    if basex_bin is not None:
+        basex_plan = json.loads(execute(basex_bin, [*common, "--plan"], env,
+                                        directory / "run.log", args.timeout))
+        if basex_plan != plan:
+            raise ValueError("basex/head input or parameter plan mismatch before measurement")
     affinity = sorted(os.sched_getaffinity(0))
     if len(affinity) != 1:
         raise ValueError("measurement requires singleton CPU affinity")
-    declared_schedule = schedule(rounds)
+    protocol = PROTOCOL_XB if basex_bin is not None else PROTOCOL
+    declared_schedule = schedule(rounds, SIDES_XB if basex_bin is not None else SIDES)
     manifest = {
         "schema": 1, "rounds": rounds, "runner": runner_fingerprint(),
         "harness_sha256": harness_sha, "lock_sha256": lock_sha,
         "builds": builds, "cases": plan["cases"],
-        "execution": {"protocol": PROTOCOL, "affinity": affinity,
+        "execution": {"protocol": protocol, "affinity": affinity,
                       "schedule": declared_schedule},
         "attachments": {
             "config": {"status": "NOT_RUN", "reason": "not requested"},
@@ -179,6 +191,8 @@ def main():
     parser.add_argument("--encode-mb", type=positive, default=1)
     parser.add_argument("--timeout", type=positive, default=90)
     parser.add_argument("--corpus-file", action="append", default=[])
+    parser.add_argument("--basex-bin", type=Path,
+                        help="independent second build of the BASE source (cross-build control leg)")
     parser.add_argument("--tuned-bin", type=Path)
     parser.add_argument("--config-failed", default="")
     args = parser.parse_args()
@@ -203,8 +217,11 @@ def main():
     if cpu not in allowed:
         parser.error("requested CPU is outside current affinity")
     os.sched_setaffinity(0, {cpu})
+    basex_bin = None
+    if args.basex_bin is not None:
+        basex_bin = args.basex_bin.resolve(strict=True)
     manifest = suite(args, args.output_dir, args.base_bin, args.head_bin,
-                     args.base_source, args.head_source, args.rounds)
+                     args.base_source, args.head_source, args.rounds, basex_bin=basex_bin)
     if args.tuned_bin:
         try:
             suite(args, args.output_dir / "config", args.head_bin,

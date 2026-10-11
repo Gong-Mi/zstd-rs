@@ -18,6 +18,19 @@ def declare_execution(manifest):
     return ledger
 
 
+def declare_execution_xb(manifest):
+    order = [('base', 'head', 'base2', 'basex'), ('head', 'base2', 'basex', 'base'),
+             ('base2', 'basex', 'base', 'head'), ('basex', 'base', 'head', 'base2')]
+    schedule, ledger = [], []
+    for number in range(1, manifest['rounds'] + 1):
+        for side in order[(number - 1) % len(order)]:
+            item = {'ordinal': len(schedule) + 1, 'round': number, 'side': side}
+            schedule.append(item)
+            ledger.append(dict(item, affinity=[0], **manifest['builds'][side]))
+    manifest['execution'] = {'protocol': 'rotating-aba-xb-v1', 'affinity': [0], 'schedule': schedule}
+    return ledger
+
+
 def execution_fixture():
     manifest, sides = fixtures.fixture(rounds=3)
     return manifest, sides, declare_execution(manifest)
@@ -41,6 +54,31 @@ class T0ExecutionTests(unittest.TestCase):
         self.assertEqual(report['data_status'], 'COMPLETE')
         self.assertFalse(report['accepted'])
         self.assertEqual(report['provenance']['execution']['affinity'], [0])
+
+    def test_basex_protocol_requires_four_side_ledger(self):
+        def with_basex(rounds=2):
+            manifest, sides = fixtures.fixture(rounds=rounds)
+            base = manifest['builds']['base']
+            manifest['builds']['basex'] = {'source_sha': base['source_sha'], 'binary_sha256': '8' * 64}
+            sides['basex'] = []
+            for row in sides['base']:
+                clone = copy.deepcopy(row)
+                clone.update(side='basex', **manifest['builds']['basex'])
+                sides['basex'].append(clone)
+            return manifest, sides
+        manifest, sides = with_basex()
+        rows = declare_execution_xb(manifest)
+        result, report, _ = self.invoke(manifest, sides, raw=raw_ledger(rows),
+                                        flags=('--require-execution',))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(report['data_status'], 'COMPLETE')
+        self.assertEqual(report['provenance']['execution']['protocol'], 'rotating-aba-xb-v1')
+        # 四侧 ledger 不得降级成 3 侧协议
+        manifest2, sides2 = with_basex()
+        rows2 = declare_execution_xb(manifest2)
+        manifest2['execution']['protocol'] = 'rotating-aba-v1'
+        self.assert_incomplete(manifest2, sides2, raw=raw_ledger(rows2),
+                               flags=('--require-execution',))
 
     def test_required_completion_ledger_cannot_be_missing_or_empty(self):
         for raw in (None, raw_ledger([])):
