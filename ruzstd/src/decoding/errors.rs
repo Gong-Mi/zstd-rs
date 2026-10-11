@@ -472,17 +472,28 @@ impl From<HuffmanTableError> for DictionaryDecodeError {
 pub enum FrameDecoderError {
     ReadFrameHeaderError(ReadFrameHeaderError),
     FrameHeaderError(FrameHeaderError),
-    WindowSizeTooBig { requested: u64, max: u64 },
+    WindowSizeTooBig {
+        requested: u64,
+        max: u64,
+    },
     DictionaryDecodeError(DictionaryDecodeError),
     FailedToReadBlockHeader(BlockHeaderReadError),
     FailedToReadBlockBody(DecodeBlockContentError),
     FailedToReadChecksum(Error),
+    /// 帧内容校验和与计算值不一致（对齐 C 的 `ZSTD_error_checksum_wrong`）。
+    /// 仅在启用 `hash` 特性（可计算 XXH64）且解码输出已全部交付时触发。
+    ChecksumMismatch {
+        read: u32,
+        calculated: u32,
+    },
     NotYetInitialized,
     FailedToInitialize(FrameHeaderError),
     FailedToDrainDecodebuffer(Error),
     FailedToSkipFrame,
     TargetTooSmall,
-    DictNotProvided { dict_id: u32 },
+    DictNotProvided {
+        dict_id: u32,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -528,6 +539,12 @@ impl core::fmt::Display for FrameDecoderError {
             }
             FrameDecoderError::FailedToReadChecksum(e) => {
                 write!(f, "Failed to read checksum: {e}")
+            }
+            FrameDecoderError::ChecksumMismatch { read, calculated } => {
+                write!(
+                    f,
+                    "Frame content checksum mismatch: read 0x{read:08X}, calculated 0x{calculated:08X}"
+                )
             }
             FrameDecoderError::NotYetInitialized => {
                 write!(f, "Decoder must initialized or reset before using it",)
