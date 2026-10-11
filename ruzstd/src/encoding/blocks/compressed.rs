@@ -109,6 +109,10 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
 enum FseTableMode<'a> {
     Predefined(&'a FSETable),
     Encoded(FSETable),
+    /// 格式 mode 3（repeat previous table）预留：编码侧目前不构造该模式，
+    /// 但 as_ref/encode_table/mode_to_bits 已按格式语义接线。`-D warnings`
+    /// （nightly clippy）下需显式允许，避免整条 lint 门被死代码拦住。
+    #[allow(dead_code)]
     RepeateLast(&'a FSETable),
 }
 

@@ -335,7 +335,7 @@ impl HuffmanTable {
             encoder.write_table();
         }
         let bits = writer.index();
-        let _ = writer.flush();
+        writer.flush();
         bits.div_ceil(8)
     }
 }
