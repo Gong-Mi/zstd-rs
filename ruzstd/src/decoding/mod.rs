@@ -14,6 +14,9 @@ pub(crate) mod block_decoder;
 pub(crate) mod decode_buffer;
 pub(crate) mod dictionary;
 pub(crate) mod frame;
+mod frame_header_info;
+
+pub use frame_header_info::{read_frame_header_info, FrameHeaderInfo};
 pub(crate) mod literals_section_decoder;
 mod ringbuffer;
 #[allow(dead_code)]

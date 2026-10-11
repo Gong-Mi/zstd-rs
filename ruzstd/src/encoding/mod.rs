@@ -40,6 +40,48 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
     vec
 }
 
+/// Convenience function to compress a source whose total size is known up front into a target.
+///
+/// This is the equivalent of the C reference encoder's one-shot `ZSTD_compress`/`ZSTD_compress2`,
+/// which knows `srcSize`: the frame header carries the `Frame_Content_Size` field and the frame is
+/// single-segment whenever the window can hold the whole content.
+/// ```rust
+/// use ruzstd::encoding::{compress_sized, CompressionLevel};
+/// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
+/// let mut target = Vec::new();
+/// compress_sized(data, data.len() as u64, &mut target, CompressionLevel::Fastest);
+/// ```
+pub fn compress_sized<R: Read, W: Write>(
+    source: R,
+    pledged_source_size: u64,
+    target: W,
+    level: CompressionLevel,
+) {
+    let mut frame_enc = FrameCompressor::new(level);
+    frame_enc.set_pledged_source_size(Some(pledged_source_size));
+    frame_enc.set_source(source);
+    frame_enc.set_drain(target);
+    frame_enc.compress();
+}
+
+/// Convenience function to compress a source whose total size is known up front into a Vec.
+///
+/// See [`compress_sized`].
+/// ```rust
+/// use ruzstd::encoding::{compress_to_vec_sized, CompressionLevel};
+/// let data: &[u8] = &[0,0,0,0,0,0,0,0,0,0,0,0];
+/// let compressed = compress_to_vec_sized(data, data.len() as u64, CompressionLevel::Fastest);
+/// ```
+pub fn compress_to_vec_sized<R: Read>(
+    source: R,
+    pledged_source_size: u64,
+    level: CompressionLevel,
+) -> Vec<u8> {
+    let mut vec = Vec::new();
+    compress_sized(source, pledged_source_size, &mut vec, level);
+    vec
+}
+
 /// The compression mode used impacts the speed of compression,
 /// and resulting compression ratios. Faster compression will result
 /// in worse compression ratios, and vice versa.

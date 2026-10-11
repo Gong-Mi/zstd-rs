@@ -47,3 +47,9 @@ harness = false
 [[example]]
 name = "enccounts"
 required-features = ["encstats"]
+
+# 已知源大小时的一趟压缩（对齐 C 一次性 ZSTD_compress 的 pledgedSrcSize 语义）。
+# 同时输出 pledged/unpledged 两种帧，供与 C 的帧头对照与互操作取证使用。
+[[example]]
+name = "content_size"
+required-features = ["std"]
