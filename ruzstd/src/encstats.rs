@@ -149,6 +149,21 @@ impl RepHistory {
     }
 }
 
+/// 诊断用：窗口条目走查顺序开关（0 = 现行：最老条目先走；1 = 最新条目先走）。
+///
+/// 现行代码 `self.window.iter()` 从最老条目开始，`candidate` 的首次接受者因此来自最老
+/// 条目；再按"更长即替换"逐条目更新。窗口一大，远端更长匹配更容易顶掉近端匹配
+/// （offset 附加位变多、局部性变差），与"窗口变大反而更差"的实测一致。本开关量这个顺序。
+pub static WINDOW_ORDER: core::sync::atomic::AtomicU8 = const { core::sync::atomic::AtomicU8::new(0) };
+
+pub fn set_window_order_newest_first(newest_first: bool) {
+    WINDOW_ORDER.store(newest_first as u8, Ordering::Relaxed);
+}
+
+pub fn window_order_newest_first() -> bool {
+    WINDOW_ORDER.load(Ordering::Relaxed) != 0
+}
+
 /// 读走并清零。
 pub fn take() -> [u64; N] {
     let mut out = [0u64; N];

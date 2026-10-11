@@ -63,3 +63,8 @@ required-features = ["encstats"]
 [[example]]
 name = "cand_rule_sweep"
 required-features = ["encstats"]
+
+# 窗口条目走查顺序 × 入围规则 × 窗口大小 的压缩率扫描（诊断）。
+[[example]]
+name = "window_order_sweep"
+required-features = ["encstats"]

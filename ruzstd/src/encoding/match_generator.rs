@@ -335,9 +335,20 @@ impl MatchGenerator {
             // （原先 `get` 与 `insert` 各算一遍，每遍 5 次 64 位乘法 + 一次动态取模）。
             let key_raw = SuffixStore::key_raw(&data_slice[..MIN_MATCH_LEN]);
 
-            // Look in each window entry
+            // Look in each window entry（诊断特性下可切换走查顺序：默认最老先走）
             let mut candidate = None;
-            for (match_entry_idx, match_entry) in self.window.iter().enumerate() {
+            #[cfg(feature = "encstats")]
+            let newest_first = crate::encstats::window_order_newest_first();
+            #[cfg(not(feature = "encstats"))]
+            let newest_first = false;
+            let entry_count = self.window.len();
+            for step in 0..entry_count {
+                let match_entry_idx = if newest_first {
+                    entry_count - 1 - step
+                } else {
+                    step
+                };
+                let match_entry = &self.window[match_entry_idx];
                 // 有界链走查（与比较融合，不预取整条链）：
                 //  - 内容比较是成本主项 ⇒ 预算 CHAIN_CMP_MAX 次；
                 //  - "太近"候选（切片 < MIN_MATCH_LEN，步进加速下常见）不消耗比较预算，
