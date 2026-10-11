@@ -45,6 +45,7 @@ impl RingBuffer {
     }
 
     /// Return the amount of available space (in bytes) of the buffer.
+    #[inline]
     pub fn free(&self) -> usize {
         let (x, y) = self.free_slice_lengths();
 
@@ -61,6 +62,7 @@ impl RingBuffer {
     }
 
     /// Ensure that there's space for `amount` elements in the buffer.
+    #[inline]
     pub fn reserve(&mut self, amount: usize) {
         let free = self.free();
         if free >= amount {
@@ -291,6 +293,7 @@ impl RingBuffer {
     /// 1. start + len <= self.len() so we do not copy uninitialised memory
     /// 2. More then len reserved space so we do not write out-of-bounds
     #[warn(unsafe_op_in_unsafe_fn)]
+    #[inline]
     pub unsafe fn extend_from_within_unchecked(&mut self, start: usize, len: usize) {
         debug_assert!(start + len <= self.len());
         debug_assert!(self.free() >= len);

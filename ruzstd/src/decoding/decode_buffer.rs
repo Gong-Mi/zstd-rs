@@ -308,6 +308,7 @@ impl DecodeBuffer {
         self.total_output_counter += data.len() as u64;
     }
 
+    #[inline]
     pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
         if self.direct.is_some() {
             return self.direct_repeat(offset, match_length);

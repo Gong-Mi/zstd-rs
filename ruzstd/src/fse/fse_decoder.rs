@@ -23,12 +23,14 @@ impl<'t> FSEDecoder<'t> {
     }
 
     /// Returns the byte associated with the symbol the internal cursor is pointing at.
+    #[inline]
     pub fn decode_symbol(&self) -> u8 {
         self.state.symbol
     }
 
     /// Initialize internal state and prepare for decoding. After this, `decode_symbol` can be called
     /// to read the first symbol and `update_state` can be called to prepare to read the next symbol.
+    #[inline]
     pub fn init_state(&mut self, bits: &mut BitReaderReversed<'_>) -> Result<(), FSEDecoderError> {
         if self.table.accuracy_log == 0 {
             return Err(FSEDecoderError::TableIsUninitialized);
@@ -40,6 +42,7 @@ impl<'t> FSEDecoder<'t> {
     }
 
     /// Advance the internal state to decode the next symbol in the bitstream.
+    #[inline]
     pub fn update_state(&mut self, bits: &mut BitReaderReversed<'_>) {
         let num_bits = self.state.num_bits;
         let add = bits.get_bits(num_bits);
