@@ -191,7 +191,11 @@ fn choose_table<'a>(
                 max_symbol = idx;
             }
         }
-        FseTableMode::Encoded(build_table_from_counts(&counts[..=max_symbol], max_log, false))
+        FseTableMode::Encoded(build_table_from_counts(
+            &counts[..=max_symbol],
+            max_log,
+            false,
+        ))
     }
 }
 
