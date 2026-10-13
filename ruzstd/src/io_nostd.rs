@@ -10,6 +10,7 @@ pub enum ErrorKind {
     WouldBlock,
     Other,
     WriteAllEof,
+    InvalidData,
 }
 
 impl ErrorKind {
@@ -21,6 +22,7 @@ impl ErrorKind {
             WouldBlock => "operation would block",
             Other => "other error",
             WriteAllEof => "write_all hit EOF",
+            InvalidData => "invalid data",
         }
     }
 }
