@@ -55,7 +55,7 @@ impl FrameHeader {
         }
 
         if let Some(frame_content_size) = self.frame_content_size {
-            output.extend(fcs_bytes(frame_content_size, self.single_segment));
+            output.extend(minify_val_fcs(frame_content_size));
         }
     }
 
@@ -71,6 +71,7 @@ impl FrameHeader {
         // `Frame_Content_Size_flag`:
         // The Frame_Content_Size_flag specifies if
         // the Frame_Content_Size field is provided within the header.
+        // TODO: The Frame_Content_Size field isn't set at all, we should prefer to include it always.
         // If the `Single_Segment_flag` is set and this value is zero,
         // the size of the FCS field is 1 byte.
         // Otherwise, the FCS field is omitted.
@@ -79,8 +80,6 @@ impl FrameHeader {
         // | 1     | 2
         // | 2     | 4
         // | 3     | 8
-        // 字段长度与 flag 的对应关系完全按 C 的 `fcsCode` 语义取（见 [`fcs_field_size`]）：
-        // 65592..=65791 走 2 字节（-256 偏移），>= 0xFFFFFFFF 走 8 字节。
 
         // `Dictionary_ID_flag`:
         if let Some(id) = self.dictionary_id {
@@ -128,11 +127,13 @@ impl FrameHeader {
         }
 
         if let Some(frame_content_size) = self.frame_content_size {
-            let flag_value: u8 = match fcs_field_size(frame_content_size, self.single_segment) {
-                1 | 0 => 0,
+            let field_size = find_min_size(frame_content_size);
+            let flag_value: u8 = match field_size {
+                1 => 0,
                 2 => 1,
                 4 => 2,
-                _ => 3,
+                3 => 8,
+                _ => panic!(),
             };
 
             bw.write_bits(flag_value, 2);
@@ -145,46 +146,13 @@ impl FrameHeader {
     }
 }
 
-/// The size in bytes of the `Frame_Content_Size` field, following the C reference encoder's
-/// `fcsCode` computation.
-///
-/// C (`ZSTD_writeFrameHeader` in `lib/compress/zstd_compress.c`):
-/// ```text
-/// fcsCode = (pledgedSrcSize>=256) + (pledgedSrcSize>=65536+256) + (pledgedSrcSize>=0xFFFFFFFF)
-/// ```
-/// which selects 1, 2, 4 or 8 field bytes. `fcsCode == 0` means the field is omitted (0 bytes)
-/// in a multi-segment frame, and is a single byte in a single-segment frame.
-///
-/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size>
-fn fcs_field_size(frame_content_size: u64, single_segment: bool) -> usize {
-    let fcs_code = u32::from(frame_content_size >= 256)
-        + u32::from(frame_content_size >= 65536 + 256)
-        + u32::from(frame_content_size >= 0xFFFF_FFFF);
-
-    match fcs_code {
-        0 if single_segment => 1,
-        0 => 0,
-        1 => 2,
-        2 => 4,
-        _ => 8,
-    }
-}
-
-/// Serialize the `Frame_Content_Size` field exactly like the C reference encoder.
-///
 /// Identical to [`minify_val`], but it implements the following edge case:
 ///
 /// > When FCS_Field_Size is 1, 4 or 8 bytes, the value is read directly. When FCS_Field_Size is 2, the offset of 256 is added.
 ///
-/// A field size of 0 (multi-segment frame with a content size below 256) emits no bytes.
-///
-/// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size>
-fn fcs_bytes(val: u64, single_segment: bool) -> Vec<u8> {
-    let new_size = fcs_field_size(val, single_segment);
-    if new_size == 0 {
-        return Vec::new();
-    }
-
+/// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size
+fn minify_val_fcs(val: u64) -> Vec<u8> {
+    let new_size = find_min_size(val);
     let mut val = val;
     if new_size == 2 {
         val -= 256;

@@ -39,14 +39,6 @@ pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
     compression_level: CompressionLevel,
-    /// Total size of the source data, if the caller knows it up front.
-    ///
-    /// Mirrors the C reference encoder's `pledgedSrcSize`
-    /// (`ZSTD_CCtx_setPledgedSrcSize` / the `srcSize` of `ZSTD_compress2`): when set, the frame
-    /// header carries the `Frame_Content_Size` field (C's default `contentSizeFlag` behaviour)
-    /// and the frame is written as a single-segment frame if the window can hold the whole
-    /// content.
-    pledged_source_size: Option<u64>,
     state: CompressState<M>,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
@@ -87,7 +79,6 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             uncompressed_data: None,
             compressed_data: None,
             compression_level,
-            pledged_source_size: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
@@ -111,7 +102,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 fse_tables: FseTables::new(),
             },
             compression_level,
-            pledged_source_size: None,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
@@ -129,24 +119,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// As the compressor compresses data, the drain serves as a place for the output to be writte.
     pub fn set_drain(&mut self, compressed_data: W) -> Option<W> {
         self.compressed_data.replace(compressed_data)
-    }
-
-    /// Pledge the total size (in bytes) of the data that will be read from the source.
-    ///
-    /// This mirrors the C reference encoder's `pledgedSrcSize`
-    /// (`ZSTD_CCtx_setPledgedSrcSize`, or the `srcSize` argument of the one-shot `ZSTD_compress`).
-    /// The source is still read until it reports EOF; the pledged size is only used to describe
-    /// the frame:
-    ///
-    /// - the `Frame_Content_Size` field is written into the frame header (C's default
-    ///   `contentSizeFlag` behaviour), and
-    /// - the frame is flagged as single-segment when the matcher's window can hold the whole
-    ///   content, which also drops the `Window_Descriptor` from the header.
-    ///
-    /// Without a pledge the frame carries no `Frame_Content_Size`, exactly as before.
-    /// Pass `None` to clear a previous pledge.
-    pub fn set_pledged_source_size(&mut self, size: Option<u64>) -> Option<u64> {
-        core::mem::replace(&mut self.pledged_source_size, size)
     }
 
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to the provided drain
@@ -169,21 +141,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // As the frame is compressed, it's stored here
         let output: &mut Vec<u8> = &mut Vec::with_capacity(1024 * 130);
         // First write the frame header
-        // C 的 `ZSTD_writeFrameHeader`：singleSegment = contentSizeFlag && windowSize >= pledgedSrcSize，
-        // 且 singleSegment 时窗口描述符不写、FCS 必写；未 pledge 时保持旧行为（无 FCS、多段）。
-        let window_size = self.state.matcher.window_size();
-        let pledged_source_size = self.pledged_source_size;
-        let single_segment = pledged_source_size.is_some_and(|size| window_size >= size);
         let header = FrameHeader {
-            frame_content_size: pledged_source_size,
-            single_segment,
+            frame_content_size: None,
+            single_segment: false,
             content_checksum: cfg!(feature = "hash"),
             dictionary_id: None,
-            window_size: if single_segment {
-                None
-            } else {
-                Some(window_size)
-            },
+            window_size: Some(self.state.matcher.window_size()),
         };
         header.serialize(output);
         // Now compress block by block
