@@ -754,6 +754,146 @@ fn verbose_disabled() {
     assert_eq!(VERBOSE, false);
 }
 
+/// B10：帧头 `Frame_Content_Size` 必须按 C `ZSTD_writeFrameHeader` 的 `fcsCode` 语义写出。
+///
+/// C（lib/compress/zstd_compress.c）：
+/// `fcsCode = (n>=256) + (n>=65536+256) + (n>=0xFFFFFFFF)`，字段长度 1/2/4/8 字节；
+/// `code 0` 在非 single_segment 帧里表示字段省略（0 字节）；
+/// `code 1` 写入的值带 -256 偏移；`code 2` 写 4 字节；`code 3` 写 8 字节。
+#[test]
+fn fcs_field_size_follows_c_fcs_code() {
+    use crate::encoding::frame_header::FrameHeader;
+    use alloc::vec::Vec;
+
+    fn header_bytes(fcs: u64, single_segment: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        FrameHeader {
+            frame_content_size: Some(fcs),
+            single_segment,
+            content_checksum: false,
+            dictionary_id: None,
+            window_size: if single_segment {
+                None
+            } else {
+                Some(1024 * 128)
+            },
+        }
+        .serialize(&mut out);
+        out
+    }
+
+    // 4 字节 magic + 1 字节 descriptor + [1 字节 window descriptor] + FCS 字段
+    // 1 字节：single_segment 且 n < 256 → fcs flag = 0
+    let h = header_bytes(7, true);
+    assert_eq!(h.len(), 4 + 1 + 1);
+    assert_eq!(h[4], 0b0010_0000, "single_segment=1 且 fcs flag=0");
+    assert_eq!(h[5], 7);
+
+    // 2 字节：n ∈ [256, 65536+256-1] → fcs flag = 1，写入值 = n - 256
+    let h = header_bytes(65_791, false);
+    assert_eq!(h[4] & 0b1100_0000, 0b0100_0000, "fcs flag 应为 1（2 字节）");
+    assert_eq!(&h[6..8], &[0xff, 0xff], "65791 - 256 = 65535");
+
+    // 4 字节：n ∈ [65792, 0xFFFFFFFF-1] → fcs flag = 2
+    let h = header_bytes(0xFFFF_FFFE, false);
+    assert_eq!(h[4] & 0b1100_0000, 0b1000_0000, "fcs flag 应为 2（4 字节）");
+    assert_eq!(&h[6..10], &0xFFFF_FFFEu32.to_le_bytes());
+
+    // 8 字节：n >= 0xFFFFFFFF（C 用 >=，边界值本身走 8 字节）→ fcs flag = 3
+    let h = header_bytes(0xFFFF_FFFF, false);
+    assert_eq!(h[4] & 0b1100_0000, 0b1100_0000, "fcs flag 应为 3（8 字节）");
+    assert_eq!(&h[6..14], &0xFFFF_FFFFu64.to_le_bytes());
+
+    // 非 single_segment 且 n < 256 → 字段省略（0 字节），flag = 0
+    let h = header_bytes(200, false);
+    assert_eq!(h.len(), 4 + 1 + 1, "非 single_segment 的 n<256 帧不写 FCS");
+    assert_eq!(h[4] & 0b1100_0000, 0);
+}
+
+/// B10：pledge 源大小后帧头写出 `Frame_Content_Size`，并按 C 的 `singleSegment` 判据描述帧；
+/// 未 pledge 时帧头保持旧行为（无 FCS）。两种输出都必须解回原文。
+#[cfg(feature = "std")]
+#[test]
+fn pledged_source_size_writes_content_size_field() {
+    use crate::decoding::{frame::read_frame_header, StreamingDecoder};
+    use crate::encoding::{compress_to_vec, compress_to_vec_sized, CompressionLevel};
+    use alloc::vec::Vec;
+
+    fn decode(frame: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut decoder = StreamingDecoder::new(frame).unwrap();
+        std::io::Read::read_to_end(&mut decoder, &mut out).unwrap();
+        out
+    }
+
+    // 4 KiB < matcher 窗口（128 KiB）→ C 判 single_segment；FCS 2 字节（>= 256），无窗口描述符
+    let small: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+    let frame = compress_to_vec_sized(
+        small.as_slice(),
+        small.len() as u64,
+        CompressionLevel::Fastest,
+    );
+    let (header, header_len) = read_frame_header(frame.as_slice()).unwrap();
+    assert_eq!(header.frame_content_size(), 4096);
+    assert!(header.descriptor.single_segment_flag());
+    assert_eq!(
+        header_len, 7,
+        "4 magic + 1 descriptor + 2 FCS 字节（无窗口描述符）"
+    );
+    assert_eq!(decode(&frame), small);
+
+    // 200 000 > 128 KiB 窗口 → 多段帧，但 C 仍写 FCS（>= 256）；4 字节字段 + 窗口描述符
+    let big: Vec<u8> = (0u8..=255).cycle().take(200_000).collect();
+    let frame = compress_to_vec_sized(big.as_slice(), big.len() as u64, CompressionLevel::Fastest);
+    let (header, header_len) = read_frame_header(frame.as_slice()).unwrap();
+    assert_eq!(header.frame_content_size(), 200_000);
+    assert!(!header.descriptor.single_segment_flag());
+    assert_eq!(
+        header_len, 10,
+        "4 magic + 1 descriptor + 1 窗口描述符 + 4 FCS 字节"
+    );
+    assert_eq!(decode(&frame), big);
+
+    // 未 pledge：帧头不写 FCS（旧行为保持）
+    let frame = compress_to_vec(small.as_slice(), CompressionLevel::Fastest);
+    let (header, header_len) = read_frame_header(frame.as_slice()).unwrap();
+    assert_eq!(header.frame_content_size(), 0, "无 FCS 时解码器回 0");
+    assert_eq!(header_len, 6);
+    assert_eq!(decode(&frame), small);
+}
+
+/// 公开帧头检视接口（对齐 C 的 `ZSTD_getFrameHeader`）必须如实区分“有 FCS / 无 FCS”，
+/// 并给出一致的窗口需求。
+#[cfg(feature = "std")]
+#[test]
+fn frame_header_info_reports_content_size() {
+    use crate::decoding::read_frame_header_info;
+    use crate::encoding::{compress_to_vec, compress_to_vec_sized, CompressionLevel};
+
+    let data: Vec<u8> = (0u8..=255).cycle().take(3000).collect();
+
+    let pledged = compress_to_vec_sized(
+        data.as_slice(),
+        data.len() as u64,
+        CompressionLevel::Fastest,
+    );
+    let info = read_frame_header_info(pledged.as_slice()).unwrap();
+    assert_eq!(info.frame_content_size, Some(3000));
+    assert!(info.single_segment);
+    assert_eq!(
+        info.window_size,
+        Some(3000),
+        "single_segment 帧的窗口需求等于内容大小"
+    );
+    assert_eq!(info.header_size, 7, "4 magic + 1 descriptor + 2 FCS 字节");
+
+    let unpledged = compress_to_vec(data.as_slice(), CompressionLevel::Fastest);
+    let info = read_frame_header_info(unpledged.as_slice()).unwrap();
+    assert_eq!(info.frame_content_size, None, "无 FCS 字段时对外是 None");
+    assert!(!info.single_segment);
+    assert_eq!(info.window_size, Some(1024 * 128));
+}
+
 /// 校验和强制验证（对齐 C 默认 `ZSTD_d_validateChecksum`）：
 /// 坏校验和必须被拒绝；本测试在未实现强制的基线上为 RED。
 #[cfg(feature = "hash")]
