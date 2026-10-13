@@ -893,3 +893,82 @@ fn frame_header_info_reports_content_size() {
     assert!(!info.single_segment);
     assert_eq!(info.window_size, Some(1024 * 128));
 }
+
+/// 校验和强制验证（对齐 C 默认 `ZSTD_d_validateChecksum`）：
+/// 坏校验和必须被拒绝；本测试在未实现强制的基线上为 RED。
+#[cfg(feature = "hash")]
+#[test]
+fn corrupted_frame_checksum_is_rejected() {
+    use crate::decoding::errors::FrameDecoderError;
+    use crate::decoding::FrameDecoder;
+
+    let unit = b"the quick brown fox jumps over the lazy dog; ";
+    let data: alloc::vec::Vec<u8> = unit
+        .iter()
+        .copied()
+        .cycle()
+        .take(unit.len() * 512)
+        .collect();
+    let frame = crate::encoding::compress_to_vec(
+        data.as_slice(),
+        crate::encoding::CompressionLevel::Fastest,
+    );
+
+    // 完好帧正常解码（sanity）
+    let mut out = alloc::vec![0u8; data.len()];
+    FrameDecoder::new()
+        .decode_all(&frame, &mut out)
+        .expect("valid frame must decode");
+    assert_eq!(out, data);
+
+    // 翻转校验和末字节 → 必须报 ChecksumMismatch
+    let mut bad = frame.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 0xFF;
+    let mut out2 = alloc::vec![0u8; data.len()];
+    match FrameDecoder::new().decode_all(&bad, &mut out2) {
+        Err(FrameDecoderError::ChecksumMismatch { read, calculated }) => {
+            assert_ne!(read, calculated);
+        }
+        other => panic!("expected ChecksumMismatch, got {:?}", other),
+    }
+}
+
+/// 同上，走 StreamingDecoder（io::Read）路径。
+#[cfg(all(feature = "hash", feature = "std"))]
+#[test]
+fn corrupted_frame_checksum_rejected_in_streaming() {
+    extern crate std;
+    use std::io::Read as _;
+
+    let unit = b"streaming checksum probe; ";
+    let data: std::vec::Vec<u8> = unit
+        .iter()
+        .copied()
+        .cycle()
+        .take(unit.len() * 512)
+        .collect();
+    let frame = crate::encoding::compress_to_vec(
+        data.as_slice(),
+        crate::encoding::CompressionLevel::Fastest,
+    );
+
+    let mut ok_decoder =
+        crate::decoding::StreamingDecoder::new(frame.as_slice()).expect("frame header ok");
+    let mut ok_sink = std::vec::Vec::new();
+    ok_decoder
+        .read_to_end(&mut ok_sink)
+        .expect("valid frame must stream");
+    assert_eq!(ok_sink, data);
+
+    let mut bad = frame.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 0xFF;
+    let mut decoder =
+        crate::decoding::StreamingDecoder::new(bad.as_slice()).expect("frame header ok");
+    let mut sink = std::vec::Vec::new();
+    assert!(
+        decoder.read_to_end(&mut sink).is_err(),
+        "streaming decode must surface the checksum mismatch"
+    );
+}

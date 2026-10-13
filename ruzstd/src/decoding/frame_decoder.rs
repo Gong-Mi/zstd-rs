@@ -107,7 +107,7 @@ impl FrameDecoderState {
         let (frame, header_size) = frame::read_frame_header(source)?;
         let window_size = frame.window_size()?;
         Self::check_window_size(window_size, max_window_size)?;
-        Ok(FrameDecoderState {
+        let mut state = FrameDecoderState {
             frame_header: frame,
             frame_finished: false,
             block_counter: 0,
@@ -115,7 +115,14 @@ impl FrameDecoderState {
             bytes_read_counter: u64::from(header_size),
             check_sum: None,
             using_dict: None,
-        })
+        };
+        #[cfg(feature = "hash")]
+        {
+            // 仅带校验和的帧才进行滚动哈希（对齐 C validateChecksum 语义）
+            state.decoder_scratch.buffer.hash_enabled =
+                state.frame_header.descriptor.content_checksum_flag();
+        }
+        Ok(state)
     }
 
     fn reset(&mut self, source: impl Read, max_window_size: u64) -> Result<(), FrameDecoderError> {
@@ -130,6 +137,12 @@ impl FrameDecoderState {
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;
+        #[cfg(feature = "hash")]
+        {
+            // 仅带校验和的帧才进行滚动哈希（对齐 C validateChecksum 语义）
+            self.decoder_scratch.buffer.hash_enabled =
+                self.frame_header.descriptor.content_checksum_flag();
+        }
         Ok(())
     }
 
@@ -615,6 +628,10 @@ impl FrameDecoder {
                     break Ok(());
                 }
             };
+            // 校验必须在解开直写绑定之前进行：直写态下 pending 由 written-drained
+            // 度量，解开后度量会换回 ring 长度。
+            #[cfg(feature = "hash")]
+            let checksum_result = self.verify_checksum();
             self.state
                 .as_mut()
                 .unwrap()
@@ -622,6 +639,8 @@ impl FrameDecoder {
                 .buffer
                 .clear_direct_output();
             frame_result?;
+            #[cfg(feature = "hash")]
+            checksum_result?;
         }
 
         Ok(total_bytes_written)
@@ -659,20 +678,71 @@ impl FrameDecoder {
             }
         }
     }
+
+    /// 校验和强制验证（对齐 C 默认语义：`ZSTD_d_validateChecksum` 默认开启；
+    /// 见 lib/decompress/zstd_decompress.c:1049-1055 / 1402-1406）。
+    ///
+    /// 仅在「帧已完成（尾部校验和已读入）且全部解码输出都已交给调用方」时计算
+    /// 并比对：滚动 XXH64 是在输出离开解码缓冲区时才更新的（decode_buffer.rs
+    /// 的 drain 路径），提前比对会把仍驻留在缓冲区里的尾部字节漏掉。无校验和
+    /// 标志的帧直接通过；未启用 `hash` 特性时无法计算，保持不校验（与旧行为一致）。
+    ///
+    /// 调用点：`Read`（含 StreamingDecoder 与 decode_from_to）与 `decode_all`；
+    /// 只用 `collect*` 收取输出的调用方不会触发（其返回类型无法承载错误）。
+    #[cfg(feature = "hash")]
+    fn verify_checksum(&mut self) -> Result<(), FrameDecoderError> {
+        use core::hash::Hasher;
+        let state = match &mut self.state {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        if !state.frame_finished || state.check_sum.is_none() {
+            return Ok(());
+        }
+        if state.decoder_scratch.buffer.can_drain() != 0 {
+            // 还有未交付给调用方的输出，滚动哈希尚未覆盖完整帧输出
+            return Ok(());
+        }
+        let read = state.check_sum.unwrap();
+        let calculated = state.decoder_scratch.buffer.hash.finish() as u32;
+        if calculated != read {
+            return Err(FrameDecoderError::ChecksumMismatch { read, calculated });
+        }
+        Ok(())
+    }
 }
 
 /// Read bytes from the decode_buffer that are no longer needed. While the frame is not yet finished
 /// this will retain window_size bytes, else it will drain it completely
 impl Read for FrameDecoder {
     fn read(&mut self, target: &mut [u8]) -> Result<usize, Error> {
-        let state = match &mut self.state {
-            None => return Ok(0),
-            Some(s) => s,
-        };
-        if state.frame_finished {
-            state.decoder_scratch.buffer.read_all(target)
-        } else {
-            state.decoder_scratch.buffer.read(target)
+        let written = {
+            let state = match &mut self.state {
+                None => return Ok(0),
+                Some(s) => s,
+            };
+            if state.frame_finished {
+                state.decoder_scratch.buffer.read_all(target)
+            } else {
+                state.decoder_scratch.buffer.read(target)
+            }
+        }?;
+        // 每交付一批输出后检查：若帧已完结且输出已全部交付，校验和必须匹配
+        //（对齐 C 默认；错配经 io::Error 上报，StreamingDecoder 路径由此覆盖）。
+        #[cfg(feature = "hash")]
+        if let Err(e) = self.verify_checksum() {
+            #[cfg(feature = "std")]
+            {
+                return Err(Error::other(e));
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                return Err(Error::new(
+                    crate::io::ErrorKind::InvalidData,
+                    alloc::boxed::Box::new(e),
+                ));
+            }
         }
+        Ok(written)
     }
 }

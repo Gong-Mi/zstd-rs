@@ -30,6 +30,11 @@ pub struct DecodeBuffer {
     total_output_counter: u64,
     #[cfg(feature = "hash")]
     pub hash: twox_hash::XxHash64,
+    /// 本帧是否带内容校验和（帧头 checksumFlag）。仅置位时才滚动哈希——
+    /// 对齐 C：`validateChecksum = checksumFlag && !forceIgnoreChecksum`
+    /// （zstd_decompress.c:720）。无校验和帧为零哈希开销。
+    #[cfg(feature = "hash")]
+    pub hash_enabled: bool,
 }
 
 // SAFETY: `direct` 只在 `decode_all` 的单次调用内绑定（绑定到解绑之间不执行用户
@@ -68,6 +73,8 @@ impl DecodeBuffer {
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
+            #[cfg(feature = "hash")]
+            hash_enabled: false,
         }
     }
 
@@ -81,6 +88,7 @@ impl DecodeBuffer {
         #[cfg(feature = "hash")]
         {
             self.hash = twox_hash::XxHash64::with_seed(0);
+            self.hash_enabled = false;
         }
     }
 
@@ -436,10 +444,23 @@ impl DecodeBuffer {
 
     /// 直写模式下的进度交代（等价于 read 的效果，但不需要传入调用方切片）。
     /// 非直写模式返回 None。
+    /// 直写模式：报告并推进交付进度。
+    ///
+    /// 直写路径不经过 ring buffer 的 drain，因此这里按推进量给滚动哈希补账
+    /// （每个字节恰好一次）——否则直写模式下计算校验和会漏掉全部输出。
     pub fn direct_progress(&mut self) -> Option<usize> {
         let d = self.direct.as_mut()?;
         let n = d.written - d.drained;
+        let start = d.drained;
+        let ptr = d.ptr;
         d.drained = d.written;
+        #[cfg(feature = "hash")]
+        if n != 0 && self.hash_enabled {
+            unsafe {
+                let slice = core::slice::from_raw_parts(ptr.add(start), n);
+                self.hash.write(slice);
+            }
+        }
         Some(n)
     }
 
@@ -472,7 +493,7 @@ impl DecodeBuffer {
     pub fn drain(&mut self) -> Vec<u8> {
         let (slice1, slice2) = self.buffer.as_slices();
         #[cfg(feature = "hash")]
-        {
+        if self.hash_enabled {
             self.hash.write(slice1);
             self.hash.write(slice2);
         }
@@ -544,7 +565,9 @@ impl DecodeBuffer {
         if n1 != 0 {
             let (written1, res1) = write_bytes(&slice1[..n1]);
             #[cfg(feature = "hash")]
-            self.hash.write(&slice1[..written1]);
+            if self.hash_enabled {
+                self.hash.write(&slice1[..written1]);
+            }
             drain_guard.amount += written1;
 
             // Apparently this is what clippy thinks is the best way of expressing this
@@ -555,7 +578,9 @@ impl DecodeBuffer {
             if written1 == n1 && n2 != 0 {
                 let (written2, res2) = write_bytes(&slice2[..n2]);
                 #[cfg(feature = "hash")]
-                self.hash.write(&slice2[..written2]);
+                if self.hash_enabled {
+                    self.hash.write(&slice2[..written2]);
+                }
                 drain_guard.amount += written2;
 
                 // Apparently this is what clippy thinks is the best way of expressing this
