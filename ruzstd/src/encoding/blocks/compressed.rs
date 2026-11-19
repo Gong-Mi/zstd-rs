@@ -485,12 +485,12 @@ mod literal_section_tests {
 
 /// Write the raw/RLE literals header exactly like C's
 /// `ZSTD_noCompressLiterals` / `ZSTD_compressRleLiteralsBlock` (flSize tiers):
-///   - len <= 31:    1-byte header, `type + (len << 3)`; bit 2 stays 0 and
-///                   the 5-bit size starts at bit 3, so sizes >= 16 read back
-///                   as sizeFormat 2 (both are handled as the 1-byte form).
-///   - 32 <= len
-///         <= 4095:  2-byte header, format 01, 12-bit size at bit 4.
-///   - len >= 4096:  3-byte header, format 11, 20-bit size at bit 4.
+/// - len <= 31: 1-byte header, `type + (len << 3)`; bit 2 stays 0 and
+///   the 5-bit size starts at bit 3, so sizes >= 16 read back
+///   as sizeFormat 2 (both are handled as the 1-byte form).
+/// - 32 <= len <= 4095: 2-byte header, format 01, 12-bit size at bit 4.
+/// - len >= 4096: 3-byte header, format 11, 20-bit size at bit 4.
+///
 /// The old Rust writer used only the 20-bit form (+2 wasted bytes for every
 /// short block); the ruzstd decoder reads all three tiers (`>> 3` / `>> 4`).
 fn write_raw_rle_header(lit_type: u8, len: usize, writer: &mut BitWriter<&mut Vec<u8>>) {
