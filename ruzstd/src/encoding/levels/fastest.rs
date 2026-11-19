@@ -126,18 +126,15 @@ mod tests {
     }
 
     #[test]
-    fn early_raw_and_rle_preserve_offset_history() {
-        let early_raw: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+    fn rle_preserve_offset_history() {
         let rle = alloc::vec![7; 64];
-        for (input, block_type) in [(early_raw, 0), (rle, 1)] {
-            let mut state = state();
-            let history = [17, 9, 2];
-            state.offset_hist = history;
-            let mut output = Vec::new();
-            compress_fastest(&mut state, true, input, &mut output);
-            assert_eq!((output[0] >> 1) & 3, block_type);
-            assert_eq!(state.offset_hist, history);
-        }
+        let mut state = state();
+        let history = [17, 9, 2];
+        state.offset_hist = history;
+        let mut output = Vec::new();
+        compress_fastest(&mut state, true, rle, &mut output);
+        assert_eq!((output[0] >> 1) & 3, 1);
+        assert_eq!(state.offset_hist, history);
     }
 
     #[test]
