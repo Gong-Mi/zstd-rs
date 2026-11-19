@@ -78,6 +78,9 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     pub(crate) fse_tables: FseTables,
+    /// 最近使用的 3 个偏移（zstd 的 rep1/rep2/rep3），用于发射重复偏移码。
+    /// 解码端对应 `do_offset_history`，初始值与解码端一致（[1, 4, 8]），每帧复位。
+    pub(crate) offset_hist: [u32; 3],
 }
 
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
@@ -92,6 +95,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                offset_hist: [1, 4, 8],
             },
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
@@ -109,6 +113,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 matcher,
                 last_huff_table: None,
                 fse_tables: FseTables::new(),
+                offset_hist: [1, 4, 8],
             },
             compression_level,
             pledged_source_size: None,
@@ -160,6 +165,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
         self.state.last_huff_table = None;
+        // 每帧复位重复偏移历史（与解码端初始值一致）
+        self.state.offset_hist = [1, 4, 8];
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
