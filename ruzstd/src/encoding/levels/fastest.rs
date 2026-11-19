@@ -167,7 +167,10 @@ mod tests {
         assert_eq!((output[second_start] >> 1) & 3, 2);
 
         let decoded = zstd::decode_all(output.as_slice()).unwrap();
-        assert!(decoded == original, "C decoder must reconstruct the original");
+        assert!(
+            decoded == original,
+            "C decoder must reconstruct the original"
+        );
         let mut decoded = Vec::with_capacity(original.len());
         crate::decoding::FrameDecoder::new()
             .decode_all_to_vec(&output, &mut decoded)
