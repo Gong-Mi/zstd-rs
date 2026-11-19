@@ -69,8 +69,14 @@ impl Matcher for MatchGeneratorDriver {
         let vec_pool = &mut self.vec_pool;
         let suffix_pool = &mut self.suffix_pool;
         const SUFFIX_STORE_MIN_CAPACITY: usize = 1024;
-        let requested_suffix_store_size =
-            usize::max(SUFFIX_STORE_MIN_CAPACITY, space.len().next_power_of_two());
+        // Cap hash table at 16K entries (C level-1 hashLog=14, 64KB cache).
+        // The old code sized the table to match the window (128K entries,
+        // 512KB cache) — 8x more cache pressure than C for no ratio gain.
+        const SUFFIX_STORE_MAX_CAPACITY: usize = 1 << 14;
+        let requested_suffix_store_size = usize::min(
+            SUFFIX_STORE_MAX_CAPACITY,
+            usize::max(SUFFIX_STORE_MIN_CAPACITY, space.len().next_power_of_two()),
+        );
         let requested_size_log = requested_suffix_store_size.ilog2();
         let suffix_store_idx = suffix_pool
             .iter()
