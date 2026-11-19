@@ -341,16 +341,12 @@ impl MatchGenerator {
                 // 首次比较命中长度：条件预算用它决定要不要花第二次比较
                 let mut last_hit_len = 0usize;
                 let mut cur = match_entry.suffixes.get_hashed(key_raw);
+                let entry_data_len = match_entry.data.len();
                 while let Some(match_index) = cur {
-                    // Full forward extension for every candidate, mirroring
-                    // the reference match finder: the restricted slice for the
-                    // trailing entry structurally forbids overlapping matches,
-                    // which makes highly repetitive input cascade in
-                    // offset-doubling steps instead of encoding one long match.
-                    let match_slice = &match_entry.data[match_index..];
-
-                    if match_slice.len() < MIN_MATCH_LEN {
-                        // 太近的候选给不出合法匹配，只走链不比较
+                    // Pre-check without slice construction: candidate must be
+                    // at least MIN_MATCH_LEN bytes from the end of the window
+                    // entry's data to produce a valid match.
+                    if entry_data_len - match_index < MIN_MATCH_LEN {
                         walked += 1;
                         if walked >= CHAIN_WALK_MAX {
                             break;
@@ -364,6 +360,7 @@ impl MatchGenerator {
                     cmps += 1;
 
                     // Check how long the common prefix actually is
+                    let match_slice = &match_entry.data[match_index..];
                     let match_len = Self::common_prefix_len(match_slice, data_slice);
 
                     // Collisions in the suffix store might make this check fail
