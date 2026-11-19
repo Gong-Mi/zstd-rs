@@ -340,20 +340,20 @@ impl MatchGenerator {
                 let mut cmps = 0usize;
                 // 首次比较命中长度：条件预算用它决定要不要花第二次比较
                 let mut last_hit_len = 0usize;
-            let mut cur = match_entry.suffixes.get_hashed(key_raw);
-            let entry_data_len = match_entry.data.len();
-            while let Some(match_index) = cur {
-                // Pre-check without slice construction: candidate must be
-                // at least MIN_MATCH_LEN bytes from the end of the window
-                // entry's data to produce a valid match.
-                if entry_data_len - match_index < MIN_MATCH_LEN {
-                    walked += 1;
-                    if walked >= CHAIN_WALK_MAX {
-                        break;
+                let mut cur = match_entry.suffixes.get_hashed(key_raw);
+                let entry_data_len = match_entry.data.len();
+                while let Some(match_index) = cur {
+                    // Pre-check without slice construction: candidate must be
+                    // at least MIN_MATCH_LEN bytes from the end of the window
+                    // entry's data to produce a valid match.
+                    if entry_data_len - match_index < MIN_MATCH_LEN {
+                        walked += 1;
+                        if walked >= CHAIN_WALK_MAX {
+                            break;
+                        }
+                        cur = match_entry.suffixes.link_of(match_index);
+                        continue;
                     }
-                    cur = match_entry.suffixes.link_of(match_index);
-                    continue;
-                }
                     if cmps >= CHAIN_CMP_MAX && !(cmps == 1 && last_hit_len >= LONG_HIT_CUT) {
                         break;
                     }
