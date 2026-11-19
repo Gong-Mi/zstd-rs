@@ -380,8 +380,8 @@ fn encode_offset(len: u32) -> (u8, u32, usize) {
 #[cfg(test)]
 mod literal_section_tests {
     use super::*;
-    use alloc::vec;
     use crate::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
+    use alloc::vec;
 
     /// Byte-exact check against C's header construction
     /// (`ZSTD_compressRleLiteralsBlock`, zstd_compress_literals.c):
@@ -441,7 +441,10 @@ mod literal_section_tests {
             }
             let mut ls = LiteralsSection::new();
             let hdr = ls.parse_from_header(&out).unwrap();
-            assert!(matches!(ls.ls_type, LiteralsSectionType::Raw), "raw len {len}");
+            assert!(
+                matches!(ls.ls_type, LiteralsSectionType::Raw),
+                "raw len {len}"
+            );
             assert_eq!(ls.regenerated_size as usize, len, "raw len {len}");
             assert_eq!(hdr as usize, out.len() - len, "raw hdr size len {len}");
 
@@ -454,7 +457,10 @@ mod literal_section_tests {
             if len > 0 {
                 let mut ls = LiteralsSection::new();
                 let hdr = ls.parse_from_header(&out).unwrap();
-                assert!(matches!(ls.ls_type, LiteralsSectionType::RLE), "rle len {len}");
+                assert!(
+                    matches!(ls.ls_type, LiteralsSectionType::RLE),
+                    "rle len {len}"
+                );
                 assert_eq!(ls.regenerated_size as usize, len, "rle len {len}");
                 assert_eq!(out[hdr as usize], 0x42, "rle value len {len}");
             }
@@ -469,10 +475,9 @@ mod literal_section_tests {
         for len in [100usize, 4096, 65536, 200000] {
             let data = vec![0x42u8; len];
             let comp = compress_to_vec(&data[..], CompressionLevel::Fastest);
-            let mut dec =
-                crate::decoding::StreamingDecoder::new(&comp[..]).expect("decode setup");
+            let mut dec = crate::decoding::StreamingDecoder::new(&comp[..]).expect("decode setup");
             let mut back = Vec::new();
-            std::io::Read::read_to_end(&mut dec, &mut back).expect("decode");
+            crate::io::Read::read_to_end(&mut dec, &mut back).expect("decode");
             assert_eq!(back, data, "len {len}");
         }
     }
