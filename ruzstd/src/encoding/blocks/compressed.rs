@@ -34,7 +34,11 @@ pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec
     // literals section
 
     let mut writer = BitWriter::from(output);
-    if literals_vec.len() > 1024 {
+    // C `ZSTD_minLiteralsToCompress` (zstd_compress_literals.c): for strategy
+    // fast the minimum is `8 << min(9 - 1, 3)` = 64 bytes; below that C emits
+    // raw literals without even attempting Huffman. Rust previously required
+    // > 1024, leaving every 64..1024 byte literal run uncompressed.
+    if literals_vec.len() >= 64 {
         if let Some(table) =
             compress_literals(&literals_vec, state.last_huff_table.as_ref(), &mut writer)
         {
@@ -432,11 +436,148 @@ fn encode_offset(len: u32) -> (u8, u32, usize) {
     (log as u8, lower, log as usize)
 }
 
+#[cfg(test)]
+mod literal_section_tests {
+    use super::*;
+    use crate::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
+    use alloc::vec;
+
+    /// Byte-exact check against C's header construction
+    /// (`ZSTD_compressRleLiteralsBlock`, zstd_compress_literals.c):
+    /// flSize==2 writes LE16 `set_rle + (1<<2) + (srcSize<<4)`, then the
+    /// single repeated byte.
+    #[test]
+    fn rle_literals_header_matches_c() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut w = BitWriter::from(&mut out);
+            rle_literals(&[0x07u8; 100], &mut w);
+            w.flush();
+        }
+        assert_eq!(out, vec![0x45, 0x06, 0x07]);
+    }
+
+    /// Raw tiers, same byte-level contract as C
+    /// (`ZSTD_noCompressLiterals`): 5-bit `type + (len<<3)` up to 31, 12-bit
+    /// format 01 up to 4095, 20-bit format 11 above.
+    #[test]
+    fn raw_literals_tiers_match_c() {
+        let cases: [(usize, &[u8]); 4] = [
+            // type 00, len 5  -> (5 << 3) = 0x28
+            (5, &[0x28]),
+            // type 00, len 20 -> (20 << 3) = 0xA0; reads back as sizeFormat 2
+            (20, &[0xA0]),
+            // type 00, len 40 -> LE16 (40 << 4) | (1 << 2) = 0x0284
+            (40, &[0x84, 0x02]),
+            // type 00, len 5000 -> LE24 (5000 << 4) | (3 << 2) = 0x01388C
+            (5000, &[0x8C, 0x38, 0x01]),
+        ];
+        for (len, expect_hdr) in cases {
+            let data = vec![0x5Au8; len];
+            let mut out: Vec<u8> = Vec::new();
+            {
+                let mut w = BitWriter::from(&mut out);
+                raw_literals(&data, &mut w);
+                w.flush();
+            }
+            assert_eq!(&out[..expect_hdr.len()], expect_hdr, "len {len} header");
+            assert_eq!(&out[expect_hdr.len()..], &data[..], "len {len} payload");
+        }
+    }
+
+    /// Whatever we write, the in-tree decoder must read back (including the
+    /// overlapping sizeFormat-2 aliasing of the 1-byte tier).
+    #[test]
+    fn raw_and_rle_headers_parse_back() {
+        for len in [0usize, 1, 5, 15, 16, 31, 32, 100, 4095, 4096, 5000, 70000] {
+            let data = vec![0x42u8; len];
+
+            let mut out: Vec<u8> = Vec::new();
+            {
+                let mut w = BitWriter::from(&mut out);
+                raw_literals(&data, &mut w);
+                w.flush();
+            }
+            let mut ls = LiteralsSection::new();
+            let hdr = ls.parse_from_header(&out).unwrap();
+            assert!(
+                matches!(ls.ls_type, LiteralsSectionType::Raw),
+                "raw len {len}"
+            );
+            assert_eq!(ls.regenerated_size as usize, len, "raw len {len}");
+            assert_eq!(hdr as usize, out.len() - len, "raw hdr size len {len}");
+
+            let mut out: Vec<u8> = Vec::new();
+            if len > 0 {
+                let mut w = BitWriter::from(&mut out);
+                rle_literals(&data, &mut w);
+                w.flush();
+            }
+            if len > 0 {
+                let mut ls = LiteralsSection::new();
+                let hdr = ls.parse_from_header(&out).unwrap();
+                assert!(
+                    matches!(ls.ls_type, LiteralsSectionType::RLE),
+                    "rle len {len}"
+                );
+                assert_eq!(ls.regenerated_size as usize, len, "rle len {len}");
+                assert_eq!(out[hdr as usize], 0x42, "rle value len {len}");
+            }
+        }
+    }
+
+    /// End-to-end: a frame whose literals are a single repeated byte must
+    /// round-trip through the in-tree decoder.
+    #[test]
+    fn all_identical_frame_roundtrips() {
+        use crate::encoding::{compress_to_vec, CompressionLevel};
+        for len in [100usize, 4096, 65536, 200000] {
+            let data = vec![0x42u8; len];
+            let comp = compress_to_vec(&data[..], CompressionLevel::Fastest);
+            let mut dec = crate::decoding::StreamingDecoder::new(&comp[..]).expect("decode setup");
+            let mut back = Vec::new();
+            crate::io::Read::read_to_end(&mut dec, &mut back).expect("decode");
+            assert_eq!(back, data, "len {len}");
+        }
+    }
+}
+
+/// Write the raw/RLE literals header exactly like C's
+/// `ZSTD_noCompressLiterals` / `ZSTD_compressRleLiteralsBlock` (flSize tiers):
+/// - len <= 31: 1-byte header, `type + (len << 3)`; bit 2 stays 0 and
+///   the 5-bit size starts at bit 3, so sizes >= 16 read back
+///   as sizeFormat 2 (both are handled as the 1-byte form).
+/// - 32 <= len <= 4095: 2-byte header, format 01, 12-bit size at bit 4.
+/// - len >= 4096: 3-byte header, format 11, 20-bit size at bit 4.
+///
+/// The old Rust writer used only the 20-bit form (+2 wasted bytes for every
+/// short block); the ruzstd decoder reads all three tiers (`>> 3` / `>> 4`).
+fn write_raw_rle_header(lit_type: u8, len: usize, writer: &mut BitWriter<&mut Vec<u8>>) {
+    writer.write_bits(lit_type, 2);
+    if len <= 31 {
+        writer.write_bits(0u8, 1);
+        writer.write_bits(len as u32, 5);
+    } else if len <= 4095 {
+        writer.write_bits(0b01u8, 2);
+        writer.write_bits(len as u32, 12);
+    } else {
+        writer.write_bits(0b11u8, 2);
+        writer.write_bits(len as u32, 20);
+    }
+}
+
 fn raw_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
-    writer.write_bits(0u8, 2);
-    writer.write_bits(0b11u8, 2);
-    writer.write_bits(literals.len() as u32, 20);
+    write_raw_rle_header(0u8, literals.len(), writer);
     writer.append_bytes(literals);
+}
+
+/// C `ZSTD_compressRleLiteralsBlock`: literals that are a single byte value
+/// repeated collapse to a 1-3 byte header plus that one byte (type 01).
+/// Reached from `compress_literals` for the all-identical run, mirroring C's
+/// `cLitSize == 1` (single-symbol alphabet) branch.
+fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
+    write_raw_rle_header(1u8, literals.len(), writer);
+    writer.append_bytes(&literals[..1]);
 }
 
 fn compress_literals(
@@ -444,6 +585,14 @@ fn compress_literals(
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
 ) -> Option<huff0_encoder::HuffmanTable> {
+    // C `ZSTD_compressLiterals`: a single-symbol alphabet makes HUF return
+    // cLitSize == 1, which is rewritten as an RLE literals section (the table
+    // from the previous block stays in effect, hence None = keep last table).
+    if !literals.is_empty() && literals.iter().all(|&b| b == literals[0]) {
+        rle_literals(literals, writer);
+        return None;
+    }
+
     let reset_idx = writer.index();
 
     let new_encoder_table = huff0_encoder::HuffmanTable::build_from_data(literals);
@@ -485,9 +634,14 @@ fn compress_literals(
         writer.write_bits(3u8, 2); // treeless compressed literals type
     }
 
+    // C `ZSTD_compressLiterals`: `U32 singleStream = srcSize < 256;` — jump
+    // tables only pay off from 256 literals upward (`MIN_LITERALS_FOR_4_STREAMS`
+    // in huf_compress.c). The single-stream geo format 00 and 4-stream 01 both
+    // use 10-bit sizes; the 14/18-bit tiers switch at the same 1K/16K points C
+    // uses for lhSize.
     let (size_format, size_bits) = match literals.len() {
-        0..6 => (0b00u8, 10),
-        6..1024 => (0b01, 10),
+        0..256 => (0b00u8, 10),
+        256..1024 => (0b01, 10),
         1024..16384 => (0b10, 14),
         16384..262144 => (0b11, 18),
         _ => unimplemented!("too many literals"),
