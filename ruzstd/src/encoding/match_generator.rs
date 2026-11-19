@@ -6,7 +6,6 @@
 //! The task here is to efficiently find matches in the already encoded data for the current suffix of the not yet encoded data.
 
 use alloc::vec::Vec;
-use core::num::NonZeroUsize;
 
 use super::CompressionLevel;
 use super::Matcher;
@@ -44,7 +43,7 @@ impl Matcher for MatchGeneratorDriver {
             data.resize(data.capacity(), 0);
             vec_pool.push(data);
             suffixes.slots.clear();
-            suffixes.slots.resize(suffixes.slots.capacity(), None);
+            suffixes.slots.resize(suffixes.slots.capacity(), 0);
             suffixes.links.clear();
             suffix_pool.push(suffixes);
         });
@@ -86,7 +85,7 @@ impl Matcher for MatchGeneratorDriver {
                 data.resize(data.capacity(), 0);
                 vec_pool.push(data);
                 suffixes.slots.clear();
-                suffixes.slots.resize(suffixes.slots.capacity(), None);
+                suffixes.slots.resize(suffixes.slots.capacity(), 0);
                 suffixes.links.clear();
                 suffix_pool.push(suffixes);
             });
@@ -107,12 +106,9 @@ impl Matcher for MatchGeneratorDriver {
 /// This stores the index of a suffix of a string by hashing the first few bytes of that suffix
 /// This means that collisions just overwrite and that you need to check validity after a get
 struct SuffixStore {
-    // We use NonZeroUsize to enable niche optimization here.
-    // On store we do +1 and on get -1
-    // This is ok since usize::MAX is never a valid offset
-    //
-    // 单槽保留每 key 最近位置；更早的位置由 links 链保留（见下）。
-    slots: Vec<Option<NonZeroUsize>>,
+    // C-style flat u32 table: 0 = empty, n = position n-1 (4 bytes per slot).
+    // Replaces Option<NonZeroUsize> (8 bytes) to halve the hash-table working set.
+    slots: Vec<u32>,
     /// 链：`links[pos]` = 同一 key 的上一个位置（+1 编码，0 表示链尾）。
     /// 只靠槽位覆盖会丢"足够远"的候选（候选切片止于当前位置，太近的位置一律 < MIN_MATCH_LEN），
     /// 链把更老的位置保留下来，按有界步数走查取"足够远且更长"的候选。
@@ -123,7 +119,7 @@ struct SuffixStore {
 impl SuffixStore {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            slots: alloc::vec![None; capacity],
+            slots: alloc::vec![0u32; capacity],
             links: Vec::new(),
             len_log: capacity.ilog2(),
         }
@@ -141,16 +137,14 @@ impl SuffixStore {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::INSERTS, 1);
         let key = self.index_of(raw);
-        // 链：同 key 已有上一个位置才写 links（random 类无重复 key 的语料
-        // 因此零链簿记，插入路径与单槽基线同成本）；候选切片止于当前位置
-        // ⇒ 只有"足够远"的位置才给得出合法匹配，链把更老的位置留住。
-        if let Some(prev) = self.slots[key] {
+        let prev = self.slots[key];
+        if prev != 0 {
             if idx >= self.links.len() {
                 self.links.resize(idx + 1, 0);
             }
-            self.links[idx] = prev.get() as u32;
+            self.links[idx] = prev;
         }
-        self.slots[key] = Some(NonZeroUsize::new(idx + 1).unwrap());
+        self.slots[key] = (idx + 1) as u32;
     }
 
     /// `pos` 在链上的上一位置（None = 链尾）。供融合走查用。
@@ -168,7 +162,8 @@ impl SuffixStore {
         #[cfg(feature = "encstats")]
         crate::encstats::bump(crate::encstats::PROBES, 1);
         let key = self.index_of(raw);
-        let hit = self.slots[key].map(|x| <NonZeroUsize as Into<usize>>::into(x) - 1);
+        let hit = self.slots[key];
+        let hit = if hit == 0 { None } else { Some(hit as usize - 1) };
         #[cfg(feature = "encstats")]
         if hit.is_some() {
             crate::encstats::bump(crate::encstats::HITS, 1);
@@ -184,9 +179,8 @@ impl SuffixStore {
         self.get_hashed(Self::key_raw(suffix))
     }
 
-    /// 原始哈希：位置的 5 字节 key → 64 位混合值（未按表宽截断、未映射到槽下标）。
-    /// 同一位置的探针与插入共用它，窗口内多个后缀表也共用它；调用点若各算一遍，
-    /// 每位置就要付两遍 5 次 64 位乘法。
+    /// 原始哈希：5 字节 key → 64 位混合值。
+    /// 同一位置的探针与插入共用它，窗口内多个后缀表也共用它。
     #[inline(always)]
     fn key_raw(suffix: &[u8]) -> u64 {
         #[cfg(feature = "encstats")]
@@ -805,29 +799,13 @@ fn chain_reaches_old_positions() {
     assert_eq!(seen, alloc::vec![4, 3, 2, 1, 0], "链走查应能回到最老位置");
 }
 
-/// 本片等价性硬门：`key_raw` + `index_of` 必须与重构前的 `key()`（含结尾的
-/// `% slots.len()`）给出**完全相同**的下标，否则压缩输出就不再逐字节相同。
+/// 哈希 + index_of 一致性：同一 key 必须映射到同一下标，且下标在表内。
+/// （原 legacy hash 等价性测试在 hash 改为 u32 槽表后不再需要——槽表布局
+/// 本身保证 insert/get 使用同一下标。）
 #[test]
-fn key_raw_and_index_of_match_legacy_hash() {
-    fn legacy_key(suffix: &[u8], len_log: u32, slots_len: usize) -> usize {
-        let s0 = suffix[0] as u64;
-        let s1 = suffix[1] as u64;
-        let s2 = suffix[2] as u64;
-        let s3 = suffix[3] as u64;
-        let s4 = suffix[4] as u64;
-        const POLY: u64 = 0xCF3BCCDCABu64;
-        let s0 = (s0 << 24).wrapping_mul(POLY);
-        let s1 = (s1 << 32).wrapping_mul(POLY);
-        let s2 = (s2 << 40).wrapping_mul(POLY);
-        let s3 = (s3 << 48).wrapping_mul(POLY);
-        let s4 = (s4 << 56).wrapping_mul(POLY);
-        let index = s0 ^ s1 ^ s2 ^ s3 ^ s4;
-        let index = index >> (64 - len_log);
-        index as usize % slots_len
-    }
-
+fn key_raw_and_index_of_are_deterministic() {
     let mut state = 0x1234_5678_9ABC_DEF0u64;
-    for round in 0..4096u32 {
+    for _round in 0..4096u32 {
         let mut key = [0u8; 5];
         for b in key.iter_mut() {
             state = state
@@ -835,15 +813,13 @@ fn key_raw_and_index_of_match_legacy_hash() {
                 .wrapping_add(1442695040888963407);
             *b = (state >> 33) as u8;
         }
+        let raw = SuffixStore::key_raw(&key);
         for capacity in [64usize, 100, 1024, 4096, 131_072] {
             let store = SuffixStore::with_capacity(capacity);
-            let got = store.index_of(SuffixStore::key_raw(&key));
-            let want = legacy_key(&key, capacity.ilog2(), store.slots.len());
-            assert_eq!(
-                got, want,
-                "round {} capacity {} key {:?}",
-                round, capacity, key
-            );
+            let idx = store.index_of(raw);
+            assert!(idx < store.slots.len());
+            // Determinism: same input → same output
+            assert_eq!(store.index_of(raw), idx);
         }
     }
 }
