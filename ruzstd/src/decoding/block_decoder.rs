@@ -96,9 +96,19 @@ impl BlockDecoder {
     fn decompress_block(
         &mut self,
         header: &BlockHeader,
-        workspace: &mut DecoderScratch, //reuse this as often as possible. Not only if the trees are reused but also reuse the allocations when building new trees
+        workspace: &mut DecoderScratch,
         mut source: impl Read,
     ) -> Result<(), DecompressBlockError> {
+        // Reject oversized compressed block bodies before buffer growth
+        // (upstream d7f37b8, RFC 8878 3.1.1.2.4 Block_Maximum_Size).
+        const MAX_BLOCK_SIZE: usize = 128 * 1024;
+        if header.content_size as usize > MAX_BLOCK_SIZE {
+            return Err(DecompressBlockError::DecompressedSizeTooLarge {
+                max: MAX_BLOCK_SIZE,
+                at_least: header.content_size as usize,
+            });
+        }
+
         workspace
             .block_content_buffer
             .resize(header.content_size as usize, 0);
