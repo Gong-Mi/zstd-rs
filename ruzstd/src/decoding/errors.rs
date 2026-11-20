@@ -259,6 +259,10 @@ pub enum DecompressBlockError {
         expected_len: usize,
         remaining_bytes: usize,
     },
+    DecompressedSizeTooLarge {
+        max: usize,
+        at_least: usize,
+    },
     DecompressLiteralsError(DecompressLiteralsError),
     LiteralsSectionParseError(LiteralsSectionParseError),
     SequencesHeaderParseError(SequencesHeaderParseError),
@@ -293,6 +297,12 @@ impl core::fmt::Display for DecompressBlockError {
             } => {
                 write!(f,
                     "Malformed section header. Says literals would be this long: {expected_len} but there are only {remaining_bytes} bytes left",
+                )
+            }
+            DecompressBlockError::DecompressedSizeTooLarge { max, at_least } => {
+                write!(
+                    f,
+                    "Malformed block wanted to generate {at_least} bytes of decompressed content, maximum is: {max}"
                 )
             }
             DecompressBlockError::DecompressLiteralsError(e) => write!(f, "{e:?}"),
