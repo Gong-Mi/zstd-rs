@@ -454,7 +454,7 @@ impl MatchGenerator {
                 // 真实 ELF −1.1%、bin-like −0.35%、binary-medium −0.02%，六语料零回退。
                 {
                     let dlen = self.window.last().unwrap().data.len();
-                    let mut try_insert = |me: &mut MatchGenerator, pos: usize| {
+                    let try_insert = |me: &mut MatchGenerator, pos: usize| {
                         if pos + MIN_MATCH_LEN <= dlen {
                             let k = SuffixStore::key_raw(&me.window.last().unwrap().data[pos..]);
                             me.window.last_mut().unwrap().suffixes.insert_hashed(k, pos);
