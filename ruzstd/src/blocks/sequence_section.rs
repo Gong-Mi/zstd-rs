@@ -63,6 +63,15 @@ pub enum ModeType {
 }
 
 impl CompressionModes {
+    /// Read a Symbol_Compression_Modes byte, whose two low bits are reserved
+    /// and must be zero (RFC 8878 3.1.1.3.2.1, libzstd rejects since v1.5.6).
+    fn parse(byte: u8) -> Result<CompressionModes, SequencesHeaderParseError> {
+        if byte & 0b11 != 0 {
+            return Err(SequencesHeaderParseError::ReservedBitsSet { got: byte });
+        }
+        Ok(CompressionModes(byte))
+    }
+
     /// Deserialize a two bit mode value into a [ModeType]
     pub fn decode_mode(m: u8) -> ModeType {
         match m {
@@ -127,7 +136,7 @@ impl SequencesHeader {
                     });
                 }
                 self.num_sequences = u32::from(source[0]);
-                self.modes = Some(CompressionModes(source[1]));
+                self.modes = Some(CompressionModes::parse(source[1])?);
                 bytes_read += 2;
             }
             128..=254 => {
@@ -146,7 +155,7 @@ impl SequencesHeader {
                             got: source.len(),
                         });
                     }
-                    self.modes = Some(CompressionModes(source[2]));
+                    self.modes = Some(CompressionModes::parse(source[2])?);
                     bytes_read += 1;
                 }
             }
@@ -158,7 +167,7 @@ impl SequencesHeader {
                     });
                 }
                 self.num_sequences = u32::from(source[1]) + (u32::from(source[2]) << 8) + 0x7F00;
-                self.modes = Some(CompressionModes(source[3]));
+                self.modes = Some(CompressionModes::parse(source[3])?);
                 bytes_read += 4;
             }
         }
