@@ -460,10 +460,9 @@ impl MatchGenerator {
                             me.window.last_mut().unwrap().suffixes.insert_hashed(k, pos);
                         }
                     };
+                    // Single backfill: only probe+2 (inside match).
+                    // Drops suffix_idx-2 (near match end) to halve backfill cost.
                     try_insert(self, probe + 2);
-                    if self.suffix_idx >= 2 {
-                        try_insert(self, self.suffix_idx - 2);
-                    }
                 }
 
                 return true;
