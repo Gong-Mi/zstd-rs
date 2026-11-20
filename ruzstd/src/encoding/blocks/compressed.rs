@@ -593,6 +593,23 @@ fn compress_literals(
         return None;
     }
 
+    // C's suspectUncompressible equivalent: sample 4KB, count max byte
+    // frequency. If no byte appears more than sample/128+4 times, the data
+    // is high-entropy and Huffman won't compress it. Write raw literals
+    // directly and skip the tree build + encode + fallback cycle.
+    {
+        let sample_len = literals.len().min(4096);
+        let mut counts = [0usize; 256];
+        for &b in &literals[..sample_len] {
+            counts[b as usize] += 1;
+        }
+        let largest = *counts.iter().max().unwrap();
+        if largest <= sample_len / 128 + 4 {
+            raw_literals(literals, writer);
+            return None;
+        }
+    }
+
     let reset_idx = writer.index();
 
     let new_encoder_table = huff0_encoder::HuffmanTable::build_from_data(literals);
